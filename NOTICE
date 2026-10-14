@@ -12,7 +12,7 @@ are distributed under the same license.
   Dates:        2026-10-10 to 2026-10-14
   Based on:     upstream Starla v0.8.0, commit a374686
   Changes:      the commits on this branch after a374686
-                (git log a374686..enodia-0025)
+                (git log a374686..enodia-0027)
 
 Where this code runs
 --------------------
@@ -21,13 +21,13 @@ It runs RIPE Atlas probe 1018212:
   https://atlas.ripe.net/probes/1018212/
 
 Each version deployed to that probe is tagged here (enodia-<NNNN>). The
-current one is enodia-0025 (c9cb056), running since 2026-10-14 01:36 UTC.
+current one is enodia-0027 (3ec874a), running since 2026-10-14 07:03 UTC.
 This branch and its tags are the Corresponding Source for anyone who
 interacts with the probe over the network (AGPL-3.0, section 13).
 
 What changed
 ------------
-0001-0005 make the probe fit to run as a system service. 0006-0025 bring
+0001-0005 make the probe fit to run as a system service. 0006-0027 bring
 its behaviour on the wire in line with RIPE NCC's reference software probe
 (ripe-atlas-software-probe, firmware 5130). Each commit message explains
 the difference and cites the reference source it follows.
@@ -62,6 +62,15 @@ the difference and cites the reference source it follows.
         default); target names, ttr and the replies' ttl
   0025  scheduler: crontab lines as eperd keeps them, one per line,
         not one per measurement id; a re-sent line keeps its slot
+  0026  timing: a timer more than 10 s off is skipped with eperd's 9807
+        record; no blocking name lookups; NTP matched as evntp; sends
+        stamped right before the syscall (never deployed on its own:
+        0027 includes it)
+  0027  runtimes: measurements on their own threads at full priority,
+        everything else on a background thread at lower priority;
+        logging never blocks; SSH keepalive as the reference's ssh;
+        start times spread within the second as eperd does; kernel
+        receive timestamps as an option, off by default
 
 Upstream
 --------
