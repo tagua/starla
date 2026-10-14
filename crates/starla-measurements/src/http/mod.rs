@@ -152,22 +152,16 @@ impl Measurement for Http {
 impl Http {
     /// An https:// fetch through reqwest. Header lines are rebuilt from the
     /// parsed map (names lowercased), so stored headers are approximate here.
+    ///
+    /// dst_addr is the address the connection went to, as httpget reports
+    /// the one it connected to (beforeconnect, httpget.c:1980-1989, 910-918).
+    /// Starla looked the host up a second time for it, with a blocking
+    /// getaddrinfo on a runtime worker (`to_socket_addrs`), and reported
+    /// that lookup's first address of the family, whichever one reqwest
+    /// had fetched from.
     async fn fetch_tls(&self) -> anyhow::Result<raw::RawHttpOutcome> {
         let results = client::execute_http_request(&self.config).await?;
-        let url = reqwest::Url::parse(&self.config.url)?;
-        let port = url.port_or_known_default().unwrap_or(443);
-        let host = url.host_str().unwrap_or("unknown");
-        let dst: Option<IpAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .ok()
-            .and_then(|mut addrs| {
-                addrs.find(|a| match self.config.af {
-                    4 => a.is_ipv4(),
-                    6 => a.is_ipv6(),
-                    _ => true,
-                })
-            })
-            .map(|a| a.ip());
+        let dst: Option<IpAddr> = results.remote_addr.map(|a| a.ip());
         Ok(raw::RawHttpOutcome {
             ttr: None,
             af: if dst.is_some_and(|d| d.is_ipv6()) {
@@ -263,5 +257,76 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("\"rt\""), "{body}");
+    }
+
+    /// An HTTP server on `listener` that answers every request with `body`.
+    fn serve(listener: tokio::net::TcpListener, body: &'static str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+    }
+
+    /// reqwest's fetch reports the address its connection went to, of the
+    /// family -4/-6 asked for, as httpget reports the address it connected
+    /// to (httpget.c:1980-1989): a server on 127.0.0.1 and one on ::1, the
+    /// same port, answer with bodies of different sizes. Starla looked the
+    /// host up again with a blocking getaddrinfo on the worker for
+    /// dst_addr, and reqwest connected over either family.
+    #[tokio::test]
+    async fn the_dst_addr_is_the_connections() {
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let v6 = tokio::net::TcpListener::bind(("::1", port)).await.ok();
+        // The -6 case needs "localhost" to name ::1 as well; some hosts' files
+        // give it 127.0.0.1 only (aletheia's), and then -6 has no address.
+        let localhost_v6 = tokio::net::lookup_host(("localhost", port))
+            .await
+            .is_ok_and(|mut a| a.any(|a| a.is_ipv6()));
+        let mut cases = vec![(4, "127.0.0.1", 2)];
+        serve(v4, "v4");
+        if let Some(v6) = v6.filter(|_| localhost_v6) {
+            serve(v6, "v6v6");
+            cases.push((6, "::1", 4));
+        }
+        for (af, dst, bsize) in cases {
+            let http = Http {
+                config: HttpConfig {
+                    url: format!("http://localhost:{port}/"),
+                    method: "GET".into(),
+                    headers: None,
+                    body: None,
+                    timeout_ms: 5000,
+                    verify_ssl: true,
+                    version: None,
+                    af,
+                    store_headers: 0,
+                    http10: false,
+                },
+                probe_id: ProbeId(1018212),
+                msm_id: MeasurementId(12023),
+            };
+            let out = http.fetch_tls().await.unwrap();
+            assert_eq!(out.dst_addr, Some(dst.parse().unwrap()), "-{af}");
+            assert_eq!(out.af, af);
+            assert_eq!(out.bsize, bsize, "-{af}: the server that answered");
+            assert_eq!(out.src_addr, Some(dst.parse().unwrap()));
+        }
     }
 }

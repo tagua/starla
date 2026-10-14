@@ -36,6 +36,30 @@ pub fn interface_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
+/// Send on a connected UDP socket the datagram `stamped` makes, with what
+/// it stamps (a send time), made once the socket is known to be writable,
+/// immediately before the send(2), as the reference stamps a query or a
+/// request just before its send (evtdig.c:1459-1465, ntp.c:544-564). A
+/// socket's readiness starts empty, so on a new socket the first
+/// writable() waits for a turn of the reactor; a stamp taken before it
+/// counted that wait. Should the send block after all, the datagram is
+/// made again.
+pub async fn send_stamped<S, B: AsRef<[u8]>>(
+    socket: &tokio::net::UdpSocket,
+    mut stamped: impl FnMut() -> (S, B),
+) -> (S, std::io::Result<usize>) {
+    loop {
+        if let Err(e) = socket.writable().await {
+            return (stamped().0, Err(e));
+        }
+        let (stamp, datagram) = stamped();
+        match socket.try_send(datagram.as_ref()) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            sent => return (stamp, sent),
+        }
+    }
+}
+
 /// Get the source IP address that would be used to reach a destination.
 ///
 /// Creates a UDP socket and connects it to the destination (without sending
@@ -59,8 +83,36 @@ pub fn get_source_addr_for_dest(dest: std::net::IpAddr) -> std::io::Result<std::
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::*;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    /// The stamp is taken after the socket is known to be writable: a new
+    /// socket's readiness is empty, so the first poll waits for the
+    /// reactor without stamping; the datagram goes out with its stamp.
+    #[tokio::test]
+    async fn a_datagram_is_stamped_when_the_socket_is_writable() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let stamps = std::cell::Cell::new(0u8);
+        let send = send_stamped(&socket, || {
+            stamps.set(stamps.get() + 1);
+            (std::time::Instant::now(), [stamps.get(); 3])
+        });
+        let mut send = std::pin::pin!(send);
+        let first = send.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(first.is_pending(), "a new socket is not known writable");
+        assert_eq!(stamps.get(), 0, "stamped before the socket was writable");
+        let polled = std::time::Instant::now();
+        let (stamp, sent) = send.await;
+        assert_eq!(sent.unwrap(), 3);
+        assert!(stamp > polled);
+        assert_eq!(stamps.get(), 1);
+        let mut buf = [0u8; 8];
+        assert_eq!(peer.recv(&mut buf).await.unwrap(), 3);
+        assert_eq!(buf[..3], [1; 3]);
+    }
 
     #[cfg(unix)]
     #[test]

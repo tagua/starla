@@ -22,6 +22,6 @@ pub use ssh::{
     ProbeInitInfo, SshConfig, SshConnection, TelnetState,
 };
 pub use telnet::{
-    CrontabLine, CrontabSpec, DnsSpec, HostTelemetryKind, HostTelemetrySpec, HttpSpec, NtpSpec,
-    PingSpec, ScheduleSpec, TelnetCommand, TelnetServer, TlsSpec, TracerouteSpec,
+    CondmvSpec, CrontabLine, CrontabSpec, DnsSpec, HostTelemetryKind, HostTelemetrySpec, HttpSpec,
+    NtpSpec, PingSpec, ScheduleSpec, TelnetCommand, TelnetServer, TlsSpec, TracerouteSpec,
 };

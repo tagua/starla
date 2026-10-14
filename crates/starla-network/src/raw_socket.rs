@@ -234,6 +234,29 @@ impl RawSocket {
         }
     }
 
+    /// Send on a connected socket the packet `packet` makes, made once the
+    /// socket is known to be writable, immediately before the send(2): a
+    /// send time it stamps into the packet is then the time the packet
+    /// left, as ping.c stamps its evdata just before its sendto
+    /// (fmticmp4/6, ping.c:559, 635; sendto 732, 757). A socket's
+    /// readiness starts empty, so on a new socket the first writable()
+    /// waits for a turn of the reactor; a packet made before it carried
+    /// that wait in its stamp. Should the send block after all, the packet
+    /// is made again.
+    pub async fn send_with(
+        &self,
+        mut packet: impl FnMut() -> io::Result<Vec<u8>>,
+    ) -> io::Result<usize> {
+        loop {
+            let mut guard = self.inner.writable().await?;
+            let buf = packet()?;
+            match guard.try_io(|inner| inner.get_ref().send(&buf)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
     /// Get the protocol this socket is configured for
     pub fn protocol(&self) -> Protocol {
         self.protocol
@@ -330,4 +353,35 @@ pub fn new_icmpv4_socket() -> io::Result<RawSocket> {
 /// Helper to create an ICMPv6 socket
 pub fn new_icmpv6_socket() -> io::Result<RawSocket> {
     RawSocket::new(Protocol::ICMPV6, Domain::IPV6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    /// The packet is made after the socket is known to be writable, not
+    /// before: a new socket's readiness is empty, so the first poll waits
+    /// for the reactor without making it; once made it goes out as made.
+    #[tokio::test]
+    async fn a_packet_is_made_when_the_socket_is_writable() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = RawSocket::new_with_type(Protocol::UDP, Domain::IPV4, Type::DGRAM).unwrap();
+        socket.connect(&peer.local_addr().unwrap()).unwrap();
+        let made = std::cell::Cell::new(0u8);
+        let send = socket.send_with(|| {
+            made.set(made.get() + 1);
+            Ok(vec![made.get(); 4])
+        });
+        let mut send = std::pin::pin!(send);
+        let first = send.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(first.is_pending(), "a new socket is not known writable");
+        assert_eq!(made.get(), 0, "made before the socket was writable");
+        assert_eq!(send.await.unwrap(), 4);
+        assert_eq!(made.get(), 1);
+        let mut buf = [0u8; 8];
+        assert_eq!(peer.recv(&mut buf).await.unwrap(), 4);
+        assert_eq!(buf[..4], [1; 4]);
+    }
 }

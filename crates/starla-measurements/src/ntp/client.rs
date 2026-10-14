@@ -4,10 +4,10 @@
 use super::NtpConfig;
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
 // NTP Epoch is 1900-01-01, Unix Epoch is 1970-01-01
 const NTP_OFFSET: u64 = 2_208_988_800;
@@ -29,17 +29,11 @@ pub const GAP_MAX_MS: u64 = 60000;
 pub const COUNT_DEFAULT: u32 = 3;
 pub const TIMEOUT_DEFAULT_MS: u64 = 1000;
 
-/// Convert NTP timestamp (64-bit: 32-bit seconds + 32-bit fraction) to f64
-fn ntp_ts_to_f64(ts: u64) -> f64 {
+/// Convert NTP timestamp (64-bit: 32-bit seconds + 32-bit fraction) to
+/// f64, as ntp.c does: seconds + fraction / 2^32, in a double
+pub(super) fn ntp_ts_to_f64(ts: u64) -> f64 {
     let secs = (ts >> 32) as f64;
     let frac = (ts & 0xFFFFFFFF) as f64 / FOUR_G;
-    secs + frac
-}
-
-/// Convert fixed-point 16.16 to f64 seconds
-fn ntp_short_to_secs(val: u32) -> f64 {
-    let secs = (val >> 16) as f64;
-    let frac = (val & 0xFFFF) as f64 / 65536.0;
     secs + frac
 }
 
@@ -84,6 +78,11 @@ fn request(t1: u64) -> BytesMut {
 /// A single NTP exchange sample
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpSample {
+    /// The header fields of the reply: the first reply's are the result's
+    /// (report(), ntp.c:443-479), and a later reply writes, in its own
+    /// entry, each of its own that differs from them (ready_callback,
+    /// :755-868)
+    pub header: NtpHeader,
     /// T1: client transmit time (NTP timestamp)
     pub origin_ts: f64,
     /// T2: server receive time (NTP timestamp)
@@ -98,168 +97,283 @@ pub struct NtpSample {
     pub offset: f64,
 }
 
-/// The server's header fields, from the first reply
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A reply's header fields as they came (struct ntphdr, ntp.c:154-167),
+/// as ready_callback keeps the first reply's (ntp_flags … ntp_reference_ts
+/// in its state, :755-767) and compares a later reply's with them, field
+/// by field (:768-868): a field differs when its bits do. report() and
+/// ready_callback format them (format_li … format_ts, :238-361).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NtpHeader {
+    /// Leap indicator, version and mode: ntp_flags
+    pub flags: u8,
     pub stratum: u8,
-    pub leap: u8,
-    pub version: u8,
-    pub mode: u8,
-    /// Raw poll exponent (log2)
-    pub poll: u8,
-    /// Raw precision exponent (log2)
+    /// Poll exponent (log2), a signed byte as evntp keeps it (int8_t
+    /// ntp_poll, ntp.c:134)
+    pub poll: i8,
+    /// Precision exponent (log2)
     pub precision: i8,
-    /// Root delay in seconds
-    pub root_delay: f64,
-    /// Root dispersion in seconds
-    pub root_dispersion: f64,
-    /// Reference ID
-    pub ref_id: String,
-    /// Reference timestamp (NTP)
-    pub ref_ts: f64,
+    /// Root delay, 16.16 seconds
+    pub root_delay: u32,
+    /// Root dispersion, 16.16 seconds
+    pub root_dispersion: u32,
+    /// Reference id, its four bytes as they came (big-endian)
+    pub ref_id: u32,
+    /// Reference timestamp, 32.32 NTP
+    pub ref_ts: u64,
+}
+
+impl NtpHeader {
+    /// NTP_LI_MASK (ntp.c:191)
+    pub fn leap(&self) -> u8 {
+        self.flags >> 6
+    }
+
+    /// NTP_VERSION_MASK (ntp.c:198)
+    pub fn version(&self) -> u8 {
+        (self.flags >> 3) & 0x7
+    }
+
+    /// NTP_MODE_MASK (ntp.c:201)
+    pub fn mode(&self) -> u8 {
+        self.flags & 0x7
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpResult {
-    /// None when no request was answered (evntp then prints no header)
-    pub header: Option<NtpHeader>,
-    /// One per request sent; None for a timeout (`{ "x":"*" }`)
+    /// One per reply and per timeout, in the order they came; None for a
+    /// timeout (`{ "x":"*" }`). The first reply's header is the result's;
+    /// none answered, evntp prints none.
     pub samples: Vec<Option<NtpSample>>,
+    /// The socket's own address once connected: the result's src_addr
+    pub src_addr: Option<IpAddr>,
+    /// create_socket's failure, `socket failed: …` or `connect failed: …`
+    /// (ntp.c:1225-1238, 1255-1274), which ends the run before any request
+    pub error: Option<String>,
 }
 
-/// Perform a single NTP exchange, returning the sample and the raw reply
-async fn ntp_exchange(
-    socket: &UdpSocket,
-    dest: SocketAddr,
-    timeout_dur: Duration,
-) -> anyhow::Result<(NtpSample, [u8; 48])> {
-    let t1 = now_ntp();
-    socket.send_to(&request(t1), dest).await?;
-
-    // Match the reply to this request. A bare recv_from on an unconnected
-    // socket accepts a late reply to the previous request -- or an off-path
-    // spoof -- as this one, and reports its arrival as our T4. Require the
-    // reply to come from the server we asked (RFC 5905 section 8) and to echo
-    // our transmit timestamp in its origin timestamp, and keep waiting until
-    // the deadline for one that does.
-    let deadline = Instant::now() + timeout_dur;
-    let mut recv_buf = [0u8; 48];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("NTP request timed out");
-        }
-        let (len, from) = match timeout(remaining, socket.recv_from(&mut recv_buf)).await {
-            Ok(res) => res?,
-            Err(_) => anyhow::bail!("NTP request timed out"),
-        };
-        if from.ip() != dest.ip() || len < 48 {
-            continue;
-        }
-        if recv_buf[24..32] != t1.to_be_bytes() {
-            continue;
-        }
-        let t4 = now_ntp();
-
-        let mut buf = &recv_buf[32..];
-        let t2 = buf.get_u64();
-        let t3 = buf.get_u64();
-        let (rtt, offset) = delay_and_offset(t1, t2, t3, t4);
-
-        return Ok((
-            NtpSample {
-                origin_ts: ntp_ts_to_f64(t1),
-                receive_ts: ntp_ts_to_f64(t2),
-                transmit_ts: ntp_ts_to_f64(t3),
-                final_ts: ntp_ts_to_f64(t4),
-                rtt,
-                offset,
-            },
-            recv_buf,
-        ));
-    }
+/// The sample a server's reply makes, received at `t4`: T1 is the reply's
+/// origin timestamp, the transmit timestamp of the request it answers, as
+/// ready_callback takes it (ntp.c:870-871, 899-911) — not the time Starla
+/// sent its latest request — and the reply's own header fields. None for a
+/// datagram shorter than a header, which ready_callback skips
+/// (ntp.c:735-740).
+fn sample(reply: &[u8], t4: u64) -> Option<NtpSample> {
+    let header = parse_header(reply)?;
+    let mut buf = reply.get(24..48)?;
+    let t1 = buf.get_u64();
+    let t2 = buf.get_u64();
+    let t3 = buf.get_u64();
+    let (rtt, offset) = delay_and_offset(t1, t2, t3, t4);
+    Some(NtpSample {
+        header,
+        origin_ts: ntp_ts_to_f64(t1),
+        receive_ts: ntp_ts_to_f64(t2),
+        transmit_ts: ntp_ts_to_f64(t3),
+        final_ts: ntp_ts_to_f64(t4),
+        rtt,
+        offset,
+    })
 }
 
-/// Send `config.count` requests, each at least `config.gap_ms` after the
-/// one before (5130's gap); an unanswered one within `config.timeout_ms` is
-/// recorded as a timeout and the next is still sent, as evntp does.
+/// evntp's run (ntp.c:503-972, 1174-1316): a socket connected to the
+/// server, so the kernel passes up only the server's datagrams
+/// (create_socket, 1255-1274), then `config.count` requests. Each request
+/// sets two timers, `-w` for its reply and `-g` before the next request
+/// (send_pkt, 640-655). Every datagram of a header or more is a reply,
+/// read the moment it comes and stamped just before it is read
+/// (ready_callback, 661-716): it is an entry of its own, its T1 the
+/// origin timestamp it carries, and it cancels the request's timeout. A
+/// timeout is a `{ "x":"*" }` entry (noreply_callback, 949-963). After a
+/// reply or a timeout the next request goes when the gap has passed, else
+/// when the gap timer fires (gap_callback, 965-972); after the last
+/// request's reply or timeout the run is over. As in libevent's loop, a
+/// turn runs the socket's callback for one datagram before the timers
+/// that came due in it, so a reply that is there when its timeout comes
+/// due still counts, and a stream of datagrams does not hold the timers
+/// off.
+///
+/// Starla's socket was unconnected and took any datagram from anyone as
+/// the answer, and its T1 was its own latest send time: a reply that came
+/// after its timeout was read only at the next request, as that request's
+/// answer, with T1 and T4 from that request (a delay near zero or
+/// negative, the offset off by the request's age), and a datagram from
+/// any other source was taken the same way. evntp checks neither the mode
+/// nor the origin of a reply: a late one is reported, with its own origin
+/// and so its real delay, in the place of the request then in flight, and
+/// that request's own reply, if it comes, after it.
 pub async fn execute_ntp_query(config: &NtpConfig) -> anyhow::Result<NtpResult> {
-    let bind_addr = if config.target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
+    use crate::ping::strerror;
+
+    let mut result = NtpResult {
+        samples: Vec::new(),
+        src_addr: None,
+        error: None,
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let bind_addr: SocketAddr = if config.target.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
     let dest = SocketAddr::new(config.target, config.port);
-    let timeout_dur = Duration::from_millis(config.timeout_ms);
-    let gap = Duration::from_millis(config.gap_ms);
-
-    let mut samples = Vec::new();
-    let mut header = None;
-
-    for i in 0..config.count {
-        let sent_at = tokio::time::Instant::now();
-        match ntp_exchange(&socket, dest, timeout_dur).await {
-            Ok((sample, raw)) => {
-                if header.is_none() {
-                    header = Some(parse_header(&raw));
-                }
-                samples.push(Some(sample));
-            }
-            Err(e) => {
-                tracing::debug!("NTP request {} to {} unanswered: {}", i + 1, dest, e);
-                samples.push(None);
-            }
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            result.error = Some(format!("socket failed: {}", strerror(&e)));
+            return Ok(result);
         }
-        if i + 1 < config.count {
-            tokio::time::sleep_until(sent_at + gap).await;
+    };
+    if let Err(e) = socket.connect(dest).await {
+        result.error = Some(format!("connect failed: {}", strerror(&e)));
+        return Ok(result);
+    }
+    // getsockname once connected (ntp.c:1286-1293)
+    result.src_addr = socket.local_addr().ok().map(|a| a.ip());
+
+    let timeout = Duration::from_millis(config.timeout_ms);
+    let gap = Duration::from_millis(config.gap_ms);
+    let mut sent = 0;
+    // A reply came to the latest request (gotresp)
+    let mut answered = false;
+    // The pending timers: the latest request's timeout, and the gap
+    let mut timeout_at: Option<tokio::time::Instant> = None;
+    let mut gap_at: Option<tokio::time::Instant> = None;
+    // Read errors in a row; past a few the socket waits for a timer
+    let mut errors = 0;
+    let mut buf = vec![0u8; 2048];
+
+    // send_pkt (ntp.c:503-659): the next request, or the end of the run
+    let mut send = true;
+    loop {
+        if send {
+            send = false;
+            answered = false;
+            if sent >= config.count {
+                break;
+            }
+            // T1 once the socket takes the request, just before the send
+            // (ntp.c:544-564): the first request's socket is new to the
+            // reactor, and T1 taken before `send().await` counted a reactor
+            // turn into the request's delay.
+            let (_t1, sending) = starla_network::send_stamped(&socket, || {
+                let t1 = now_ntp();
+                (t1, request(t1))
+            })
+            .await;
+            if let Err(e) = sending {
+                // Its timeout reports it as unanswered.
+                tracing::debug!("NTP request {} to {} not sent: {}", sent + 1, dest, e);
+            }
+            sent += 1;
+            let now = tokio::time::Instant::now();
+            timeout_at = Some(now + timeout);
+            gap_at = Some(now + gap);
+        }
+
+        let first_timer = timeout_at.into_iter().chain(gap_at).min();
+        let timer = async {
+            match first_timer {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        // The socket's event: a datagram, or an error pending on it, which
+        // libevent's epoll hands ready_callback as EV_READ too (EPOLLERR).
+        // tokio's readable() does not wake for EPOLLERR alone (its
+        // Ready::ERROR), so it is asked for.
+        tokio::select! {
+            ready = socket.ready(Interest::READABLE | Interest::ERROR), if errors < 16 => {
+                ready?;
+            }
+            () = timer => {}
+        }
+
+        // One turn of eperd's event loop: the socket's callback, one
+        // datagram read, then the timers that came due, which a callback
+        // before them may have deleted or set again. A timer that came due
+        // is no longer pending.
+        let now = tokio::time::Instant::now();
+        let gap_pending = gap_at.is_some_and(|at| at > now);
+        // ready_callback stamps the time, then reads (ntp.c:688, 714)
+        let t4 = now_ntp();
+        match read(&socket, &mut buf) {
+            Ok(len) => {
+                errors = 0;
+                if let Some(sample) = sample(&buf[..len], t4) {
+                    result.samples.push(Some(sample));
+                    answered = true;
+                    timeout_at = None;
+                    send = !gap_pending || sent >= config.count;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // a read error is skipped (ntp.c:718-724): an ICMP error on the
+            // connected socket, say, which the read takes
+            Err(_) => errors += 1,
+        }
+        if send {
+            // send_pkt set both timers again: neither is due
+            continue;
+        }
+        if timeout_at.is_some_and(|at| at <= now) {
+            // noreply_callback (ntp.c:949-963)
+            tracing::debug!("NTP request {} to {} unanswered", sent, dest);
+            result.samples.push(None);
+            timeout_at = None;
+            errors = 0;
+            send = !gap_pending || sent >= config.count;
+        }
+        if !send && gap_at.is_some_and(|at| at <= now) {
+            // gap_callback (ntp.c:965-972)
+            gap_at = None;
+            errors = 0;
+            send = answered || timeout_at.is_none();
         }
     }
 
-    Ok(NtpResult { header, samples })
+    Ok(result)
 }
 
-fn parse_header(raw: &[u8; 48]) -> NtpHeader {
-    let mut buf = &raw[..];
-    let first = buf.get_u8();
-    let li = (first >> 6) & 0x03;
-    let vn = (first >> 3) & 0x07;
-    let mode = first & 0x07;
-    let stratum = buf.get_u8();
-    let poll = buf.get_u8();
-    let precision = buf.get_i8();
-    let root_delay_raw = buf.get_u32();
-    let root_disp_raw = buf.get_u32();
-    let ref_id_raw = buf.get_u32();
-    let ref_ts = buf.get_u64();
-
-    // Reference ID: stratum <= 1 uses ASCII, >= 2 uses hex
-    let ref_id = if stratum <= 1 {
-        let bytes = ref_id_raw.to_be_bytes();
-        String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .to_string()
-    } else {
-        format!("{:08x}", ref_id_raw)
-    };
-
-    NtpHeader {
-        stratum,
-        leap: li,
-        version: vn,
-        mode,
-        poll,
-        precision,
-        root_delay: ntp_short_to_secs(root_delay_raw),
-        root_dispersion: ntp_short_to_secs(root_disp_raw),
-        ref_id,
-        ref_ts: ntp_ts_to_f64(ref_ts),
+/// ready_callback's read (ntp.c:714-724): a socket error pending — an ICMP
+/// error on the connected socket, port unreachable, say — is what the read
+/// returns, and takes, before any datagram: Linux's UDP recvmsg asks
+/// sock_error first. On Linux only EPOLLERR says so, which tokio keeps as
+/// Ready::ERROR, and its try_recv, seeing no READABLE, would not read: the
+/// error stayed, and the next request's send took it instead and did not
+/// go out. It is taken here with SO_ERROR, as the read takes it. (macOS
+/// reports the error readable, and the read takes it.)
+fn read(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<usize> {
+    let pending = socket.try_io(Interest::ERROR, || match socket.take_error() {
+        Ok(Some(e)) => Ok(e),
+        // none: the readiness goes, until the next error
+        Ok(None) => Err(std::io::ErrorKind::WouldBlock.into()),
+        Err(e) => Ok(e),
+    });
+    match pending {
+        Ok(e) => Err(e),
+        Err(_) => socket.try_recv(buf),
     }
+}
+
+/// The header fields of a reply of a header or more, as they came.
+fn parse_header(raw: &[u8]) -> Option<NtpHeader> {
+    let mut buf = raw.get(..48)?;
+    Some(NtpHeader {
+        flags: buf.get_u8(),
+        stratum: buf.get_u8(),
+        poll: buf.get_i8(),
+        precision: buf.get_i8(),
+        root_delay: buf.get_u32(),
+        root_dispersion: buf.get_u32(),
+        ref_id: buf.get_u32(),
+        ref_ts: buf.get_u64(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn ts(secs: f64) -> u64 {
         (secs * FOUR_G).round() as u64
@@ -325,7 +439,6 @@ mod tests {
 
         let config = NtpConfig {
             target: "127.0.0.1".parse().unwrap(),
-            dst_name: "127.0.0.1".into(),
             timeout_ms: 300,
             port,
             count: 3,
@@ -335,7 +448,8 @@ mod tests {
         assert_eq!(res.samples.len(), 3);
         assert!(res.samples[0].is_some() && res.samples[1].is_some());
         assert!(res.samples[2].is_none(), "the third timed out");
-        assert_eq!(res.header.unwrap().ref_id, "GPS");
+        let header = res.samples[0].as_ref().unwrap().header;
+        assert_eq!(header.ref_id.to_be_bytes(), *b"GPS\0");
 
         let mut at = Vec::new();
         while let Ok((t, req)) = rx.try_recv() {
@@ -350,5 +464,255 @@ mod tests {
                 w[1] - w[0]
             );
         }
+    }
+
+    /// A server's reply to `request`, received at `t2` and sent at `t3`:
+    /// mode 4, stratum 1, "GPS", the request's transmit timestamp as origin.
+    fn reply(request: &[u8; 48], t2: u64, t3: u64) -> [u8; 48] {
+        let mut reply = *request;
+        reply[0] = 0x24; // LI 0, VN 4, mode 4 (server)
+        reply[1] = 1; // stratum 1
+        reply[12..16].copy_from_slice(b"GPS\0");
+        reply[24..32].copy_from_slice(&request[40..48]); // origin = T1
+        reply[32..40].copy_from_slice(&t2.to_be_bytes());
+        reply[40..48].copy_from_slice(&t3.to_be_bytes());
+        reply
+    }
+
+    fn config(port: u16, count: u32, timeout_ms: u64, gap_ms: u64) -> NtpConfig {
+        NtpConfig {
+            target: "127.0.0.1".parse().unwrap(),
+            timeout_ms,
+            port,
+            count,
+            gap_ms,
+        }
+    }
+
+    /// A reply that comes after its timeout, while the next request is in
+    /// flight, is an entry of its own with its own origin and so its real
+    /// delay and offset, and the next request's reply is another
+    /// (ready_callback, ntp.c:661-946). The server holds its reply to
+    /// request 1 until request 2 comes (its T3 - T2 says so), then answers
+    /// that one 30 ms later. Starla took the late reply as request 2's
+    /// answer, with request 2's T1 (a delay of minus the gap, the offset off
+    /// by half of it), and request 2's reply as request 3's.
+    #[tokio::test]
+    async fn a_late_reply_is_not_the_next_requests_answer() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let (first, first_at) = (buf, now_ntp());
+            seen.lock().unwrap().push(buf);
+            let (_, _) = server.recv_from(&mut buf).await.unwrap();
+            let second_at = now_ntp();
+            seen.lock().unwrap().push(buf);
+            server
+                .send_to(&reply(&first, first_at, now_ntp()), from)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            server
+                .send_to(&reply(&buf, second_at, now_ntp()), from)
+                .await
+                .unwrap();
+            let (_, _) = server.recv_from(&mut buf).await.unwrap();
+            let at = now_ntp();
+            seen.lock().unwrap().push(buf);
+            server.send_to(&reply(&buf, at, at), from).await.unwrap();
+        });
+
+        let res = execute_ntp_query(&config(port, 3, 150, 250)).await.unwrap();
+        let t1: Vec<f64> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| ntp_ts_to_f64(u64::from_be_bytes(r[40..48].try_into().unwrap())))
+            .collect();
+        assert_eq!(t1.len(), 3);
+        assert_eq!(res.samples.len(), 4, "{:?}", res.samples);
+        assert!(res.samples[0].is_none(), "request 1 timed out");
+        let late = res.samples[1].as_ref().unwrap();
+        assert_eq!(late.origin_ts, t1[0], "the late reply is request 1's");
+        assert!(late.final_ts - late.origin_ts >= 0.25, "{late:?}");
+        let second = res.samples[2].as_ref().unwrap();
+        assert_eq!(second.origin_ts, t1[1]);
+        assert!(second.final_ts - second.origin_ts >= 0.03, "{second:?}");
+        let third = res.samples[3].as_ref().unwrap();
+        assert_eq!(third.origin_ts, t1[2]);
+        for s in res.samples.iter().flatten() {
+            assert!((0.0..0.05).contains(&s.rtt), "{s:?}");
+            assert!(s.offset.abs() < 0.05, "{s:?}");
+        }
+    }
+
+    /// The socket is connected to the server (create_socket, ntp.c:
+    /// 1255-1274), so a datagram from anywhere else never reaches it: here
+    /// a reply from another port, the request's origin in it and the clock
+    /// 1000 s ahead, comes before the server's own. Starla's socket was not
+    /// connected and took it.
+    #[tokio::test]
+    async fn a_reply_from_elsewhere_is_not_read() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let spoofer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let at = now_ntp();
+            let ahead = at + (1000 << 32);
+            spoofer
+                .send_to(&reply(&buf, ahead, ahead), from)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .send_to(&reply(&buf, at, now_ntp()), from)
+                .await
+                .unwrap();
+        });
+
+        let res = execute_ntp_query(&config(port, 1, 500, 2000))
+            .await
+            .unwrap();
+        assert_eq!(res.samples.len(), 1);
+        let s = res.samples[0].as_ref().unwrap();
+        assert!(s.offset.abs() < 1.0, "the spoofed reply was read: {s:?}");
+        assert!(s.final_ts - s.origin_ts >= 0.05, "{s:?}");
+        assert_eq!(res.src_addr, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    /// T1 is taken once the socket takes the request, just before its send
+    /// (ntp.c:544-564). The run's socket is new to the reactor, so its first
+    /// send waits a reactor turn for writable: a run held there 50 ms — a
+    /// busy runtime — still has the delay of the server's answer alone.
+    /// Stamped before that wait, as c9cb056 stamped it, T1 put the 50 ms
+    /// into the delay.
+    #[tokio::test]
+    async fn t1_is_taken_when_the_socket_takes_the_request() {
+        use std::future::Future;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (came, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let at = now_ntp();
+            server.send_to(&reply(&buf, at, at), from).await.unwrap();
+            let _ = came.send(());
+        });
+
+        let config = config(port, 1, 1000, 2000);
+        let mut run = std::pin::pin!(execute_ntp_query(&config));
+        let first = run
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(first.is_pending(), "a new socket is not known writable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(requests.try_recv().is_err(), "sent before it was writable");
+        let res = run.await.unwrap();
+        let s = res.samples[0].as_ref().unwrap();
+        assert!(s.rtt < 0.04, "the wait for writable is in the delay: {s:?}");
+    }
+
+    /// Each reply's sample carries that reply's own header fields, as
+    /// ready_callback reads each reply's (ntp.c:755-868): here a root
+    /// dispersion that grows 4/65536 s a reply, as time.mediainvent.at's
+    /// does in the lines RIPE stores from 5130 probes (msm 112928959).
+    /// Starla kept the first reply's alone.
+    #[tokio::test]
+    async fn each_sample_has_its_replys_header() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            for n in 0..3u32 {
+                let (_, from) = server.recv_from(&mut buf).await.unwrap();
+                let at = now_ntp();
+                let mut answer = reply(&buf, at, at);
+                answer[8..12].copy_from_slice(&(2354 + 4 * n).to_be_bytes());
+                server.send_to(&answer, from).await.unwrap();
+            }
+        });
+
+        let res = execute_ntp_query(&config(port, 3, 500, 150)).await.unwrap();
+        let headers: Vec<NtpHeader> = res.samples.iter().flatten().map(|s| s.header).collect();
+        assert_eq!(headers.len(), 3, "{:?}", res.samples);
+        let dispersions: Vec<u32> = headers.iter().map(|h| h.root_dispersion).collect();
+        assert_eq!(dispersions, [2354, 2358, 2362]);
+        for h in headers {
+            assert_eq!((h.flags, h.stratum), (0x24, 1));
+            assert_eq!((h.leap(), h.version(), h.mode()), (0, 4, 4));
+            assert_eq!(h.ref_id.to_be_bytes(), *b"GPS\0");
+        }
+    }
+
+    /// The poll exponent is a signed byte (int8_t ntp_poll, ntp.c:134),
+    /// as precision: 0xfa is -6, which format_8bit prints as 0.015625.
+    #[test]
+    fn the_poll_is_a_signed_byte() {
+        let mut r = [0u8; 48];
+        r[2] = 0xfa;
+        r[3] = 0xe9;
+        let h = parse_header(&r).unwrap();
+        assert_eq!((h.poll, h.precision), (-6, -23));
+    }
+
+    /// The first request goes to a closed port: the ICMP port unreachable
+    /// leaves an error on the connected socket, which ready_callback's read
+    /// takes and skips (ntp.c:714-724, libevent handing it EPOLLERR as
+    /// EV_READ), and the request times out. The server is then up for the
+    /// second and third, which both go out and are answered. On Linux,
+    /// waiting on readable() alone, Starla never read the error; the
+    /// second request's send took it (ECONNREFUSED) and did not go out.
+    #[tokio::test]
+    async fn an_icmp_error_is_read_and_the_next_request_goes_out() {
+        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let (came, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            // up once the first request has met the closed port
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let server = UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
+            let mut buf = [0u8; 48];
+            loop {
+                let (_, from) = server.recv_from(&mut buf).await.unwrap();
+                let at = now_ntp();
+                server.send_to(&reply(&buf, at, at), from).await.unwrap();
+                let _ = came.send(buf);
+            }
+        });
+
+        let res = execute_ntp_query(&config(port, 3, 250, 300)).await.unwrap();
+        server.abort();
+        let mut answered = 0;
+        while requests.try_recv().is_ok() {
+            answered += 1;
+        }
+        assert_eq!(answered, 2, "{:?}", res.samples);
+        assert_eq!(res.samples.len(), 3, "{:?}", res.samples);
+        assert!(res.samples[0].is_none(), "{:?}", res.samples);
+        assert!(
+            res.samples[1].is_some() && res.samples[2].is_some(),
+            "{:?}",
+            res.samples
+        );
+    }
+
+    /// Datagrams shorter than a header are skipped (ntp.c:735-740).
+    #[test]
+    fn a_short_datagram_is_no_reply() {
+        assert!(sample(&[0u8; 47], 0).is_none());
+        assert!(parse_header(&[0u8; 47]).is_none());
+        let mut r = [0u8; 48];
+        r[24..32].copy_from_slice(&ts(3_000_000_000.0).to_be_bytes());
+        r[32..48].copy_from_slice(&[0u8; 16]);
+        let s = sample(&r, ts(3_000_000_000.5)).unwrap();
+        assert_eq!(s.origin_ts, 3_000_000_000.0, "T1 is the reply's origin");
     }
 }
