@@ -90,6 +90,9 @@ impl LineGone {
 pub(crate) struct Now {
     /// Unix seconds
     pub wall: i64,
+    /// The wall clock's microseconds into `wall`, gettimeofday's tv_usec:
+    /// set_timeout's wait takes them into account (eperd.c:756-763)
+    pub usec: u32,
     pub mono: Instant,
 }
 
@@ -98,9 +101,10 @@ impl Now {
     /// from the monotonic moment never runs out before the wall clock
     /// reaches its end.
     pub(crate) fn read() -> Self {
-        let wall = unix_now();
+        let wall = wall_now();
         Self {
-            wall,
+            wall: wall.as_secs() as i64,
+            usec: wall.subsec_micros(),
             mono: Instant::now(),
         }
     }
@@ -115,6 +119,7 @@ pub(crate) fn at(wall: i64) -> Now {
     let base = *BASE.get_or_init(Instant::now);
     Now {
         wall,
+        usec: 0,
         mono: base + Duration::from_secs(u64::try_from(wall).expect("a test's wall clock")),
     }
 }
@@ -240,13 +245,71 @@ impl ScheduledTask {
         if self.is_expired(self.next_run.min(now.wall)) {
             return Fired::Expired;
         }
+        self.advance(now);
+        Fired::Run
+    }
+
+    /// perd's TestJobs for the line, where [`fire`](Self::fire) is eperd's
+    /// RunJob: crons/main is perd's crontab (bin/ripe-atlas.in:126-128).
+    /// perd's timer is the wall clock alone, and it has no 10 s rule and
+    /// writes no record (perd.c:775-830, 1226-1248):
+    ///
+    /// - the line runs once the wall clock reaches `next_run` and its start
+    ///   time, however late, unless the wall clock is past its end time;
+    /// - a wall clock stepped back keeps it waiting for its slot, unless it
+    ///   went back more than 10 intervals: then perd starts the line over
+    ///   (nextcycle 0) and it runs at once, on to the first cycle after now.
+    pub(crate) fn fire_perd(&mut self, now: Now) -> Fired {
+        if !self.armed {
+            return Fired::NotYet;
+        }
+        if now.wall < self.next_run {
+            let went_back = now.wall >= self.start_time
+                && now.wall < slot(self.start_time, self.interval, self.cycle - 10);
+            if !went_back {
+                return Fired::NotYet;
+            }
+            self.armed = false;
+            if self.is_expired(now.wall) {
+                return Fired::Expired;
+            }
+            self.draw_cycle(now);
+            return Fired::Run;
+        }
+        // perd runs a line only from its start time on (perd.c:814-818):
+        // a spread can put cycle 0's time before it
+        if now.wall < self.start_time {
+            return Fired::NotYet;
+        }
+        self.armed = false;
+        if self.is_expired(now.wall) {
+            return Fired::Expired;
+        }
+        self.advance(now);
+        Fired::Run
+    }
+
+    /// RunJob's next cycle once the line runs (eperd.c:1328-1338): the one
+    /// after this, or, if that cycle's slot has passed, the first after
+    /// now; its offset drawn and the timer set.
+    fn advance(&mut self, now: Now) {
+        // RunJob reads the clock as its timer fires: in the cycle's second,
+        // at its offset's microseconds, when the tick that took the line
+        // came before them — the run starts there ([`Start`])
+        let fired = Now {
+            usec: if now.wall == self.next_run {
+                now.usec.max(self.usec)
+            } else {
+                now.usec
+            },
+            ..now
+        };
         self.cycle += 1;
         if slot(self.start_time, self.interval, self.cycle) < now.wall {
             self.cycle = first_cycle_after(now.wall, self.start_time, self.interval);
         }
         self.do_distr();
-        self.set_timeout(now);
-        Fired::Run
+        self.set_timeout(fired);
     }
 
     /// When this cycle's run starts: the second its timer is set for and
@@ -317,22 +380,21 @@ impl ScheduledTask {
     /// are kept for RunJob's record. The wait is the timeval set_timeout
     /// arms, tv_sec: nexttime less now, less a second when the offset's
     /// microseconds are fewer than now's (:756-763), 0 if that is negative
-    /// (:764-765). Starla's timer is the second's — its lines are taken on
-    /// a 1 s tick, and a run sleeps its offset's microseconds once it is
-    /// taken ([`Start`]) — and it reads the clock in whole seconds, the
-    /// moment itself being some way into that second: always the second
-    /// less.
+    /// (:764-765). Starla gave every record the second less, as if the
+    /// clock were always read past the offset's microseconds.
     ///
-    /// The timer's monotonic deadline is the wait event_add counts
-    /// (:776): `next_run` less the second read, from the monotonic moment
-    /// read with it — 0 for a time already past, which fires at once.
+    /// The timer's monotonic deadline is the wait in whole seconds, from
+    /// the second read: Starla's timer is the second's — its lines are
+    /// taken on a 1 s tick, and a run sleeps its offset's microseconds once
+    /// it is taken ([`Start`]) — 0 for a time already past, which fires at
+    /// once.
     fn set_timeout(&mut self, now: Now) {
         if self.is_expired(now.wall) {
             return;
         }
         self.armed = true;
         self.generated = now.wall;
-        self.waittime = (self.next_run - now.wall - 1).max(0);
+        self.waittime = (self.next_run - now.wall - i64::from(self.usec < now.usec)).max(0);
         self.deadline = now.mono + Duration::from_secs((self.next_run - now.wall).max(0) as u64);
     }
 }
@@ -401,13 +463,6 @@ impl InconsistentTime {
         body.push('"');
         body
     }
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 /// eperd's set_timeout: cycle 0 while `start_time` is still ahead, else the
@@ -579,6 +634,7 @@ mod tests {
         assert_eq!(t.next_run, slot);
         let stepped = |wall: i64, mono: i64| Now {
             wall,
+            usec: 0,
             mono: at(mono).mono,
         };
         // the wall clock 8 s back: neither clock is there a second before
@@ -713,7 +769,13 @@ mod tests {
         let mut t = ScheduledTask::new_at(at(generated), 1, 60, 1, 2_000_000_000, 14, job());
         assert_eq!(t.cycle, 29_865_601);
         t.next_run = 1_791_936_061 - 5;
-        t.set_timeout(at(generated));
+        // waittime 48, not 49: the offset's microseconds were fewer than
+        // the clock's when the timer was set
+        t.usec = 250_000;
+        t.set_timeout(Now {
+            usec: 700_000,
+            ..at(generated)
+        });
 
         let fired = t.fire(at(1_791_936_764));
         let Fired::Inconsistent(times) = fired else {
@@ -743,6 +805,91 @@ mod tests {
         assert_eq!(t.cycle, 29_865_613);
         assert!((1_791_936_781 - 7..=1_791_936_781 + 7).contains(&t.next_run));
         assert_eq!(t.fire(at(t.next_run)), Fired::Run);
+    }
+
+    /// The record's waittime is set_timeout's tv_sec: nexttime less now,
+    /// and a second less only when the offset's microseconds are fewer than
+    /// now's (eperd.c:756-765). Starla always took the second off.
+    #[test]
+    fn the_records_waittime_is_set_timeouts_seconds() {
+        let generated = 1_791_936_007;
+        let waittime = |next_run: i64, usec: u32, now_usec: u32| {
+            let mut t = ScheduledTask::new_at(at(generated), 1, 60, 1, 2_000_000_000, 14, job());
+            t.next_run = next_run;
+            t.usec = usec;
+            t.set_timeout(Now {
+                usec: now_usec,
+                ..at(generated)
+            });
+            let Fired::Inconsistent(times) = t.fire(at(1_791_936_764)) else {
+                panic!("not inconsistent");
+            };
+            times.waittime
+        };
+        assert_eq!(waittime(1_791_936_056, 250_000, 700_000), 48);
+        assert_eq!(waittime(1_791_936_056, 700_000, 700_000), 49);
+        assert_eq!(waittime(1_791_936_056, 900_000, 0), 49);
+        // a time already past: 0 (:764-765)
+        assert_eq!(waittime(generated, 250_000, 700_000), 0);
+        assert_eq!(waittime(generated - 3, 900_000, 0), 0);
+    }
+
+    /// RunJob sets the next cycle's timer at the moment its own fired: in
+    /// the cycle's second, at its offset's microseconds (eperd.c:1328-1338,
+    /// 756-763). Starla's tick takes the line as the second begins, before
+    /// them; the wait is counted from where the run starts, so it is a
+    /// second less exactly when the next offset's microseconds are fewer
+    /// than this one's.
+    #[test]
+    fn the_next_timer_is_set_as_the_run_starts() {
+        let slot = 1_791_836_412;
+        for _ in 0..200 {
+            let mut t =
+                ScheduledTask::new_at(at(slot - 400), 1, 900, 312, 2_000_000_000, 20, job());
+            t.next_run = slot;
+            t.usec = 800_000;
+            let tick = Now {
+                usec: 3_000,
+                ..at(slot)
+            };
+            assert_eq!(t.fire(tick), Fired::Run);
+            assert_eq!(t.generated, slot);
+            assert_eq!(
+                t.waittime,
+                t.next_run - slot - i64::from(t.usec < 800_000),
+                "next at {} and {} µs",
+                t.next_run,
+                t.usec
+            );
+        }
+        // A tick past the offset's microseconds, or in a later second,
+        // reads the clock as it is
+        let mut t = ScheduledTask::new_at(at(slot - 400), 1, 900, 312, 2_000_000_000, 0, job());
+        t.next_run = slot;
+        t.usec = 800_000;
+        assert_eq!(
+            t.fire(Now {
+                usec: 3_000,
+                ..at(slot + 1)
+            }),
+            Fired::Run
+        );
+        assert_eq!((t.next_run, t.usec), (slot + 900, 0));
+        assert_eq!(t.waittime, 900 - 1 - 1);
+    }
+
+    /// perd runs a line from its start time on (perd.c:814-818): a spread
+    /// that puts cycle 0's time before it waits for it.
+    #[test]
+    fn a_perd_line_waits_for_its_start_time() {
+        let start = 1_791_836_400;
+        let mut t = ScheduledTask::new_at(at(start - 100), 1, 900, start, 2_000_000_000, 20, job());
+        assert_eq!(t.cycle, 0);
+        t.set_next_run(start - 5, at(start - 100));
+        assert_eq!(t.fire_perd(at(start - 5)), Fired::NotYet);
+        assert_eq!(t.fire_perd(at(start - 1)), Fired::NotYet);
+        assert_eq!(t.fire_perd(at(start)), Fired::Run);
+        assert_eq!(t.cycle, 1);
     }
 
     #[test]

@@ -35,14 +35,18 @@ pub use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Lines the writer thread may have queued before new ones are dropped.
 ///
-/// The largest burst Starla logs is a crontab push under the debug drop-in:
-/// ~800 CRONLINEs at ~4 debug events each is ~3,200 lines per crontab, and
-/// three crontabs can come back to back, ~9,600 lines within milliseconds.
-/// 16,384 holds all of that even if the output stalls just as it starts.
-/// The queue's slots are allocated up front, 32 bytes each: 512 KiB here,
+/// The largest burst Starla logs is a crontab push under the debug drop-in,
+/// which also has `starla_controller::telnet=trace`: each CRONLINE is five
+/// events — telnet's "received" line (debug), its "CRONLINE: interval="
+/// and command parse lines (trace), and the command handler's "Processing
+/// command" and "Scheduled <type> measurement" (debug). ~800 CRONLINEs are
+/// ~4,000 lines a crontab, and three crontabs can come back to back,
+/// ~12,000 lines within milliseconds. 32,768 holds that with room for as
+/// much again if the output stalls just as it starts; 16,384 left ~4,400.
+/// The queue's slots are allocated up front, 32 bytes each: 1 MiB here,
 /// where tracing-appender's default of 128,000 lines would be 4 MiB. A full
-/// queue of ordinary ~150-byte lines holds another ~2.5 MiB of text.
-pub const BUFFERED_LINES_LIMIT: usize = 16 * 1024;
+/// queue of ordinary ~150-byte lines holds another ~5 MiB of text.
+pub const BUFFERED_LINES_LIMIT: usize = 32 * 1024;
 
 /// The writer thread's name, as `top -H` shows it (at most 15 bytes).
 const WRITER_THREAD: &str = "starla-log";
@@ -168,6 +172,12 @@ impl Drop for LogGuard {
 }
 
 /// Ends the process as an unhandled SIGTERM would have.
+///
+/// As PID 1 — the twin's container runs Starla so, with no init — the
+/// kernel ignores a signal whose action is the default: raise() returns,
+/// and the process exits with 128 + SIGTERM, 143, the status a shell gives
+/// a process SIGTERM killed. Before the hook Starla ignored SIGTERM there
+/// and was SIGKILLed at the end of docker's grace period (137).
 #[cfg(unix)]
 fn die_of_sigterm() -> ! {
     // SAFETY: libc calls on a local signal set; the default action of
@@ -184,8 +194,11 @@ fn die_of_sigterm() -> ! {
 }
 
 /// Stops the writer thread once it has written what is queued, giving up
-/// after [`FLUSH_TIMEOUT`]. The first call does it; later ones find nothing
-/// to stop.
+/// after [`FLUSH_TIMEOUT`]. The first call does it, and holds the lock
+/// while it waits: main's drop and the SIGTERM thread can both come, and
+/// the second waits on the lock for the flush the first started, then
+/// finds nothing to stop. It returned at once, and the process could end
+/// with the lines still being written.
 ///
 /// Dropping tracing-appender's `WorkerGuard` queues a shutdown behind the
 /// lines (waiting up to 100 ms for room), then waits up to 1 s for the
@@ -201,18 +214,42 @@ fn die_of_sigterm() -> ! {
 /// good: if the queue stays full for 100 ms it println!s that it failed, to
 /// the same stdout that is not being read.
 fn stop_writer(worker: &Mutex<Option<Writer>>) {
-    let Some(Writer { guard, finished }) =
-        worker.lock().unwrap_or_else(PoisonError::into_inner).take()
-    else {
+    let mut writer = worker.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(Writer { guard, finished }) = writer.take() else {
         return;
     };
-    // If no thread can be started, the closure, and the guard with it, is
-    // dropped here, on this thread.
-    let _ = std::thread::Builder::new()
-        .name("starla-log-stop".to_string())
-        .spawn(move || drop(guard));
+    drop_elsewhere(guard, |drop_it| {
+        std::thread::Builder::new()
+            .name("starla-log-stop".to_string())
+            .spawn(drop_it)
+            .map(|_| ())
+    });
     // Nothing is ever sent: Err(Disconnected) is the writer thread's end.
     let _ = finished.recv_timeout(FLUSH_TIMEOUT);
+}
+
+/// Drops `value` on the thread `spawn` starts, or never, if it starts none.
+///
+/// The value goes to the thread through a channel once the thread is
+/// running, so a failed spawn — TasksMax reached as the probe stops — still
+/// has it here, and it is forgotten, not dropped on this thread: the
+/// guard's drop could block for good (see [`stop_writer`]), with SIGTERM's
+/// exit or main's behind it. Without the shutdown the guard would have
+/// queued, the writer thread goes on writing the queue while the stop
+/// waits for it, and the lines are written all the same; the wait is then
+/// the whole [`FLUSH_TIMEOUT`]. The guard used to be moved into the
+/// closure, which a failed spawn drops where it fails.
+fn drop_elsewhere<T: Send + 'static>(
+    value: T,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+) {
+    let (hand, take) = mpsc::channel::<T>();
+    match spawn(Box::new(move || drop(take.recv()))) {
+        Ok(()) => {
+            let _ = hand.send(value);
+        }
+        Err(_) => std::mem::forget(value),
+    }
 }
 
 /// Initialize logging subsystem
@@ -672,6 +709,69 @@ mod tests {
             written, LINES,
             "written when the drop returned, after {waited:?}"
         );
+    }
+
+    /// The SIGTERM thread and main's drop can both stop the writer: the
+    /// second waits for the flush the first started instead of returning
+    /// while lines are still being written.
+    #[test]
+    fn a_second_stop_waits_for_the_first_ones_flush() {
+        const LINES: usize = 200;
+        const STALL: Duration = Duration::from_millis(1_000);
+        let output = Gate::default();
+        let guard = queue_lines(&output, LINES);
+        let worker = Arc::clone(&guard.worker);
+        let first = std::thread::spawn(move || drop(guard));
+        // the first stop has taken the writer, and waits on the closed
+        // output (holding the lock as it does)
+        wait_for("the first stop", || {
+            (!worker.try_lock().is_ok_and(|writer| writer.is_some())).then_some(())
+        });
+        let opener = std::thread::spawn({
+            let output = output.clone();
+            move || {
+                std::thread::sleep(STALL);
+                output.open();
+            }
+        });
+
+        stop_writer(&worker);
+        let written = output
+            .text()
+            .lines()
+            .filter(|l| l.contains("queued line"))
+            .count();
+        first.join().unwrap();
+        opener.join().unwrap();
+        assert_eq!(written, LINES, "written when the second stop returned");
+    }
+
+    /// A value is dropped on the thread started for it; if none can be
+    /// started, it is forgotten rather than dropped on the calling thread,
+    /// where the log guard's drop could block for good.
+    #[test]
+    fn a_value_is_dropped_on_its_own_thread_or_never() {
+        struct Noted(mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Noted {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+
+        let (noted, drops) = mpsc::channel();
+        drop_elsewhere(Noted(noted), |f| {
+            std::thread::spawn(f);
+            Ok(())
+        });
+        let on = drops.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(on, std::thread::current().id());
+
+        let (noted, drops) = mpsc::channel();
+        drop_elsewhere(Noted(noted), |_| Err(io::Error::other("no thread")));
+        assert!(matches!(
+            drops.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
     }
 
     /// An output that takes nothing at all holds the exit for FLUSH_TIMEOUT,

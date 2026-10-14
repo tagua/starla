@@ -1745,10 +1745,10 @@ mod tests {
             "the stall ran out before the last submit: the test proves nothing"
         );
         // A submit that waited for the queues' locks would have waited
-        // until the stall ran out, 10 s; 50 ms leaves room for a loaded
-        // host's preemption
+        // until the stall ran out, 10 s. 1 s leaves room for a loaded
+        // host's preemption, which has held a thread here 75 ms.
         assert!(
-            slowest < Duration::from_millis(50),
+            slowest < Duration::from_secs(1),
             "a submit waited {slowest:?}"
         );
 
