@@ -11,12 +11,18 @@
 ///
 /// Within the probe's cgroup (starla.service) the kernel's fair scheduler
 /// shares the CPU between the probe's threads by weight, nice 0 weighing
-/// 1024 and nice 10 weighing 110 (sched_prio_to_weight): a measurement
-/// thread that wakes for a reply runs ahead of a background thread busy on
-/// the same CPU instead of queueing behind it for a slice. Russh's
-/// 8192-bit group exchange computes for ~0.3 s at every connect and rekey
-/// on the background thread; the measurement threads take their replies
-/// meanwhile.
+/// 1024 and nice 10 weighing 110 (sched_prio_to_weight): a background
+/// thread busy on a CPU gets about a tenth of it while a measurement
+/// thread wants it too. Russh's 8192-bit group exchange computes for
+/// ~0.3 s at every connect and rekey on the background thread.
+///
+/// Nice sets the share, not who runs first at a wakeup. Under EEVDF a
+/// running thread keeps the rest of its slice (base_slice_ns, ~2.8 ms on
+/// enodia) whatever its nice, so a measurement thread woken for a reply on
+/// the CPU where the background thread is computing can wait up to that
+/// slice, unless the kernel puts it on the other CPU. The background
+/// thread on SCHED_IDLE ([`idle_this_thread`]) is preempted at once
+/// instead (check_preempt_wakeup_fair); that is an option, off by default.
 pub const BACKGROUND_NICE_INCREMENT: i32 = 10;
 
 /// The highest nice value Linux has.
@@ -86,6 +92,41 @@ impl Nice {
     }
 }
 
+/// Puts the calling thread on SCHED_IDLE, the policy of a thread that gives
+/// way at once to any other woken on its CPU, and whose share of it is
+/// below nice 19's. Whether it was set: never elsewhere than on Linux.
+///
+/// For the background threads, with `[measurements] background_sched_idle`
+/// (see [`BACKGROUND_NICE_INCREMENT`]). A thread starts on its creator's
+/// policy. Going to SCHED_IDLE needs no privilege; sched_setscheduler is
+/// in the unit's `@system-service` filter (by its @resources), and
+/// RestrictRealtime forbids only the real-time policies.
+pub fn idle_this_thread() -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: param lives for the call; pid 0 is the calling thread.
+        if unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
+
+/// Whether the calling thread runs on SCHED_IDLE.
+#[cfg(target_os = "linux")]
+pub fn this_thread_is_idle() -> std::io::Result<bool> {
+    // SAFETY: takes no pointers; pid 0 is the calling thread.
+    match unsafe { libc::sched_getscheduler(0) } {
+        -1 => Err(std::io::Error::last_os_error()),
+        policy => Ok(policy == libc::SCHED_IDLE),
+    }
+}
+
 /// The calling thread's nice value.
 #[cfg(target_os = "linux")]
 pub fn this_thread_nice() -> std::io::Result<i32> {
@@ -152,9 +193,27 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_goes_idle_on_its_own() {
+        assert!(!this_thread_is_idle().unwrap());
+        let (idle, child) = std::thread::spawn(|| {
+            assert!(idle_this_thread().unwrap());
+            let child = std::thread::spawn(|| this_thread_is_idle().unwrap())
+                .join()
+                .unwrap();
+            (this_thread_is_idle().unwrap(), child)
+        })
+        .join()
+        .unwrap();
+        assert_eq!((idle, child), (true, true), "itself and what it starts");
+        assert!(!this_thread_is_idle().unwrap(), "only its own thread");
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn elsewhere_nothing_is_set() {
         assert_eq!(Nice::below_this_thread(10).unwrap(), None);
+        assert!(!idle_this_thread().unwrap());
     }
 }

@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(
             record,
             "RESULT { \"id\":\"9807\", \"fw\":5130, \"mver\": \"2.6.4\", \"time\":1791836418, \
-             \"reason\": \"inconsistent time; now 1791836418; nexttime 1791836407; waittime 29; \
+             \"reason\": \"inconsistent time; now 1791836418; nexttime 1791836407; waittime 30; \
              cycle 29863940; generated 1791836377\", \"cmd\": \"evtdig -4 --timeout 3000 -A \
              \\\"5009\\\" 127.0.0.1\" }"
         );

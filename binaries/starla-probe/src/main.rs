@@ -19,8 +19,8 @@ use anyhow::Result;
 use clap::Parser;
 use starla_common::logging::{init_logging, LogConfig};
 use starla_controller::{
-    registration::DEFAULT_WAIT_SECS, ConKeep, InitResponse, KnownHosts, ProbeInitInfo, RegState,
-    RegStep, SshConfig, SshConnection, TelnetCommand,
+    registration::DEFAULT_WAIT_SECS, ConKeep, InitResponse, KeepRefused, KnownHosts, ProbeInitInfo,
+    RegState, RegStep, SshConfig, SshConnection, TelnetCommand,
 };
 use starla_metrics::MetricsRegistry;
 use starla_results::{
@@ -410,6 +410,7 @@ fn main() -> Result<()> {
 
     // Everything else, on the background runtime, until the probe shuts
     // down
+    let sched_idle = config.measurements.background_sched_idle;
     let background = Background {
         config,
         runtime_dir,
@@ -423,7 +424,7 @@ fn main() -> Result<()> {
         scheduler_task,
         pause,
     };
-    let ended = runtimes::spawn_background(move || run_background(background))?
+    let ended = runtimes::spawn_background(sched_idle, move || run_background(background))?
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     // The measurements under way end with their runtime
@@ -748,10 +749,22 @@ async fn run_background(background: Background) -> Result<()> {
 
     // Outer loop: re-runs register → controller-connect if the initial
     // controller handshake fails (typically the controller hasn't sync'd
-    // the freshly-approved probe key yet). Keeps the process alive so
-    // launchd / systemd don't penalty-box a fast-exit cycle.
+    // the freshly-approved probe key yet), and after the controller kicked
+    // us out from KEEP (a forced registration, then a new session). Keeps
+    // the process alive so launchd / systemd don't penalty-box a fast-exit
+    // cycle.
     let mut ctrl_delay = Duration::from_secs(5);
     let max_ctrl_delay = Duration::from_secs(60);
+
+    // The result upload loop is the process's, started at the first KEEP
+    // connection: a kick from KEEP comes back to the top of
+    // 'register_and_connect for a new registration and session, and must
+    // not start a second one.
+    let mut upload_loop_started = false;
+
+    // The waits after a KEEP ends. A run of kicks spans passes through
+    // 'register_and_connect, so its back-off lives out here.
+    let mut keep_waits = KeepWaits::new();
 
     // Back to the top of 'register_and_connect after ctrl_delay: the saved
     // assignment (if still valid) means no new registration.
@@ -812,6 +825,12 @@ async fn run_background(background: Background) -> Result<()> {
                 }
                 RegStep::Register(reason) => reason,
             };
+            // reginit drops con_keep_conf.txt whenever it registers
+            // (reginit.sh.in:56-60 for FORCE_REG, 129-130 for the rest): a
+            // cached controller session is the old assignment's. Kept, the
+            // registration CON_KEEP_BROKEN forces would be followed by a
+            // KEEP on the very session the controller refused.
+            let _ = std::fs::remove_file(&con_keep_path);
             let probe_info = ProbeInitInfo::reregister(starla_common::FIRMWARE_VERSION, reason);
 
             // Connect to registration server
@@ -1125,17 +1144,11 @@ async fn run_background(background: Background) -> Result<()> {
                 // behavior)
                 result_handler.set_session_id(session_id.clone()).await;
 
-                // Step 4: Connection loop with automatic reconnection
-                let initial_reconnect_delay = Duration::from_secs(5);
-                let max_reconnect_delay = Duration::from_secs(300);
-                // Successful connect() does not imply a healthy session: a
-                // session can drop within seconds of being established. Only
-                // reset backoff after the session has stayed up this long,
-                // otherwise a flapping link produces a tight reconnect storm.
-                let stable_session_threshold = Duration::from_secs(60);
-                let mut reconnect_delay = initial_reconnect_delay;
+                // Step 4: Connection loop with automatic reconnection. The
+                // back-off is KeepWaits': reset only once a session has
+                // stayed up STABLE_SESSION.
+                keep_waits.new_session();
                 let mut connection_attempt = 0u32;
-                let mut upload_loop_started = false;
 
                 'connection_loop: loop {
                     connection_attempt += 1;
@@ -1163,17 +1176,14 @@ async fn run_background(background: Background) -> Result<()> {
                         Ok(ssh) => ssh,
                         Err(e) => {
                             error!("Failed to connect for KEEP: {}", e);
-                            warn!("Retrying connection in {:?}...", reconnect_delay);
+                            let wait = keep_waits.connect_failed();
+                            warn!("Retrying connection in {:?}...", wait);
                             tokio::select! {
                                 _ = tokio::signal::ctrl_c() => {
                                     info!("Received Ctrl+C during reconnect wait");
                                     break 'connection_loop;
                                 }
-                                _ = tokio::time::sleep(reconnect_delay) => {
-                                    reconnect_delay = std::cmp::min(
-                                        reconnect_delay * 2,
-                                        max_reconnect_delay
-                                    );
+                                _ = tokio::time::sleep(wait) => {
                                     continue 'connection_loop;
                                 }
                             }
@@ -1184,9 +1194,9 @@ async fn run_background(background: Background) -> Result<()> {
                     // SSH handler routes directly to telnet command parser
                     if let Err(e) = keep_ssh.request_reverse_tunnel(remote_port).await {
                         error!("Failed to setup reverse tunnel: {}", e);
-                        warn!("Retrying connection in {:?}...", reconnect_delay);
-                        tokio::time::sleep(reconnect_delay).await;
-                        reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
+                        let wait = keep_waits.connect_failed();
+                        warn!("Retrying connection in {:?}...", wait);
+                        tokio::time::sleep(wait).await;
                         continue 'connection_loop;
                     }
                     debug!("Reverse tunnel established: remote port {}", remote_port);
@@ -1233,53 +1243,80 @@ async fn run_background(background: Background) -> Result<()> {
                         tokio::spawn(async move { keep_ssh_for_keep.run_keep_session().await });
 
                     // Wait for shutdown or connection loss
-                    let should_reconnect = tokio::select! {
+                    let keep_end = tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
                             info!("Received Ctrl+C");
-                            false
+                            None
                         }
                         _ = &mut scheduler_task => {
                             error!("Scheduler task ended unexpectedly");
-                            false
+                            None
                         }
                         result = keep_task => {
-                            match result {
-                                Ok(Err(e)) => warn!("KEEP session lost: {}", e),
-                                Err(e) => warn!("KEEP task panicked: {}", e),
-                                _ => warn!("KEEP session ended"),
-                            }
                             probe_status.lock().await.connected = false;
                             metrics.set_connected(false);
                             // Clear SSH connection so uploads fail fast
                             *ssh_for_upload.lock().await = None;
-                            true // Reconnect
+                            Some(keep_ended(result))
                         }
                     };
 
-                    if !should_reconnect {
+                    let Some(keep_end) = keep_end else {
                         break 'connection_loop;
-                    }
+                    };
 
                     let session_uptime = session_started_at.elapsed();
-                    if session_uptime >= stable_session_threshold {
-                        reconnect_delay = initial_reconnect_delay;
-                    } else {
-                        reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
-                        debug!(
-                            "Session lasted only {:?} (< {:?}); escalating backoff to {:?}",
-                            session_uptime, stable_session_threshold, reconnect_delay
-                        );
-                    }
-
-                    // Wait before reconnecting
-                    debug!("Reconnecting in {:?}...", reconnect_delay);
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received Ctrl+C during reconnect wait");
-                            break 'connection_loop;
+                    match keep_waits.after(keep_end, session_uptime) {
+                        AfterKeep::Reregister { refused, wait } => {
+                            // CON_KEEP_BROKEN: KEEP again on this SESSION_ID
+                            // is refused every time (2026-10-14: ~4 min off,
+                            // until a restart). As the reference: end this
+                            // session, register again (FORCE_REG), then a
+                            // controller INIT for a new session
+                            // (ripe-atlas.in:217-226).
+                            warn!(
+                                "{} after {:?}; registering again in {}s",
+                                refused,
+                                session_uptime,
+                                wait.as_secs()
+                            );
+                            drop(keep_ssh);
+                            probe_status.lock().await.last_connection_error =
+                                Some(refused.to_string());
+                            force_reregistration(&reg_path);
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {
+                                    info!("Received Ctrl+C during re-registration wait");
+                                    break 'connection_loop;
+                                }
+                                // Back to the top, with the scheduler, telnet,
+                                // the result handler and the upload loop as
+                                // they are: not the graceful shutdown below
+                                _ = tokio::time::sleep(wait) => {
+                                    continue 'register_and_connect;
+                                }
+                            }
                         }
-                        _ = tokio::time::sleep(reconnect_delay) => {
-                            // Continue to reconnect
+                        AfterKeep::Rekeep { why, wait } => {
+                            warn!("{}", why);
+                            if session_uptime < STABLE_SESSION {
+                                debug!(
+                                    "Session lasted only {:?} (< {:?}); escalating backoff to {:?}",
+                                    session_uptime, STABLE_SESSION, wait
+                                );
+                            }
+
+                            // Wait before reconnecting
+                            debug!("Reconnecting in {:?}...", wait);
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {
+                                    info!("Received Ctrl+C during reconnect wait");
+                                    break 'connection_loop;
+                                }
+                                _ = tokio::time::sleep(wait) => {
+                                    // Continue to reconnect
+                                }
+                            }
                         }
                     }
                 }
@@ -1594,6 +1631,7 @@ async fn run_commands(
                     max_body_size: spec.max_body_size,
                     store_headers: spec.store_headers,
                     http10: spec.http10,
+                    sni: spec.sni,
                     timeout_ms: spec.timeout_ms,
                 })
             ),
@@ -1622,6 +1660,7 @@ async fn run_commands(
                     packets: spec.packets,
                     timeout_ms: spec.timeout_ms,
                     gap_ms: spec.gap_ms,
+                    busy: Default::default(),
                 })
             ),
             TelnetCommand::HostTelemetry(spec) => {
@@ -1788,6 +1827,139 @@ fn save_con_keep(con_keep: &ConKeep, path: &std::path::Path) {
             e
         );
     }
+}
+
+/// A KEEP session up this long held: the back-offs after a KEEP ends start
+/// over. A successful connect() does not make a session healthy, as one can
+/// drop within seconds of being established, and resetting on every
+/// connect lets a flapping link reconnect in a tight storm.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
+
+/// Before KEEP again on the same session, the wait starts here and doubles
+/// while sessions end short of [`STABLE_SESSION`] (the first is twice this),
+/// up to [`REKEEP_MAX`].
+const REKEEP_FIRST: Duration = Duration::from_secs(5);
+const REKEEP_MAX: Duration = Duration::from_secs(300);
+
+/// After the controller kicked us out from KEEP, the wait before registering
+/// again: this the first time, doubling for each kick in a row (no session
+/// between them that held for [`STABLE_SESSION`]), up to [`KICKED_MAX`].
+///
+/// The reference notices con_keep_reply.vol only at its main loop's next
+/// pass (ripe-atlas.in:217-226), and a pass ends with `sleepkick 180`
+/// (ripe-atlas.in:271): it re-registers 0 to 180 s after a kick, and with a
+/// controller that kicks every new KEEP at once, once every 180 s. Every
+/// kick costs a registration INIT, a controller INIT and a KEEP connection
+/// and a new SESSION_ID, so a run of kicks comes down to the reference's
+/// pace, not one a minute.
+const KICKED_FIRST: Duration = Duration::from_secs(60);
+const KICKED_MAX: Duration = Duration::from_secs(180);
+
+/// How a KEEP task ended.
+#[derive(Debug, PartialEq)]
+enum KeepEnded {
+    /// The controller wrote on KEEP: it has kicked us out of the session
+    /// (CON_KEEP_BROKEN). Register again, then a controller INIT for a new
+    /// session; KEEP again on this one is refused every time.
+    KickedOut(KeepRefused),
+    /// The session was lost, or the task failed: KEEP again on the same
+    /// session after the back-off. Holds the line to log.
+    Lost(String),
+}
+
+fn keep_ended(ended: Result<anyhow::Result<()>, tokio::task::JoinError>) -> KeepEnded {
+    match ended {
+        Ok(Err(e)) => match e.downcast::<KeepRefused>() {
+            Ok(refused) => KeepEnded::KickedOut(refused),
+            Err(e) => KeepEnded::Lost(format!("KEEP session lost: {}", e)),
+        },
+        Ok(Ok(())) => KeepEnded::Lost("KEEP session ended".to_string()),
+        Err(e) => KeepEnded::Lost(format!("KEEP task panicked: {}", e)),
+    }
+}
+
+/// What the connection loop does once a KEEP has ended.
+#[derive(Debug, PartialEq)]
+enum AfterKeep {
+    /// KEEP again on the same session after `wait`; `why` is the line to
+    /// log.
+    Rekeep { why: String, wait: Duration },
+    /// The controller kicked us out (CON_KEEP_BROKEN): force a registration
+    /// and, after `wait`, register again, then a controller INIT for a new
+    /// session (ripe-atlas.in:217-226).
+    Reregister {
+        refused: KeepRefused,
+        wait: Duration,
+    },
+}
+
+/// The waits after a KEEP ends, kept across sessions and registrations for
+/// as long as the process runs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KeepWaits {
+    /// The wait before KEEP again on the same session, or before another
+    /// try to connect for it.
+    rekeep: Duration,
+    /// The wait before registering again at the next kick.
+    kicked: Duration,
+}
+
+impl KeepWaits {
+    fn new() -> Self {
+        KeepWaits {
+            rekeep: REKEEP_FIRST,
+            kicked: KICKED_FIRST,
+        }
+    }
+
+    /// A new controller session (a new SESSION_ID): KEEP on it backs off
+    /// from the start. A run of kicks goes on counting.
+    fn new_session(&mut self) {
+        self.rekeep = REKEEP_FIRST;
+    }
+
+    /// The wait before another try to connect for KEEP, doubling the next.
+    fn connect_failed(&mut self) -> Duration {
+        let wait = self.rekeep;
+        self.rekeep = std::cmp::min(self.rekeep * 2, REKEEP_MAX);
+        wait
+    }
+
+    /// What to do after a KEEP that ended as `end` after `uptime`. A kick
+    /// always registers again, never KEEPs again on the refused session.
+    fn after(&mut self, end: KeepEnded, uptime: Duration) -> AfterKeep {
+        let held = uptime >= STABLE_SESSION;
+        if held {
+            // Whatever came before this session, it is not a run of kicks
+            self.kicked = KICKED_FIRST;
+        }
+        match end {
+            KeepEnded::KickedOut(refused) => {
+                let wait = self.kicked;
+                self.kicked = std::cmp::min(self.kicked * 2, KICKED_MAX);
+                AfterKeep::Reregister { refused, wait }
+            }
+            KeepEnded::Lost(why) => {
+                self.rekeep = if held {
+                    REKEEP_FIRST
+                } else {
+                    std::cmp::min(self.rekeep * 2, REKEEP_MAX)
+                };
+                AfterKeep::Rekeep {
+                    why,
+                    wait: self.rekeep,
+                }
+            }
+        }
+    }
+}
+
+/// The saved registration, made to register again with CON_KEEP_BROKEN
+/// (RegState::kicked_out), as the reference writes force_reg.txt.
+fn force_reregistration(reg_path: &std::path::Path) {
+    let mut reg = RegState::load(reg_path);
+    reg.kicked_out();
+    save_reg(&reg, reg_path);
 }
 
 #[cfg(test)]
@@ -2024,5 +2196,163 @@ mod tests {
             !notice.show(),
             "a retry moments later must not reprint and scroll the key away"
         );
+    }
+
+    /// Only a KEEP the controller answered sends the probe back to
+    /// register (CON_KEEP_BROKEN); a KEEP that is lost, or a task that
+    /// fails, KEEPs again on the same session, as before.
+    #[tokio::test]
+    async fn only_a_keep_reply_sends_the_probe_back_to_register() {
+        let refused = KeepRefused {
+            reply: "session not known\n".to_string(),
+            bytes: 18,
+        };
+        assert_eq!(
+            keep_ended(Ok(Err(refused.clone().into()))),
+            KeepEnded::KickedOut(refused)
+        );
+        assert_eq!(
+            keep_ended(Ok(Err(anyhow::anyhow!("KEEP session ended")))),
+            KeepEnded::Lost("KEEP session lost: KEEP session ended".to_string())
+        );
+        assert_eq!(
+            keep_ended(Ok(Ok(()))),
+            KeepEnded::Lost("KEEP session ended".to_string())
+        );
+        let panicked: Result<anyhow::Result<()>, _> = tokio::spawn(async { panic!("boom") }).await;
+        assert!(matches!(
+            keep_ended(panicked),
+            KeepEnded::Lost(why) if why.starts_with("KEEP task panicked")
+        ));
+    }
+
+    /// After a kick the saved registration forces the next one: the top of
+    /// 'register_and_connect reads it from disk.
+    #[test]
+    fn a_kick_forces_the_next_registration() {
+        let dir = std::env::temp_dir().join(format!("starla-kick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("con_init_conf.txt");
+        let mut reg = RegState::default();
+        let ctr = starla_controller::ControllerInfo {
+            host: "ctr-dub-sw02.atlas.prod.ripe.net".into(),
+            port: 443,
+            probe_id: 1018212,
+            rereg_secs: Some(86_400),
+        };
+        reg.registered(&ctr, unix_now());
+        save_reg(&reg, &path);
+        assert!(matches!(
+            RegState::load(&path).next_step(unix_now()),
+            RegStep::Cached(_)
+        ));
+
+        force_reregistration(&path);
+        let back = RegState::load(&path);
+        assert_eq!(back.next_step(unix_now()), RegStep::Register("FORCE_REG"));
+        assert_eq!(back.forced.as_deref(), Some("CON_KEEP_BROKEN"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn kick() -> KeepEnded {
+        KeepEnded::KickedOut(KeepRefused {
+            reply: "session not known\n".to_string(),
+            bytes: 18,
+        })
+    }
+
+    fn lost() -> KeepEnded {
+        KeepEnded::Lost("KEEP session lost: KEEP session ended".to_string())
+    }
+
+    /// The wait before registering again, which a kick must lead to.
+    fn reregister_in(after: AfterKeep) -> u64 {
+        match after {
+            AfterKeep::Reregister { refused, wait } => {
+                assert_eq!(refused.reply, "session not known\n");
+                wait.as_secs()
+            }
+            other => panic!("a kick must register again, not {other:?}"),
+        }
+    }
+
+    /// The wait before KEEP again on the same session, which a loss must
+    /// lead to.
+    fn rekeep_in(after: AfterKeep) -> u64 {
+        match after {
+            AfterKeep::Rekeep { why, wait } => {
+                assert_eq!(why, "KEEP session lost: KEEP session ended");
+                wait.as_secs()
+            }
+            other => panic!("a lost KEEP must KEEP again, not {other:?}"),
+        }
+    }
+
+    /// A kick registers again whatever came before it and however long its
+    /// session lasted: KEEP again on the refused session is what kept the
+    /// probe off for ~4 minutes on 2026-10-14. A KEEP lost with nothing
+    /// said KEEPs again on the same session.
+    #[test]
+    fn a_kick_always_registers_again_and_a_loss_keeps_again() {
+        for uptime in [0, 1, 59, 60, 3600] {
+            let uptime = Duration::from_secs(uptime);
+            let mut waits = KeepWaits::new();
+            rekeep_in(waits.after(lost(), Duration::ZERO));
+            reregister_in(waits.after(kick(), uptime));
+            rekeep_in(waits.after(lost(), uptime));
+            waits.connect_failed();
+            reregister_in(waits.after(kick(), uptime));
+        }
+    }
+
+    /// The incident's controller kicks every new KEEP within 0.2 s. The
+    /// waits before registering again go 60, 120, then 180 s, the
+    /// reference's pass (ripe-atlas.in:271), and never shorter; a session
+    /// that held for STABLE_SESSION starts them over.
+    #[test]
+    fn kicks_in_a_row_come_down_to_the_references_pace() {
+        let quick = Duration::from_millis(200);
+        let mut waits = KeepWaits::new();
+        let run: Vec<u64> = (0..6)
+            .map(|_| reregister_in(waits.after(kick(), quick)))
+            .collect();
+        assert_eq!(run, [60, 120, 180, 180, 180, 180]);
+
+        // a session lost short of STABLE_SESSION, and the new session a
+        // kick brings, do not end the run
+        rekeep_in(waits.after(lost(), quick));
+        waits.new_session();
+        assert_eq!(reregister_in(waits.after(kick(), quick)), 180);
+
+        // a session that held does, lost ...
+        assert_eq!(rekeep_in(waits.after(lost(), STABLE_SESSION)), 5);
+        assert_eq!(reregister_in(waits.after(kick(), quick)), 60);
+        assert_eq!(reregister_in(waits.after(kick(), quick)), 120);
+        // ... or kicked
+        let held = Duration::from_secs(3600);
+        assert_eq!(reregister_in(waits.after(kick(), held)), 60);
+        assert_eq!(reregister_in(waits.after(kick(), quick)), 120);
+    }
+
+    /// KEEP again on the same session backs off as it always has: 10, 20,
+    /// 40, 80 s (the incident's log) ... up to 300 s while sessions end
+    /// short, 5 s after one that held, and a new session starts over.
+    #[test]
+    fn a_lost_keep_backs_off_as_before() {
+        let quick = Duration::from_millis(200);
+        let mut waits = KeepWaits::new();
+        let run: Vec<u64> = (0..7)
+            .map(|_| rekeep_in(waits.after(lost(), quick)))
+            .collect();
+        assert_eq!(run, [10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(rekeep_in(waits.after(lost(), STABLE_SESSION)), 5);
+
+        // a failed connect waits the current back-off and doubles the next
+        assert_eq!(waits.connect_failed().as_secs(), 5);
+        assert_eq!(waits.connect_failed().as_secs(), 10);
+        assert_eq!(rekeep_in(waits.after(lost(), quick)), 40);
+        waits.new_session();
+        assert_eq!(waits.rekeep, REKEEP_FIRST);
+        assert_eq!(rekeep_in(waits.after(lost(), quick)), 10);
     }
 }

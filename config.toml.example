@@ -51,6 +51,17 @@ keepalive_interval = 60
 # receives, not only the probe's (one clock read each).
 kernel_rx_timestamps = false
 
+# Run the probe's background threads (SSH and its key exchanges, uploads,
+# telnet, telemetry) on SCHED_IDLE. Off by default: they run 10 nice levels
+# below the measurement threads, which gives the measurements the larger
+# share of a busy CPU but not the CPU at once -- a reply that wakes a
+# measurement thread where the background is computing (an SSH key
+# exchange, ~0.3 s at every connect and hourly rekey) can wait up to one
+# scheduler slice, ~3 ms, before it is read. On SCHED_IDLE (Linux only;
+# ignored elsewhere) the background gives way at once. For a host whose
+# CPUs get busy; on an idle one the measurement thread finds a free CPU.
+background_sched_idle = false
+
 [storage]
 # Maximum number of results to hold in the upload queue
 max_queue_size = 10000

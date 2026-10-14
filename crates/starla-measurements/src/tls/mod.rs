@@ -215,7 +215,7 @@ fn certs_suffix(certs: &[Vec<u8>]) -> String {
 
 /// strerror()'s text, which tcputil passes to reporterr() (tcputil.c:315,
 /// 527): io::Error's Display without its " (os error N)".
-fn strerror(e: &std::io::Error) -> String {
+pub(crate) fn strerror(e: &std::io::Error) -> String {
     let s = e.to_string();
     match (e.raw_os_error(), s.rfind(" (os error ")) {
         (Some(_), Some(i)) => s[..i].to_string(),

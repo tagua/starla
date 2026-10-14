@@ -12,10 +12,14 @@ use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64}
 use russh::{Channel, ChannelMsg, Preferred};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 /// SSH connection configuration
@@ -49,6 +53,43 @@ pub struct SshConfig {
     pub max_reconnect_delay: Duration,
     /// Number of reconnection attempts before giving up (0 = infinite)
     pub max_reconnect_attempts: u32,
+}
+
+impl SshConfig {
+    /// How long the login may wait for the server, from the key exchange's
+    /// end to the server's answer to the key: one ServerAliveInterval, 60 s
+    /// (the connect timeout if the interval is 0).
+    ///
+    /// The reference's ssh bounds each packet its login waits for by
+    /// ServerAliveInterval × ServerAliveCountMax, 180 s (ssh.c,
+    /// ssh_packet_set_timeout). Starla's bound is the interval alone:
+    /// russh counts keepalives only once the session is authenticated, and
+    /// before then, once an interval has passed with nothing from the
+    /// server, its session task spins on the expired keepalive timer,
+    /// re-arming the inactivity timer each time, so neither ends it. Past
+    /// one interval a stalled login burns a core of the background thread
+    /// until the bound; up to it, nothing. A login takes about a second.
+    /// Starla had no bound: a server that never answered the key held a
+    /// spinning task until the server or TCP gave up.
+    pub fn login_timeout(&self) -> Duration {
+        if self.keepalive_interval.is_zero() {
+            self.connect_timeout
+        } else {
+            self.keepalive_interval
+        }
+    }
+
+    /// When the identification strings and the key exchange must be done
+    /// by: the connect timeout from now. Every packet from the server
+    /// re-arms russh's keepalive timer, so a key exchange spins only after
+    /// a whole keepalive interval of silence from the server; with the
+    /// defaults (30 s against 60 s) it never does. A timeout too large for
+    /// the clock is a year.
+    fn connected_by(&self) -> Instant {
+        let now = Instant::now();
+        now.checked_add(self.connect_timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400))
+    }
 }
 
 impl Default for SshConfig {
@@ -463,6 +504,81 @@ fn client_config(config: &SshConfig) -> client::Config {
     }
 }
 
+/// A session's stream, which [`SshConnection::login`] can cut: from then
+/// on a read ends as at the end of the stream and a write fails, so the
+/// session task reading and writing it ends.
+struct Cuttable<S> {
+    inner: S,
+    cut: Arc<Cut>,
+}
+
+/// The switch that cuts a [`Cuttable`] stream.
+#[derive(Debug, Default)]
+struct Cut {
+    done: AtomicBool,
+    /// The reader's, woken by the cut
+    reader: futures::task::AtomicWaker,
+}
+
+impl Cut {
+    fn cut(&self) {
+        self.done.store(true, Ordering::Release);
+        self.reader.wake();
+    }
+
+    fn is_cut(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+impl<S> Cuttable<S> {
+    fn new(inner: S) -> (Self, Arc<Cut>) {
+        let cut = Arc::new(Cut::default());
+        (
+            Self {
+                inner,
+                cut: Arc::clone(&cut),
+            },
+            cut,
+        )
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Cuttable<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.cut.reader.register(cx.waker());
+        if self.cut.is_cut() {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Cuttable<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.cut.is_cut() {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// SSH connection to RIPE Atlas controller
 pub struct SshConnection {
     session: Arc<Mutex<Handle<AtlasClientHandler>>>,
@@ -484,27 +600,25 @@ impl SshConnection {
         known_hosts: KnownHosts,
         telnet_state: Option<TelnetState>,
     ) -> anyhow::Result<Self> {
-        let ssh_config = client_config(&config);
         let handler = AtlasClientHandler::new(host, port, known_hosts, telnet_state);
 
         let addr = format!("{}:{}", host, port);
         debug!("Connecting to SSH controller at {}", addr);
 
-        let session = timeout(
-            config.connect_timeout,
-            client::connect(Arc::new(ssh_config), addr, handler),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
-
-        Self::authenticate(session, host, port, key).await
+        // As russh's client::connect, with the TCP connection Starla's own,
+        // so that the login can cut it
+        let connected_by = config.connected_by();
+        let stream = timeout_at(connected_by, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+        Self::login(stream, connected_by, host, port, key, &config, handler).await
     }
 
     /// [`connect`](Self::connect) over a stream of the test's own, in place
     /// of a TCP connection to `host:port`.
     #[cfg(test)]
     async fn connect_stream(
-        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
         host: &str,
         port: u16,
         key: &PrivateKey,
@@ -512,9 +626,47 @@ impl SshConnection {
         known_hosts: KnownHosts,
     ) -> anyhow::Result<Self> {
         let handler = AtlasClientHandler::new(host, port, known_hosts, None);
-        let session =
-            client::connect_stream(Arc::new(client_config(&config)), stream, handler).await?;
-        Self::authenticate(session, host, port, key).await
+        let connected_by = config.connected_by();
+        Self::login(stream, connected_by, host, port, key, &config, handler).await
+    }
+
+    /// The SSH session over `stream`: the identification strings and the
+    /// key exchange by `connected_by`, then the login within
+    /// [`SshConfig::login_timeout`]. A login that fails or runs out of
+    /// time cuts the stream, which ends russh's session task. Dropping the
+    /// session's handle ends it too, but connect_stream returns the handle
+    /// only once the key exchange is done, and russh's JoinHandle cannot
+    /// abort the task: a connect dropped at its timeout during the
+    /// exchange left the task behind, waiting on the server for good.
+    async fn login(
+        stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        connected_by: Instant,
+        host: &str,
+        port: u16,
+        key: &PrivateKey,
+        config: &SshConfig,
+        handler: AtlasClientHandler,
+    ) -> anyhow::Result<Self> {
+        let (stream, cut) = Cuttable::new(stream);
+        let login_timeout = config.login_timeout();
+        let login = async {
+            let session = timeout_at(
+                connected_by,
+                client::connect_stream(Arc::new(client_config(config)), stream, handler),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+            timeout(login_timeout, Self::authenticate(session, host, port, key))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("SSH login: no answer from the server in {login_timeout:?}")
+                })?
+        };
+        let logged_in = login.await;
+        if logged_in.is_err() {
+            cut.cut();
+        }
+        logged_in
     }
 
     /// Log in as `atlas` with the probe's key, on a session just set up.
@@ -801,14 +953,97 @@ pub fn parse_init_response(output: &str) -> anyhow::Result<InitResponse> {
     }
 }
 
+/// A KEEP reply as a log line shows it: escaped, the first 256 bytes.
+fn keep_reply(data: &[u8]) -> String {
+    let shown = &data[..data.len().min(256)];
+    format!(
+        "{:?} ({} bytes)",
+        String::from_utf8_lossy(shown),
+        data.len()
+    )
+}
+
+/// The most of a KEEP reply [`KeepRefused`] keeps.
+const KEEP_REPLY_KEPT: usize = 4096;
+
+/// How long a KEEP channel may stay open once the controller has written on
+/// it. The reference does not wait for ssh to exit: its main loop kills ssh
+/// as soon as it finds con_keep_reply.vol non-empty (ripe-atlas.in:217-221),
+/// at its next pass, up to 180 s on. RIPE's controller closes the channel
+/// at once (2026-10-14: within 0.2 s); this bounds one that does not.
+const KEEP_REPLY_GRACE: Duration = Duration::from_secs(30);
+
+/// The controller wrote on KEEP: it has kicked us out of the session
+/// (CON_KEEP_BROKEN).
+///
+/// A KEEP the controller takes says nothing for as long as the session
+/// lasts. The reference probe sends KEEP's stdout to con_keep_reply.vol and
+/// its stderr to $SSH_ERR (reginit.sh.in:523), and its main loop, finding
+/// con_keep_reply.vol non-empty, kills ssh and forces a new registration
+/// with REASON=CON_KEEP_BROKEN (ripe-atlas.in:217-226): a registration INIT,
+/// then a controller INIT for a new SESSION_ID. So only stdout counts here;
+/// stderr is logged and is not a refusal. KEEP again on the same session
+/// is refused each time: after a hot swap on 2026-10-14 the controller
+/// answered KEEP with 18 bytes and exit status 0 within 0.2 s, then every
+/// same-session retry with 4, and the probe stayed off for ~4 minutes,
+/// until a restart.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("controller kicked us out from KEEP: {reply:?} ({bytes} bytes)")]
+pub struct KeepRefused {
+    /// What the controller wrote on stdout: the first 4 KiB, as UTF-8
+    /// (lossy).
+    pub reply: String,
+    /// How many bytes it wrote on stdout in all.
+    pub bytes: usize,
+}
+
+/// What the controller writes on a KEEP channel's stdout, gathered for
+/// [`KeepRefused`]: every byte counted, the first [`KEEP_REPLY_KEPT`] kept.
+#[derive(Debug, Default)]
+struct KeepReply {
+    kept: Vec<u8>,
+    bytes: usize,
+}
+
+impl KeepReply {
+    fn add(&mut self, data: &[u8]) {
+        self.bytes += data.len();
+        let room = KEEP_REPLY_KEPT.saturating_sub(self.kept.len());
+        self.kept.extend_from_slice(&data[..data.len().min(room)]);
+    }
+
+    /// Whether the controller has written anything yet.
+    fn written(&self) -> bool {
+        self.bytes > 0
+    }
+
+    /// The refusal, if the controller wrote anything at all (the
+    /// reference's `[ -s con_keep_reply.vol ]`).
+    fn refusal(self) -> Option<KeepRefused> {
+        self.written().then(|| KeepRefused {
+            reply: String::from_utf8_lossy(&self.kept).into_owned(),
+            bytes: self.bytes,
+        })
+    }
+}
+
 impl SshConnection {
     /// Start the KEEP session and monitor it.
     ///
     /// Opens a channel with the KEEP command and blocks until the channel
-    /// closes (which means the controller disconnected). Returns when the
-    /// connection is lost. The caller should use this as the connection
-    /// health signal.
+    /// closes, which is the connection health signal. A KEEP the controller
+    /// takes writes nothing on stdout: if it wrote anything, the error is a
+    /// [`KeepRefused`] carrying what it wrote (the caller registers again),
+    /// once the channel has ended or at most 30 s after the first byte;
+    /// otherwise the connection was lost, and the error says "KEEP session
+    /// ended".
     pub async fn run_keep_session(&self) -> anyhow::Result<()> {
+        self.keep_session(KEEP_REPLY_GRACE).await
+    }
+
+    /// [`run_keep_session`](Self::run_keep_session), the channel let stay
+    /// open for `grace` once the controller has written on it.
+    async fn keep_session(&self, grace: Duration) -> anyhow::Result<()> {
         debug!("Starting KEEP session");
         let session = self.session.lock().await;
         let mut channel = session.channel_open_session().await?;
@@ -817,11 +1052,43 @@ impl SshConnection {
 
         debug!("KEEP session started, monitoring channel");
 
+        // What the controller says on KEEP's stdout, which the reference
+        // probe keeps in con_keep_reply.vol (reginit.sh.in:523): a reply
+        // ends the session, and its words are the reason
+        let mut reply = KeepReply::default();
+        // Set at the first byte of a reply: the channel is waited for no
+        // later than this, as the reference kills ssh without waiting for
+        // it to exit (ripe-atlas.in:220)
+        let mut answered_by: Option<Instant> = None;
+
         // Block until the KEEP channel closes: this is our connection health signal
-        while let Some(msg) = channel.wait().await {
+        loop {
+            let msg = match answered_by {
+                None => channel.wait().await,
+                Some(by) => match timeout_at(by, channel.wait()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        debug!(
+                            "KEEP channel still open {:?} after the controller wrote on it",
+                            grace
+                        );
+                        break;
+                    }
+                },
+            };
+            let Some(msg) = msg else { break };
             match msg {
                 ChannelMsg::Data { data } => {
-                    trace!("KEEP channel data: {} bytes", data.len());
+                    debug!("KEEP channel data: {}", keep_reply(&data));
+                    reply.add(&data);
+                    if answered_by.is_none() && reply.written() {
+                        answered_by = Some(Instant::now() + grace);
+                    }
+                }
+                ChannelMsg::ExtendedData { data, ext } => {
+                    // The reference's $SSH_ERR, not con_keep_reply.vol: not a
+                    // refusal
+                    debug!(ext, "KEEP channel stderr: {}", keep_reply(&data));
                 }
                 ChannelMsg::Eof => {
                     debug!("KEEP channel EOF: connection lost");
@@ -834,6 +1101,11 @@ impl SshConnection {
             }
         }
 
+        if let Some(refused) = reply.refusal() {
+            // The caller logs it, with what it does about it
+            debug!("KEEP session ended: {}", refused);
+            return Err(refused.into());
+        }
         warn!("KEEP session ended: controller disconnected");
         anyhow::bail!("KEEP session ended")
     }
@@ -1541,6 +1813,208 @@ mod tests {
         }
     }
 
+    /// A server that takes the key exchange and never answers the key.
+    struct Mute;
+
+    impl russh::server::Handler for Mute {
+        type Error = anyhow::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            std::future::pending().await
+        }
+    }
+
+    /// The probe's end of a wire, which tells when it is dropped: when the
+    /// session task that owns it has ended.
+    struct Owned {
+        inner: tokio::io::DuplexStream,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Owned {
+        fn new(inner: tokio::io::DuplexStream) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (dropped, gone) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    inner,
+                    dropped: Some(dropped),
+                },
+                gone,
+            )
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for Owned {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Owned {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The default configuration on a short clock: keepalives every 200 ms,
+    /// so the login has 200 ms.
+    fn quick_config() -> SshConfig {
+        SshConfig {
+            connect_timeout: Duration::from_millis(500),
+            keepalive_interval: Duration::from_millis(200),
+            ..SshConfig::default()
+        }
+    }
+
+    /// One keepalive interval, before russh's pre-login spin can start; a
+    /// connect timeout too large for the clock saturates.
+    #[test]
+    fn the_login_ends_before_russh_would_spin() {
+        assert_eq!(
+            SshConfig::default().login_timeout(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(quick_config().login_timeout(), Duration::from_millis(200));
+        let by = quick_config().connected_by();
+        assert!(by <= Instant::now() + Duration::from_millis(500));
+        let silly = SshConfig {
+            connect_timeout: Duration::MAX,
+            keepalive_interval: Duration::MAX,
+            ..SshConfig::default()
+        };
+        assert!(silly.connected_by() > Instant::now() + Duration::from_secs(86_400));
+        let none = SshConfig {
+            keepalive_interval: Duration::ZERO,
+            ..SshConfig::default()
+        };
+        assert_eq!(none.login_timeout(), Duration::from_secs(30));
+    }
+
+    /// A server that takes the key exchange and never answers the key: the
+    /// login gives up after one keepalive interval, before russh's session
+    /// task would start spinning on its expired keepalive timer, and the
+    /// task ends with it. Starla waited for good, the task spinning from
+    /// the first interval on. Dropping the session's handle at the timeout
+    /// ends the task here; the cut is for the key exchange, when russh does
+    /// not read its handle (the test below).
+    #[tokio::test]
+    async fn a_login_the_server_never_answers_ends_with_its_session() {
+        let (probe, controller) = tokio::io::duplex(1 << 16);
+        let server = russh::server::Config {
+            keys: vec![generate_key().unwrap()],
+            inactivity_timeout: None,
+            keepalive_interval: None,
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            if let Ok(running) = russh::server::run_stream(Arc::new(server), controller, Mute).await
+            {
+                let _ = running.await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (wire, gone) = Owned::new(probe);
+        let key = generate_key().unwrap();
+        let started = tokio::time::Instant::now();
+        let login = SshConnection::connect_stream(
+            wire,
+            "ctr-test",
+            443,
+            &key,
+            quick_config(),
+            KnownHosts::load(&dir.path().join("known_hosts")),
+        );
+        let Err(e) = timeout(Duration::from_secs(10), login)
+            .await
+            .expect("no bound")
+        else {
+            panic!("logged in");
+        };
+        let took = started.elapsed();
+        assert!(e.to_string().contains("no answer from the server"), "{e}");
+        assert!(
+            (Duration::from_millis(200)..Duration::from_secs(3)).contains(&took),
+            "gave up after {took:?}"
+        );
+        timeout(Duration::from_secs(2), gone)
+            .await
+            .expect("the session task still runs")
+            .unwrap();
+    }
+
+    /// A server that sends its identification and nothing more: the key
+    /// exchange runs out of the connect's time, and the session task russh
+    /// spawned for it ends. Dropping the connect at its timeout left the
+    /// task behind.
+    #[tokio::test]
+    async fn a_key_exchange_that_stalls_ends_with_its_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (probe, mut controller) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            controller.write_all(b"SSH-2.0-stall\r\n").await.unwrap();
+            let mut sink = [0u8; 4096];
+            while matches!(controller.read(&mut sink).await, Ok(n) if n > 0) {}
+            // keeps its end open
+            std::future::pending::<()>().await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (wire, gone) = Owned::new(probe);
+        let key = generate_key().unwrap();
+        let login = SshConnection::connect_stream(
+            wire,
+            "ctr-test",
+            443,
+            &key,
+            quick_config(),
+            KnownHosts::load(&dir.path().join("known_hosts")),
+        );
+        let Err(e) = timeout(Duration::from_secs(10), login)
+            .await
+            .expect("no bound")
+        else {
+            panic!("logged in");
+        };
+        assert_eq!(e.to_string(), "Connection timeout");
+        timeout(Duration::from_secs(2), gone)
+            .await
+            .expect("the session task still runs")
+            .unwrap();
+    }
+
     /// A session with the default configuration to a [`Controller`], and
     /// the switch that silences its wire.
     async fn keep_session() -> (
@@ -1633,6 +2107,219 @@ mod tests {
             "still up {:?} after the controller went",
             gone.elapsed()
         );
+    }
+
+    /// A controller whose KEEP writes `stdout` and `stderr` (either may be
+    /// empty) and, if `closes`, exits 0 and closes the channel: RIPE's after
+    /// the hot swap of 2026-10-14, or, with nothing written, a KEEP that
+    /// just ends. One that does not close leaves the channel open.
+    struct KeepEnds {
+        stdout: &'static [u8],
+        stderr: &'static [u8],
+        closes: bool,
+        channels: Vec<Channel<russh::server::Msg>>,
+    }
+
+    impl russh::server::Handler for KeepEnds {
+        type Error = anyhow::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<russh::server::Msg>,
+            _: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            self.channels.push(channel);
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            command: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(command, b"KEEP");
+            session.channel_success(channel)?;
+            if !self.stdout.is_empty() {
+                session.data(channel, self.stdout.to_vec())?;
+            }
+            if !self.stderr.is_empty() {
+                session.extended_data(channel, 1, self.stderr.to_vec())?;
+            }
+            if self.closes {
+                session.exit_status_request(channel, 0)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// How a KEEP session against a [`KeepEnds`] controller ends, the
+    /// channel let stay open for `grace` once written on; None if it has
+    /// not ended within `within`.
+    async fn keep_ends(
+        stdout: &'static [u8],
+        stderr: &'static [u8],
+        closes: bool,
+        grace: Duration,
+        within: Duration,
+    ) -> Option<anyhow::Error> {
+        let (probe, controller) = tokio::io::duplex(1 << 16);
+        let server = russh::server::Config {
+            keys: vec![generate_key().unwrap()],
+            inactivity_timeout: None,
+            keepalive_interval: None,
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let handler = KeepEnds {
+            stdout,
+            stderr,
+            closes,
+            channels: Vec::new(),
+        };
+        tokio::spawn(async move {
+            if let Ok(running) =
+                russh::server::run_stream(Arc::new(server), controller, handler).await
+            {
+                let _ = running.await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let conn = SshConnection::connect_stream(
+            probe,
+            "ctr-test",
+            443,
+            &generate_key().unwrap(),
+            SshConfig::default(),
+            KnownHosts::load(&dir.path().join("known_hosts")),
+        )
+        .await
+        .unwrap();
+        let ended = timeout(within, conn.keep_session(grace)).await.ok()?;
+        Some(ended.expect_err("a KEEP session only ever ends in an error"))
+    }
+
+    /// How `run_keep_session` ends against a [`KeepEnds`] controller that
+    /// closes the channel.
+    async fn keep_against(stdout: &'static [u8], stderr: &'static [u8]) -> anyhow::Error {
+        let e = keep_ends(
+            stdout,
+            stderr,
+            true,
+            KEEP_REPLY_GRACE,
+            Duration::from_secs(10),
+        )
+        .await;
+        e.expect("KEEP did not end")
+    }
+
+    /// CON_KEEP_BROKEN: the controller answers KEEP with a line and exit
+    /// status 0, and closes it. That is a refusal, carrying what it said,
+    /// not a lost connection: KEEP again on the same session would be
+    /// refused again (ripe-atlas.in:217-226).
+    #[tokio::test]
+    async fn a_keep_the_controller_answers_is_a_refusal_with_its_words() {
+        let e = keep_against(b"session not known\n", b"").await;
+        let refused = e
+            .downcast_ref::<KeepRefused>()
+            .unwrap_or_else(|| panic!("not a KeepRefused: {e:#}"));
+        assert_eq!(refused.reply, "session not known\n");
+        assert_eq!(refused.bytes, 18);
+        assert_eq!(
+            e.to_string(),
+            r#"controller kicked us out from KEEP: "session not known\n" (18 bytes)"#
+        );
+
+        // its stderr, the reference's $SSH_ERR, is not part of the reply
+        let e = keep_against(b"session not known\n", b"noise\n").await;
+        let refused = e.downcast_ref::<KeepRefused>().expect("not a KeepRefused");
+        assert_eq!(refused.reply, "session not known\n");
+        assert_eq!(refused.bytes, 18);
+    }
+
+    /// Only stdout is con_keep_reply.vol (reginit.sh.in:523): a KEEP that
+    /// ends with something on stderr alone is a lost session, as the
+    /// reference KEEPs again on its cached session.
+    #[tokio::test]
+    async fn a_keep_answered_only_on_stderr_is_a_lost_session() {
+        let e = keep_against(b"", b"go away\n").await;
+        assert!(e.downcast_ref::<KeepRefused>().is_none(), "{e:#}");
+        assert_eq!(e.to_string(), "KEEP session ended");
+    }
+
+    /// A KEEP that ends with nothing written is a lost session, as before:
+    /// the caller KEEPs again on the same session.
+    #[tokio::test]
+    async fn a_keep_that_ends_with_nothing_said_is_a_lost_session() {
+        let e = keep_against(b"", b"").await;
+        assert!(e.downcast_ref::<KeepRefused>().is_none(), "{e:#}");
+        assert_eq!(e.to_string(), "KEEP session ended");
+    }
+
+    /// A controller that writes on KEEP but leaves the channel open has
+    /// still kicked us out: the reference kills ssh without waiting for it
+    /// (ripe-atlas.in:217-221). The refusal comes once the grace is up.
+    /// A KEEP that stays open and silent is a healthy session, and goes on.
+    #[tokio::test]
+    async fn a_keep_answered_and_left_open_is_a_refusal_after_the_grace() {
+        let grace = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let e = keep_ends(
+            b"session not known\n",
+            b"",
+            false,
+            grace,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("a KEEP answered and left open must end");
+        let refused = e
+            .downcast_ref::<KeepRefused>()
+            .unwrap_or_else(|| panic!("not a KeepRefused: {e:#}"));
+        assert_eq!(refused.reply, "session not known\n");
+        assert!(started.elapsed() >= grace, "ended before the grace");
+
+        // silent and open: still up after many graces
+        let e = keep_ends(b"", b"", false, grace, grace * 5).await;
+        assert!(e.is_none(), "a silent KEEP ended: {:#}", e.unwrap());
+        // and so with only stderr written
+        let e = keep_ends(b"", b"noise\n", false, grace, grace * 5).await;
+        assert!(
+            e.is_none(),
+            "a KEEP with stderr only ended: {:#}",
+            e.unwrap()
+        );
+    }
+
+    /// Every byte the controller writes is counted, and the first 4 KiB
+    /// kept, across chunks.
+    #[test]
+    fn a_keep_reply_keeps_its_first_4_kib() {
+        assert_eq!(KeepReply::default().refusal(), None);
+
+        let mut reply = KeepReply::default();
+        reply.add(b"");
+        assert_eq!(reply.refusal(), None, "an empty chunk is not a reply");
+
+        let mut reply = KeepReply::default();
+        reply.add(&[b'a'; 3000]);
+        reply.add(&[b'b'; 3000]);
+        let refused = reply.refusal().unwrap();
+        assert_eq!(refused.bytes, 6000);
+        assert_eq!(refused.reply.len(), KEEP_REPLY_KEPT);
+        assert!(refused.reply.starts_with(&"a".repeat(3000)));
+        assert!(refused.reply.ends_with(&"b".repeat(KEEP_REPLY_KEPT - 3000)));
     }
 
     #[test]
