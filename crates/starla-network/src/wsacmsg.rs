@@ -124,6 +124,7 @@ mod tests {
         let want = RecvMeta {
             ttl: Some(57),
             dst: Some("2001:418:1::33".parse().unwrap()),
+            ..Default::default()
         };
         let mut control = pktinfo("2001:418:1::33", 12);
         control.extend(hoplimit(57));
@@ -149,7 +150,7 @@ mod tests {
             recv_meta(&control),
             RecvMeta {
                 ttl: Some(57),
-                dst: None
+                ..Default::default()
             }
         );
         let mut bad = hoplimit(57);

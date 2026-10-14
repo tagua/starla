@@ -17,6 +17,7 @@ starla-network = { workspace = true }
 starla-scheduler = { workspace = true }
 starla-controller = { workspace = true }
 starla-results = { workspace = true }
+starla-measurements = { workspace = true }
 starla-metrics = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -263,6 +263,7 @@ impl Traceroute {
                 opts: &self.config.opts,
                 paris,
                 index: self.config.instance.index(),
+                kernel_rx: starla_network::rxstamp::enabled(),
             })
             .await),
             #[cfg(windows)]

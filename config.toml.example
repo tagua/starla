@@ -34,6 +34,23 @@ ssh_timeout = 30
 # SSH keepalive interval (seconds)
 keepalive_interval = 60
 
+[measurements]
+# Time replies by the kernel's receive stamps, not by a clock read once the
+# probe gets to them. Off by default: the reference probe stamps replies in
+# userspace, and turning this on departs from it deliberately.
+#
+# On (Linux only; ignored elsewhere), ping, traceroute, DNS over UDP and NTP
+# take a reply's receive time from SO_TIMESTAMPNS, the kernel's stamp of
+# its arrival. Their RTTs then leave out the time a reply waited to be read
+# -- a busy or stalled runtime, the scheduler -- so they no longer depend
+# on userspace scheduling, and read lower than reference probes' (about
+# 10-30 us on an idle host). Send times stay userspace, taken right before
+# the send. DNS over TCP, TLS and HTTP keep userspace stamps.
+#
+# The cost: while it is on, the kernel stamps every packet the host
+# receives, not only the probe's (one clock read each).
+kernel_rx_timestamps = false
+
 [storage]
 # Maximum number of results to hold in the upload queue
 max_queue_size = 10000

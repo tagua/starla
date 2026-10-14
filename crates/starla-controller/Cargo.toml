@@ -30,3 +30,5 @@ base64 = "0.23"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Paused time for the keepalive tests (no new crates).
+tokio = { workspace = true, features = ["test-util"] }

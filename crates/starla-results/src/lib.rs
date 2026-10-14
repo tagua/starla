@@ -21,6 +21,7 @@ pub use queue::{QueueStats, QueuedResult, ResultQueue};
 pub use time_sync::TimeSyncTracker;
 pub use uploader::{
     PostTarget, RateLimited, ResultUploader, UploadStream, UploadTransport, UploaderConfig,
+    UPLOAD_BODY_TARGET,
 };
 
 use post_schedule::Slots;
@@ -28,7 +29,7 @@ use starla_common::MeasurementResult;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -132,8 +133,73 @@ fn system_wall_clock() -> f64 {
 /// newer ones are waiting.
 const MAX_PENDING_ONEOFFS: usize = 256;
 
+/// A result as a measurement handed it over, with the `lts` it was
+/// measured at: read when it is handed over, as the reference writes
+/// get_timesync() into a result when it produces one.
+struct Submitted {
+    result: MeasurementResult,
+    lts: i64,
+}
+
+/// The measurement side of the result hand-off: where a measurement task
+/// puts its result, from the measurement runtime, for the result handler on
+/// the background runtime to take.
+///
+/// [`submit`](Self::submit) never waits: no lock, no await, nothing that
+/// depends on the background runtime having run. A bounded channel's
+/// `try_send` is an atomic reservation and a push onto its block list; the
+/// handler takes everything waiting on each wake and queues it there
+/// ([`ResultHandler::run`]). A measurement that awaited the queue's lock
+/// waited for whatever held it — an upload being built, a cleanup, or the
+/// background thread itself, preempted while holding it.
+///
+/// The channel holds as many results as the queue does
+/// ([`ResultHandlerConfig::max_queue_size`]); with that many waiting, the
+/// handler has not run for longer than any upload interval, and a further
+/// result is dropped (and counted as a queue drop) rather than held.
+#[derive(Clone)]
+pub struct ResultSink {
+    tx: mpsc::Sender<Submitted>,
+    time_sync: Arc<TimeSyncTracker>,
+    metrics: starla_metrics::MetricsRegistry,
+}
+
+impl ResultSink {
+    /// Hand a result over for upload. Returns at once.
+    pub fn submit(&self, result: MeasurementResult) {
+        let submitted = Submitted {
+            lts: self.time_sync.lts(),
+            result,
+        };
+        match self.tx.try_send(submitted) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(dropped)) => {
+                self.metrics.record_queue_drop();
+                warn!(
+                    msm_id = dropped.result.msm_id.0,
+                    "Result hand-off full ({}), dropping result",
+                    self.tx.max_capacity()
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(dropped)) => {
+                debug!(
+                    msm_id = dropped.result.msm_id.0,
+                    "Result handler gone, dropping result"
+                );
+            }
+        }
+    }
+}
+
 /// Main result handler that coordinates queuing and uploading
 pub struct ResultHandler {
+    /// Results handed over by the measurements ([`ResultSink`]) and not yet
+    /// queued. Only the background side takes the lock, and never across
+    /// an await.
+    inbox: std::sync::Mutex<mpsc::Receiver<Submitted>>,
+    /// The sending side, handed to the measurements; kept here so the
+    /// channel never closes while the handler lives
+    sink: ResultSink,
     queue: Arc<Mutex<ResultQueue>>,
     /// Results of ONEOFF measurements, eooqd's spool: posted on their own
     /// with `&SRC=oneoff`, never in the main upload.
@@ -171,6 +237,12 @@ impl ResultHandler {
             Some(path) => TimeSyncTracker::open(path.clone()),
             None => TimeSyncTracker::new(),
         });
+        let (tx, inbox) = mpsc::channel(config.max_queue_size.max(1));
+        let sink = ResultSink {
+            tx,
+            time_sync: Arc::clone(&time_sync),
+            metrics: metrics.clone(),
+        };
         let uploader = ResultUploader::new(
             transport,
             uploader_config,
@@ -180,6 +252,8 @@ impl ResultHandler {
         );
 
         Self {
+            inbox: std::sync::Mutex::new(inbox),
+            sink,
             queue: Arc::new(Mutex::new(queue)),
             oneoff_queue: Mutex::new(ResultQueue::new(config.max_queue_size)),
             oneoff_pending: Mutex::new(VecDeque::new()),
@@ -298,8 +372,11 @@ impl ResultHandler {
 
     /// The next result of measurement `msm_id` is a ONEOFF's: it goes to
     /// eooqd's spool, posted at once with `&SRC=oneoff`, not into the next
-    /// main upload. Call before the measurement is started.
+    /// main upload. Call before the measurement is started. Results handed
+    /// over before this call are queued first, as before it: they are not
+    /// the one-off's.
     pub async fn expect_oneoff(&self, msm_id: u64) {
+        self.take_submitted().await;
         let mut pending = self.oneoff_pending.lock().await;
         if pending.len() >= MAX_PENDING_ONEOFFS {
             pending.pop_front();
@@ -307,37 +384,109 @@ impl ResultHandler {
         pending.push_back(msm_id);
     }
 
-    /// Submit a result for upload
-    pub async fn submit(&self, result: MeasurementResult) {
-        let oneoff = {
-            let mut pending = self.oneoff_pending.lock().await;
-            let at = pending.iter().position(|&id| id == result.msm_id.0);
-            at.and_then(|i| pending.remove(i)).is_some()
-        };
-        if oneoff {
-            let mut queue = self.oneoff_queue.lock().await;
-            queue.enqueue_measured(result, self.time_sync.lts());
-            debug!("One-off result enqueued, queue: {}", queue.stats().count);
-            drop(queue);
-            self.oneoff_ready.notify_one();
+    /// The measurement side's end of the hand-off: [`ResultSink::submit`]
+    /// from any runtime, without waiting.
+    pub fn sink(&self) -> ResultSink {
+        self.sink.clone()
+    }
+
+    /// Submit a result for upload: [`ResultSink::submit`]. It is queued
+    /// when the handler next takes what was handed over.
+    pub fn submit(&self, result: MeasurementResult) {
+        self.sink.submit(result);
+    }
+
+    /// The results handed over and not yet taken, all of them.
+    fn drain_inbox(&self) -> Vec<Submitted> {
+        let mut inbox = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut batch = Vec::new();
+        while let Ok(submitted) = inbox.try_recv() {
+            batch.push(submitted);
+        }
+        batch
+    }
+
+    /// Wait until a result is handed over, then take all that are waiting.
+    async fn next_submitted(&self) -> Vec<Submitted> {
+        std::future::poll_fn(|cx| {
+            let mut inbox = self
+                .inbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut batch = Vec::new();
+            match inbox.poll_recv_many(cx, &mut batch, usize::MAX) {
+                // Closed and empty: never, as the handler holds a sender
+                std::task::Poll::Ready(0) => std::task::Poll::Pending,
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(batch),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Queue what the measurements have handed over: anything that reads or
+    /// drains the queues takes it first, so it sees every result handed
+    /// over before it.
+    async fn take_submitted(&self) {
+        let batch = self.drain_inbox();
+        self.enqueue(batch).await;
+    }
+
+    /// Queue a batch of handed-over results, in the order they came: a
+    /// ONEOFF's into eooqd's spool, at once with `&SRC=oneoff`, every other
+    /// into the main queue.
+    async fn enqueue(&self, batch: Vec<Submitted>) {
+        if batch.is_empty() {
             return;
         }
-
-        let mut queue = self.queue.lock().await;
-        let before = queue.stats().count;
-        queue.enqueue_measured(result, self.time_sync.lts());
-        let after = queue.stats().count;
-
-        if after <= before && before > 0 {
-            self.metrics.record_queue_drop();
+        let (mut oneoffs, mut main) = (Vec::new(), Vec::new());
+        {
+            let mut pending = self.oneoff_pending.lock().await;
+            for submitted in batch {
+                let at = pending
+                    .iter()
+                    .position(|&id| id == submitted.result.msm_id.0);
+                if at.and_then(|i| pending.remove(i)).is_some() {
+                    oneoffs.push(submitted);
+                } else {
+                    main.push(submitted);
+                }
+            }
         }
 
-        self.metrics.update_queue_depth(after as i64);
-        debug!("Result enqueued, queue: {}", after);
+        if !oneoffs.is_empty() {
+            let mut queue = self.oneoff_queue.lock().await;
+            // One line per result, as 0026 logged at each submit: the debug
+            // drop-in's output stays the same
+            for Submitted { result, lts } in oneoffs {
+                queue.enqueue_measured(result, lts);
+                debug!("One-off result enqueued, queue: {}", queue.stats().count);
+            }
+            drop(queue);
+            self.oneoff_ready.notify_one();
+        }
+
+        if !main.is_empty() {
+            let mut queue = self.queue.lock().await;
+            for Submitted { result, lts } in main {
+                let before = queue.stats().count;
+                queue.enqueue_measured(result, lts);
+                let after = queue.stats().count;
+                if after <= before && before > 0 {
+                    self.metrics.record_queue_drop();
+                }
+                debug!("Result enqueued, queue: {}", after);
+            }
+            self.metrics.update_queue_depth(queue.stats().count as i64);
+        }
     }
 
     /// Get current queue statistics
     pub async fn queue_stats(&self) -> QueueStats {
+        self.take_submitted().await;
         let queue = self.queue.lock().await;
         queue.stats()
     }
@@ -362,6 +511,7 @@ impl ResultHandler {
             debug!("No upload endpoint configured, skipping upload");
             return Ok(0);
         }
+        self.take_submitted().await;
 
         // Drain all available results: upload everything each cycle,
         // matching the official probe's httppost behavior
@@ -435,6 +585,7 @@ impl ResultHandler {
         if !self.has_endpoint().await {
             return Ok(0);
         }
+        self.take_submitted().await;
         let results = self.oneoff_queue.lock().await.drain_all();
         let (uploadable, failed): (Vec<_>, Vec<_>) = results
             .into_iter()
@@ -494,6 +645,7 @@ impl ResultHandler {
 
     /// Run cleanup to remove expired and failed results
     pub async fn run_cleanup(&self) {
+        self.take_submitted().await;
         let mut queue = self.queue.lock().await;
         let removed_expired = queue.cleanup_expired(self.config.max_result_age_secs);
         let removed_failed = queue.cleanup_failed(self.config.max_attempts);
@@ -591,6 +743,12 @@ impl ResultHandler {
                 }
 
                 _ = self.lines_changed.notified() => {}
+
+                // What the measurements handed over: all of it, on each
+                // wake
+                batch = self.next_submitted() => {
+                    self.enqueue(batch).await;
+                }
 
                 _ = sleep_until(main_at) => {
                     let Some(tick) = main_at else { continue };
@@ -842,10 +1000,79 @@ mod tests {
             starla_metrics::MetricsRegistry::new().unwrap(),
         );
 
-        handler.submit(make_result(1001)).await;
+        handler.submit(make_result(1001));
 
         let stats = handler.queue_stats().await;
         assert_eq!(stats.count, 1);
+    }
+
+    /// Under the debug drop-in each result handed over logs its own
+    /// "Result enqueued, queue: N" (or "One-off result enqueued, queue: N"),
+    /// as 0026 did at each submit, though the handler takes them in a batch.
+    #[tokio::test]
+    async fn each_result_taken_logs_its_own_enqueued_line() {
+        use starla_common::logging::{fmt, EnvFilter};
+        // As uploader::tests::logged_by_an_upload: every callsite asks the
+        // subscriber of the thread it is hit on.
+        static ASK_EACH_THREAD: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ASK_EACH_THREAD
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(EnvFilter::new(
+                "info,starla=debug,starla_results::uploader=trace,starla_controller::ssh=trace",
+            ))
+            .with_ansi(false)
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let handler = ResultHandler::new(
+            Box::new(NoopTransport),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            starla_metrics::MetricsRegistry::new().unwrap(),
+        );
+        handler.expect_oneoff(7001).await;
+        handler.expect_oneoff(7002).await;
+        // One batch: three for the main queue, two one-offs between them
+        for msm_id in [1001, 7001, 1002, 7002, 1003] {
+            handler.submit(make_result(msm_id));
+        }
+        assert_eq!(handler.queue_stats().await.count, 3);
+
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let enqueued: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(" DEBUG ") && l.contains("enqueued, queue: "))
+            .map(|l| l.split_once(": ").map_or(l, |(_, message)| message))
+            .collect();
+        assert_eq!(
+            enqueued,
+            [
+                "One-off result enqueued, queue: 1",
+                "One-off result enqueued, queue: 2",
+                "Result enqueued, queue: 1",
+                "Result enqueued, queue: 2",
+                "Result enqueued, queue: 3",
+            ],
+            "{log}"
+        );
     }
 
     #[test]
@@ -933,7 +1160,7 @@ mod tests {
             .set_endpoint_path("/?PROBE_ID=1".into())
             .await
             .unwrap();
-        handler.submit(make_result(1001)).await;
+        handler.submit(make_result(1001));
 
         let tries = ResultHandlerConfig::default().max_attempts + 3;
         for _ in 0..tries {
@@ -966,7 +1193,7 @@ mod tests {
             .set_endpoint_path("/?PROBE_ID=1".into())
             .await
             .unwrap();
-        handler.submit(make_result(1001)).await;
+        handler.submit(make_result(1001));
 
         let cancel = CancellationToken::new();
         let run = tokio::spawn({
@@ -1033,7 +1260,7 @@ mod tests {
             .set_endpoint_path("/?PROBE_ID=1".into())
             .await
             .unwrap();
-        handler.submit(make_result(1001)).await;
+        handler.submit(make_result(1001));
         handler.mark_time_synced();
         let _ = handler.upload_pending().await;
         let (_, req) = seen.try_recv().unwrap();
@@ -1052,7 +1279,7 @@ mod tests {
             .await
             .unwrap();
         handler.set_session_id("s".into()).await;
-        handler.submit(make_result(1001)).await;
+        handler.submit(make_result(1001));
         let _ = handler.post_timesync().await;
         let (_, req) = seen.try_recv().unwrap();
         assert!(
@@ -1355,8 +1582,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(19_800)).await;
         handler.expect_oneoff(222_024_177).await;
         let oneoff = make_result(222_024_177);
-        handler.submit(oneoff.clone()).await;
-        handler.submit(make_result(1001)).await;
+        handler.submit(oneoff.clone());
+        handler.submit(make_result(1001));
         tokio::time::sleep(Duration::from_secs(50)).await;
         cancel.cancel();
 
@@ -1385,7 +1612,7 @@ mod tests {
         let cancel = start(&handler);
         tokio::time::sleep(Duration::from_secs(5)).await;
         handler.expect_oneoff(222_046_998).await;
-        handler.submit(make_result(222_046_998)).await;
+        handler.submit(make_result(222_046_998));
         tokio::time::sleep(Duration::from_secs(175)).await;
         cancel.cancel();
 
@@ -1422,6 +1649,135 @@ mod tests {
         assert!(at.iter().all(|t| (t - 12) % 60 == 0), "{at:?}");
         let gaps: Vec<i64> = at.windows(2).map(|w| w[1] - w[0]).collect();
         assert_eq!(gaps, [60, 120, 240, 480, 960, 1800, 1800, 1800, 1800]);
+    }
+
+    /// The measurements hand their results over without waiting for the
+    /// background runtime ([`ResultSink`]). Results handed over while the
+    /// background thread is stalled — russh's session task computes two
+    /// ~0.3 s modpows at every connect and rekey — wait in the hand-off,
+    /// none lost, and go out in order with the first upload after it.
+    /// Real threads: the handler on a runtime of its own thread, as the
+    /// probe runs it, and the results submitted from a multi-thread one.
+    ///
+    /// The stall lasts until the last result is submitted (10 s at most),
+    /// not a fixed 0.3 s: under CPU contention the paced submits sometimes
+    /// outlasted a fixed stall, and the test failed for proving nothing.
+    #[test]
+    fn results_handed_over_during_a_background_stall_are_uploaded_after_it() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        const RESULTS: u64 = 50;
+        const STALL_AT_MOST: Duration = Duration::from_secs(10);
+        let (transport, mut seen) = answering(&[OK]);
+        let handler = Arc::new(ResultHandler::new(
+            transport,
+            UploaderConfig::default(),
+            ResultHandlerConfig {
+                upload_interval: Duration::from_millis(400),
+                ..Default::default()
+            },
+            starla_metrics::MetricsRegistry::new().unwrap(),
+        ));
+        let cancel = CancellationToken::new();
+        let (stalled_tx, stalled) = std::sync::mpsc::channel();
+        let (stall_ended_tx, stall_ended) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let background = std::thread::spawn({
+            let handler = Arc::clone(&handler);
+            let cancel = cancel.clone();
+            let release = Arc::clone(&release);
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    handler
+                        .set_endpoint_path("/?PROBE_ID=1&SESSION_ID=s".into())
+                        .await
+                        .unwrap();
+                    let run = tokio::spawn({
+                        let handler = Arc::clone(&handler);
+                        let cancel = cancel.clone();
+                        async move { handler.run(cancel).await }
+                    });
+                    tokio::task::yield_now().await;
+                    // A poll that does not return until every result is
+                    // submitted, as a modpow's 0.3 s, and holds the queues
+                    // meanwhile, as an upload being built holds them: a
+                    // submit that took their locks would wait out the
+                    // whole stall, here to its 10 s limit
+                    tokio::spawn(async move {
+                        let _pending = handler.oneoff_pending.lock().await;
+                        let _queue = handler.queue.lock().await;
+                        stalled_tx.send(()).unwrap();
+                        let until = std::time::Instant::now() + STALL_AT_MOST;
+                        while !release.load(SeqCst) && std::time::Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+                        stall_ended_tx.send(release.load(SeqCst)).unwrap();
+                    });
+                    cancel.cancelled().await;
+                    run.await.unwrap().unwrap();
+                });
+            }
+        });
+
+        let measurement = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let sink = handler.sink();
+        stalled.recv().unwrap();
+        let slowest = measurement.block_on(async move {
+            let mut slowest = Duration::ZERO;
+            for i in 0..RESULTS {
+                let t = std::time::Instant::now();
+                sink.submit(make_result(5000 + i));
+                slowest = slowest.max(t.elapsed());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            slowest
+        });
+        release.store(true, SeqCst);
+        assert!(
+            stall_ended.recv().unwrap(),
+            "the stall ran out before the last submit: the test proves nothing"
+        );
+        // A submit that waited for the queues' locks would have waited
+        // until the stall ran out, 10 s; 50 ms leaves room for a loaded
+        // host's preemption
+        assert!(
+            slowest < Duration::from_millis(50),
+            "a submit waited {slowest:?}"
+        );
+
+        // Every result goes out once, in the order handed over
+        let mut bodies = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let wanted =
+            |bodies: &str| (0..RESULTS).all(|i| bodies.contains(&format!("\"{}\"", 5000 + i)));
+        while !wanted(&bodies) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not uploaded:\n{bodies}"
+            );
+            match seen.try_recv() {
+                Ok((_, req)) => bodies.push_str(&req),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let at: Vec<usize> = (0..RESULTS)
+            .map(|i| {
+                let id = format!("\"{}\"", 5000 + i);
+                assert_eq!(bodies.matches(&id).count(), 1, "{id} once");
+                bodies.find(&id).unwrap()
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "out of order");
+
+        cancel.cancel();
+        background.join().unwrap();
     }
 
     /// A line the controller's crontab repeats keeps its slot (perd's

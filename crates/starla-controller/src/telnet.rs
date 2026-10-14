@@ -604,6 +604,13 @@ pub async fn handle_connection(
     // malicious or malfunctioning controller can take
     const MAX_LINE_LEN: usize = 256 * 1024; // 256KB
 
+    // A crontab is ~800 lines, each parsed and logged here with no await
+    // between them while the reads find data waiting: yield every so many,
+    // so the runtime's other tasks (KEEP, uploads) are not held up for the
+    // whole crontab.
+    const LINES_PER_YIELD: usize = 64;
+    let mut taken = 0usize;
+
     'session: loop {
         use tokio::io::AsyncReadExt;
         let read = tokio::select! {
@@ -624,6 +631,10 @@ pub async fn handle_connection(
 
         // Filter out telnet IAC sequences and split the rest into lines
         for line in lines.feed(&telnet_filter.feed(&raw_buf[..n])) {
+            taken += 1;
+            if taken.is_multiple_of(LINES_PER_YIELD) {
+                tokio::task::yield_now().await;
+            }
             if atlas
                 .as_ref()
                 .is_some_and(|rx| rx.has_changed().unwrap_or(false))

@@ -21,6 +21,7 @@ use super::engine::{Hop, Probe, Trace};
 use super::wire::{self, TraceId, BASE_PORT, SRC_BASE_PORT};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use starla_common::{TracerouteOptions, TracerouteProtocol};
+use starla_network::rxstamp::Arrival;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
@@ -228,27 +229,34 @@ struct Received {
     hoplimit: i32,
     /// IPV6_TCLASS, -42 without one
     tclass: i32,
-    at: Duration,
+    /// When it was read (gettime_mono), and when the kernel had it
+    at: Arrival<Duration>,
 }
 
 /// A raw socket that reports the IPv6 hop limit and traffic class of what
-/// it receives.
+/// it receives, and with `kernel_rx_timestamps` the kernel's stamp of its
+/// arrival.
 struct RawSock {
     fd: AsyncFd<Socket>,
 }
 
 impl RawSock {
-    fn new(v6: bool, protocol: Protocol) -> io::Result<Self> {
-        Self::with_type(v6, Type::RAW, protocol)
+    fn new(v6: bool, protocol: Protocol, kernel_rx: bool) -> io::Result<Self> {
+        Self::with_type(v6, Type::RAW, protocol, kernel_rx)
     }
 
-    fn with_type(v6: bool, ty: Type, protocol: Protocol) -> io::Result<Self> {
+    fn with_type(v6: bool, ty: Type, protocol: Protocol, kernel_rx: bool) -> io::Result<Self> {
         let domain = if v6 { Domain::IPV6 } else { Domain::IPV4 };
         let sock = Socket::new(domain, ty, Some(protocol))?;
         sock.set_nonblocking(true)?;
         if v6 {
             setsockopt_int(&sock, libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT, 1)?;
             setsockopt_int(&sock, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, 1)?;
+        }
+        if kernel_rx {
+            if let Err(e) = starla_network::rxstamp::enable(sock.as_raw_fd()) {
+                tracing::debug!("traceroute: no receive stamps from the kernel: {}", e);
+            }
         }
         Ok(Self {
             fd: AsyncFd::new(sock)?,
@@ -281,9 +289,10 @@ impl RawSock {
             return Err(io::Error::last_os_error());
         }
         let at = mono();
-        let (mut hoplimit, mut tclass) = (-42, -42);
+        let (mut hoplimit, mut tclass, mut stamp) = (-42, -42, None);
         // SAFETY: the CMSG_* walk stays inside msg_control/msg_controllen,
-        // which the kernel just filled; the ints are read unaligned.
+        // which the kernel just filled; the ints are read unaligned, the
+        // stamp from as many bytes as its cmsg_len says.
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
             while !c.is_null() {
@@ -297,6 +306,13 @@ impl RawSock {
                     } else if (*c).cmsg_type == libc::IPV6_TCLASS {
                         tclass = v;
                     }
+                } else if (*c).cmsg_level == libc::SOL_SOCKET {
+                    let data = libc::CMSG_DATA(c);
+                    let len = ((*c).cmsg_len as usize).saturating_sub(data as usize - c as usize);
+                    let data = std::slice::from_raw_parts(data, len);
+                    stamp =
+                        starla_network::rxstamp::from_cmsg((*c).cmsg_level, (*c).cmsg_type, data)
+                            .or(stamp);
                 }
                 c = libc::CMSG_NXTHDR(&msg, c);
             }
@@ -307,7 +323,10 @@ impl RawSock {
             from,
             hoplimit,
             tclass,
-            at,
+            at: Arrival {
+                user: at,
+                kernel: stamp.and_then(|stamp| starla_network::rxstamp::monotonic(stamp, mono)),
+            },
         })
     }
 
@@ -333,18 +352,18 @@ impl RawSock {
 /// that ping and traceroute work there without root. A TCP trace still
 /// needs root there: its SYNs and the target's answers go through raw TCP
 /// sockets, and the reference has no other way either.
-fn reply_socket(v6: bool, protocol: TracerouteProtocol) -> io::Result<RawSock> {
+fn reply_socket(v6: bool, protocol: TracerouteProtocol, kernel_rx: bool) -> io::Result<RawSock> {
     let icmp = if v6 {
         Protocol::ICMPV6
     } else {
         Protocol::ICMPV4
     };
-    let raw = RawSock::new(v6, icmp);
+    let raw = RawSock::new(v6, icmp, kernel_rx);
     #[cfg(target_os = "macos")]
     if let Err(e) = &raw {
         let unprivileged = matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES));
         if unprivileged && protocol != TracerouteProtocol::TCP {
-            if let Ok(dgram) = RawSock::with_type(v6, Type::DGRAM, icmp) {
+            if let Ok(dgram) = RawSock::with_type(v6, Type::DGRAM, icmp, kernel_rx) {
                 return Ok(dgram);
             }
         }
@@ -368,6 +387,9 @@ pub struct RunSpec<'a> {
     pub paris: Option<u16>,
     /// the measurement's slot (trtstate.index)
     pub index: u16,
+    /// `kernel_rx_timestamps`: replies timed by the kernel's stamps of
+    /// their arrival ([`starla_network::rxstamp`])
+    pub kernel_rx: bool,
 }
 
 /// Everything send_pkt needs for a probe.
@@ -531,7 +553,7 @@ pub async fn run(spec: &RunSpec<'_>) -> Vec<Hop> {
             return trace.into_hops();
         }
     };
-    let icmp = match reply_socket(v6, opts.protocol) {
+    let icmp = match reply_socket(v6, opts.protocol, spec.kernel_rx) {
         Ok(s) => s,
         Err(e) => {
             trace.start_failed(&format!("socket failed: {}", strerror(&e)));
@@ -545,7 +567,7 @@ pub async fn run(spec: &RunSpec<'_>) -> Vec<Hop> {
         return trace.into_hops();
     }
     let tcp = if opts.protocol == TracerouteProtocol::TCP {
-        let s = match RawSock::new(v6, Protocol::TCP) {
+        let s = match RawSock::new(v6, Protocol::TCP, spec.kernel_rx) {
             Ok(s) => s,
             Err(e) => {
                 trace.start_failed(&format!("socket failed: {}", strerror(&e)));
@@ -659,6 +681,15 @@ mod tests {
         protocol: TracerouteProtocol,
         paris: Option<u16>,
     ) -> String {
+        trace_localhost_with(target, protocol, paris, false).await
+    }
+
+    async fn trace_localhost_with(
+        target: IpAddr,
+        protocol: TracerouteProtocol,
+        paris: Option<u16>,
+        kernel_rx: bool,
+    ) -> String {
         let opts = TracerouteOptions {
             protocol,
             timeout_ms: 1000,
@@ -668,7 +699,11 @@ mod tests {
             target,
             opts: &opts,
             paris,
-            index: 4000 + protocol as u16 + if paris.is_some() { 0 } else { 8 },
+            index: 4000
+                + protocol as u16
+                + if paris.is_some() { 0 } else { 8 }
+                + if kernel_rx { 16 } else { 0 },
+            kernel_rx,
         };
         let r = render_hops(&run(&spec).await);
         eprintln!("{} {:?}: {}", target, protocol, r);
@@ -773,6 +808,48 @@ mod tests {
         assert_eq!(r.matches("\"from\":\"127.0.0.1\"").count(), 3, "{r}");
     }
 
+    /// With `kernel_rx_timestamps` the traces read as without: the same
+    /// hops and fields, rtts in the same format, from the kernel's stamps.
+    #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "needs CAP_NET_RAW: the Linux check runs it with --include-ignored"
+    )]
+    async fn kernel_stamps_time_the_same_traces() {
+        let rtt = |r: &str| -> Vec<f64> {
+            r.split("\"rtt\":")
+                .skip(1)
+                .map(|s| s[..s.find([',', ' ']).unwrap()].parse().unwrap())
+                .collect()
+        };
+        let r = trace_localhost_with(
+            Ipv6Addr::LOCALHOST.into(),
+            TracerouteProtocol::UDP,
+            LOCAL_UDP_PARIS,
+            true,
+        )
+        .await;
+        assert!(
+            r.starts_with("[ { \"hop\":1, \"result\": [ { \"from\":\"::1\", \"ttl\":64, \"rtt\":"),
+            "{r}"
+        );
+        assert_eq!(r.matches(", \"size\":88 }").count(), 3, "{r}");
+        let r = trace_localhost_with(
+            Ipv4Addr::LOCALHOST.into(),
+            TracerouteProtocol::ICMP,
+            Some(1),
+            true,
+        )
+        .await;
+        assert!(
+            r.starts_with("[ { \"hop\":1, \"result\": [ { \"from\":\"127.0.0.1\", \"ttl\":64, \"size\":40, \"rtt\":"),
+            "{r}"
+        );
+        let rtts = rtt(&r);
+        assert_eq!(rtts.len(), 3, "{r}");
+        assert!(rtts.iter().all(|ms| (0.0..10.0).contains(ms)), "{r}");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "needs CAP_NET_RAW: the Linux check runs it with --include-ignored"]
@@ -800,9 +877,11 @@ mod tests {
         }
         assert!(Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)).is_err());
         for v6 in [false, true] {
-            assert!(reply_socket(v6, TracerouteProtocol::ICMP).is_ok());
-            assert!(reply_socket(v6, TracerouteProtocol::UDP).is_ok());
-            let e = reply_socket(v6, TracerouteProtocol::TCP).err().unwrap();
+            assert!(reply_socket(v6, TracerouteProtocol::ICMP, false).is_ok());
+            assert!(reply_socket(v6, TracerouteProtocol::UDP, false).is_ok());
+            let e = reply_socket(v6, TracerouteProtocol::TCP, false)
+                .err()
+                .unwrap();
             assert_eq!(e.raw_os_error(), Some(libc::EPERM));
         }
         let r = trace_localhost(Ipv4Addr::LOCALHOST.into(), TracerouteProtocol::TCP).await;

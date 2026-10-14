@@ -8,6 +8,7 @@
 
 pub mod resolver;
 
+use crate::target::Resolver;
 use crate::traits::Measurement;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -214,11 +215,14 @@ impl Measurement for Dns {
     }
 
     async fn execute(&self) -> anyhow::Result<MeasurementResult> {
-        // Read at every run, as tdig_start() does. With -I, the interface's
-        // resolv.conf.<ifname> when it exists, else /etc/resolv.conf.
-        let resolvers = self.config.resolv.then(|| {
-            resolver::read_resolv_conf(&resolver::resolv_conf_for(self.config.interface.as_deref()))
-        });
+        // tdig_start() reads resolv.conf at every run (with -I, the
+        // interface's resolv.conf.<ifname> when it exists); here the copy the
+        // background runtime refreshes every minute (no file read on the
+        // measurement runtime)
+        let resolvers = self
+            .config
+            .resolv
+            .then(|| resolver::local_resolvers(self.config.interface.as_deref()));
         // get_probe_id() is -1 until the probe knows its id
         let probe_id = match self.probe_id.0 {
             0 => -1,
@@ -310,6 +314,17 @@ pub(crate) async fn run(
     probe_id: i64,
     resolvers: Option<Vec<String>>,
 ) -> Vec<Entry> {
+    run_via(cfg, probe_id, resolvers, None).await
+}
+
+/// [`run`], a server name looked up with `dns`, the probe's resolver
+/// when None.
+async fn run_via(
+    cfg: &DnsConfig,
+    probe_id: i64,
+    resolvers: Option<Vec<String>>,
+    dns: Option<&Resolver>,
+) -> Vec<Entry> {
     // The macros are expanded before anything else (evtdig.c:3068)
     let Some(name) = resolver::expand_name_macros(&cfg.query, probe_id) else {
         let (dst, sub) = match cfg.resolv {
@@ -324,7 +339,7 @@ pub(crate) async fn run(
         )];
     };
     let Some(list) = resolvers else {
-        return vec![query(cfg, &cfg.server, Some(&name), None, probe_id).await];
+        return vec![query(cfg, dns, &cfg.server, Some(&name), None, probe_id).await];
     };
     if list.is_empty() {
         let text = "\"nameserver\": \"no local resolvers found\"";
@@ -337,7 +352,7 @@ pub(crate) async fn run(
             // (evtdig.c:3444)
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        entries.push(query(cfg, ns, None, Some((i + 1, list.len())), probe_id).await);
+        entries.push(query(cfg, dns, ns, None, Some((i + 1, list.len())), probe_id).await);
     }
     entries
 }
@@ -347,6 +362,7 @@ pub(crate) async fn run(
 /// (noreply_callback(), evtdig.c:1522), until the retries run out.
 async fn query(
     cfg: &DnsConfig,
+    dns: Option<&Resolver>,
     server: &str,
     name: Option<&str>,
     sub: Option<(usize, usize)>,
@@ -366,9 +382,9 @@ async fn query(
             }
         };
         let mut attempt = if cfg.tcp {
-            resolver::tcp_attempt(cfg, server, name, probe_id).await
+            resolver::tcp_attempt(cfg, dns, server, name, probe_id).await
         } else {
-            resolver::udp_attempt(cfg, server, name, probe_id).await
+            resolver::udp_attempt(cfg, dns, server, name, probe_id).await
         };
         // A retried query leaves its addresses too
         cfg.carry.apply(&mut attempt, cfg.tcp);
@@ -1326,6 +1342,114 @@ mod tests {
         }
     }
 
+    /// A server name is asked of the probe's resolvers by Starla's evdns, as
+    /// tdig_start() asks DnsBase (evtdig.c:3223), and the query goes to the
+    /// address it gives; a name that does not exist is evdns's EAI_NONAME.
+    /// For -4 only an A question goes out, for -6 only an AAAA one.
+    /// Starla asked the system resolver, with getaddrinfo() on the blocking
+    /// pool.
+    #[tokio::test]
+    async fn a_server_name_is_looked_up_as_evdns_looks_it_up() {
+        let (target, mut asked) = udp_server("127.0.0.1:0").await;
+        let port = target.port();
+        let (dns, mut lookups) = crate::target::local_resolver(
+            Some(|name| (name == "ns.example").then(|| IpAddr::from([127, 0, 0, 1]))),
+            Duration::from_secs(2),
+            1,
+        )
+        .await;
+        let cfg = DnsConfig {
+            server: "ns.example.".into(),
+            port,
+            query: "hostname.bind.".into(),
+            timeout_ms: 2000,
+            disable_check_addr: true,
+            ..Default::default()
+        };
+        let entries = run_via(&cfg, 1, None, Some(&dns)).await;
+        assert_eq!(name_of(&asked.recv().await.unwrap()), "hostname.bind");
+        assert_eq!(
+            lookups.recv().await.unwrap(),
+            ("ns.example".into(), hickory_proto::rr::RecordType::A)
+        );
+        assert!(lookups.try_recv().is_err(), "-4 asks for A alone");
+        let line = uploaded(&format_line(11001, &cfg, &entries, entries[0].printed), 3);
+        assert!(line.contains(&format!(r#""name" : "ns.example." , "dst_addr" : "127.0.0.1" , "dst_port" : "{port}" , "af" : 4 , "src_addr" : "127.0.0.1" , "proto" : "UDP" ,"result" : {{ "rt" : "#)), "{line}");
+
+        // Another line: nothing carried over from the one before
+        let cfg = DnsConfig {
+            server: "nx.example.".into(),
+            carry: Carry::default(),
+            ..cfg
+        };
+        let entries = run_via(&cfg, 1, None, Some(&dns)).await;
+        let line = uploaded(&format_line(11001, &cfg, &entries, entries[0].printed), 3);
+        assert!(line.ends_with(r#""dst_name" : "nx.example." , "proto" : "UDP" , "error" : {"evdns_getaddrinfo": "nx.example. nodename nor servname provided, or not known"} }"#), "{line}");
+        let asked = |lookups: &mut tokio::sync::mpsc::UnboundedReceiver<_>| {
+            std::iter::from_fn(|| lookups.try_recv().ok()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            asked(&mut lookups),
+            [("nx.example".to_string(), hickory_proto::rr::RecordType::A)]
+        );
+
+        let cfg = DnsConfig { af: 6, ..cfg };
+        let entries = run_via(&cfg, 1, None, Some(&dns)).await;
+        let line = uploaded(&format_line(11001, &cfg, &entries, entries[0].printed), 3);
+        assert!(line.ends_with(r#""dst_name" : "nx.example." , "proto" : "UDP" , "error" : {"evdns_getaddrinfo": "nx.example. nodename nor servname provided, or not known"} }"#), "{line}");
+        assert_eq!(
+            asked(&mut lookups),
+            [(
+                "nx.example".to_string(),
+                hickory_proto::rr::RecordType::AAAA
+            )]
+        );
+    }
+
+    /// A server name whose resolvers never answer: the lookup ends when
+    /// evdns's timeout and attempts from resolv.conf run out, and the line
+    /// is what evtdig writes for it, EAI_FAIL in udp_dns_cb()'s
+    /// `"evdns_getaddrinfo"` over UDP, in tcp_reporterr()'s `"TUDNS"` over
+    /// TCP (evtdig.c:3025, 1585). Nothing else bounds it, in evtdig either:
+    /// its timers are set once the server has an address. Starla's
+    /// getaddrinfo() on the blocking pool held a thread for 18 to 20 s on
+    /// enodia, and nothing bounded it at all.
+    #[tokio::test]
+    async fn a_server_name_nobody_answers_for_ends_with_evdns_timeouts() {
+        let (dns, mut lookups) =
+            crate::target::local_resolver(None, Duration::from_millis(200), 2).await;
+        for (tcp, error) in [
+            (
+                false,
+                r#""dst_name" : "ns.example." , "proto" : "UDP" , "error" : {"evdns_getaddrinfo": "ns.example. non-recoverable failure in name resolution"} }"#,
+            ),
+            (
+                true,
+                r#""dst_name" : "ns.example." , "proto" : "TCP" , "error" : { "TUDNS" : "non-recoverable failure in name resolution"} }"#,
+            ),
+        ] {
+            let cfg = DnsConfig {
+                server: "ns.example.".into(),
+                tcp,
+                query: "hostname.bind.".into(),
+                ..Default::default()
+            };
+            let start = std::time::Instant::now();
+            let entries = run_via(&cfg, 1, None, Some(&dns)).await;
+            let took = start.elapsed();
+            // two transmissions, 200 ms each
+            assert!(took >= Duration::from_millis(400), "{took:?}");
+            assert!(took < Duration::from_secs(2), "{took:?}");
+            let line = uploaded(&format_line(11001, &cfg, &entries, entries[0].printed), 3);
+            assert!(line.ends_with(error), "{line}");
+            let asked: Vec<_> = std::iter::from_fn(|| lookups.try_recv().ok()).collect();
+            assert_eq!(
+                asked,
+                vec![("ns.example".to_string(), hickory_proto::rr::RecordType::A); 2]
+            );
+        }
+    }
+
     /// A DNS server on a local socket whose replies leave with TTL (hop
     /// limit) 42.
     async fn udp_server_hops(addr: &str) -> SocketAddr {
@@ -1832,7 +1956,8 @@ mod tests {
             "127.0.0.1",
             &servers,
             "hostname.bind.",
-            1
+            1,
+            false
         ));
         let first = attempt
             .as_mut()
@@ -1845,6 +1970,62 @@ mod tests {
             panic!("{:?}", a.outcome)
         };
         assert!(rt < 40.0, "the wait for writable is in rt: {rt} ms");
+    }
+
+    /// With `kernel_rx_timestamps`, a reply that waited to be read — the
+    /// attempt not polled for 40 ms, a busy runtime — reports rt to the
+    /// kernel's stamp of its arrival: loopback's, the wait left out, with
+    /// `--ttl` or without. Without the option rt has the wait in, as the
+    /// reference's rt would.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn rt_runs_to_the_kernels_stamp_of_the_reply() {
+        use starla_network::rxstamp::{hold, stamping_at_arrival};
+        use std::future::Future;
+        // as set_enabled holds it
+        hold().unwrap();
+        assert!(stamping_at_arrival(Duration::from_secs(2)));
+        let (server, mut queries) = udp_server("127.0.0.1:0").await;
+        let servers = [server];
+        for (kernel_rx, ttl) in [(false, false), (true, false), (true, true)] {
+            let cfg = DnsConfig {
+                query: "hostname.bind.".into(),
+                timeout_ms: 2000,
+                disable_check_addr: true,
+                ttl,
+                ..Default::default()
+            };
+            let mut attempt = std::pin::pin!(resolver::udp_query(
+                &cfg,
+                "127.0.0.1",
+                &servers,
+                "hostname.bind.",
+                1,
+                kernel_rx
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // Polled until the query has gone and been answered, then left
+            // while the answer waits.
+            let query = loop {
+                assert!(attempt.as_mut().poll(&mut cx).is_pending());
+                tokio::select! {
+                    q = queries.recv() => break q.unwrap(),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let a = attempt.await;
+            let Outcome::Reply { rt, wire, .. } = a.outcome else {
+                panic!("{:?}", a.outcome)
+            };
+            assert_eq!(wire[..2], query[..2]);
+            assert_eq!(a.ttl, ttl.then_some(64), "--ttl {ttl}");
+            if kernel_rx {
+                assert!(rt < 10.0, "the wait is in rt: {rt} ms");
+            } else {
+                assert!(rt >= 40.0, "{rt} ms");
+            }
+        }
     }
 
     /// A server name with several addresses of the family gets the query at
@@ -1862,7 +2043,15 @@ mod tests {
             disable_check_addr: true,
             ..Default::default()
         };
-        let a = resolver::udp_query(&cfg, "ns.example.", &[first, last], "hostname.bind.", 1).await;
+        let a = resolver::udp_query(
+            &cfg,
+            "ns.example.",
+            &[first, last],
+            "hostname.bind.",
+            1,
+            false,
+        )
+        .await;
         let (q1, q2) = (rx1.recv().await.unwrap(), rx2.recv().await.unwrap());
         assert_eq!(q1[2..], q2[2..], "the same query, its own id");
         assert_eq!(

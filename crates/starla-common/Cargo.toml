@@ -21,6 +21,11 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 libc = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+# A SIGTERM writes out the queued log lines before the process dies of it.
+# Already in Cargo.lock: it is what tokio's signal handling registers with.
+signal-hook-registry = "1.4"
+
 [features]
 default = []
 json = ["tracing-subscriber/json"]
