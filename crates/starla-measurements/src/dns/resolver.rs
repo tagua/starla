@@ -672,8 +672,13 @@ pub(crate) async fn udp_query(
                 " \"err\" : \"unable to format DNS query\"",
             );
         };
-        let start = Instant::now();
-        let sent = match socket.send(&query).await {
+        // The send time once the socket takes the query, just before the
+        // send, as evtdig stamps it (evtdig.c:1459-1465). Each attempt's
+        // socket is new to the reactor, so Starla's stamp before
+        // `send().await` put a reactor turn in every query's rt.
+        let (start, sent) =
+            starla_network::send_stamped(&socket, || (Instant::now(), &query[..])).await;
+        let sent = match sent {
             Ok(n) if n == query.len() => Ok(()),
             Ok(_) => Err(std::io::Error::last_os_error()),
             Err(e) => Err(e),

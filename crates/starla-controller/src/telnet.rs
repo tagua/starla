@@ -34,6 +34,11 @@ pub enum TelnetCommand {
     Oneoff(Box<TelnetCommand>),
     /// An httppost CRONLINE: when and where the probe posts its results
     Httppost(HttppostSpec),
+    /// A condmv CRONLINE: in crons/7 one of eperd's timed lines (condmv is
+    /// an eperd built-in, eperd.c:932), armed and fired like any other;
+    /// its run, moving data/new/7 to data/out/7 with the 9907 marker, is
+    /// the uploader's
+    Condmv(CondmvSpec),
     /// A crontab the controller sent whole: its CRONLINEs, handed on once
     /// a line other than a CRONLINE has ended it
     Crontab(CrontabSpec),
@@ -41,7 +46,7 @@ pub enum TelnetCommand {
     Status,
     /// Stop a running measurement
     Stop(u64),
-    /// Ignored command (known but not handled, e.g. condmv, internal
+    /// Ignored command (known but not handled, e.g. dfrm, internal
     /// commands)
     Ignored(String),
     /// Unknown command
@@ -138,6 +143,14 @@ pub struct HttppostSpec {
     pub set_time: Option<i64>,
     /// `--local-time`: send a `Unix-Date:` header
     pub local_time: bool,
+}
+
+/// A condmv CRONLINE's timing: all of it a cron daemon uses. Its arguments
+/// are the spool's, which Starla does not keep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CondmvSpec {
+    pub spread: Option<u32>,
+    pub schedule: ScheduleSpec,
 }
 
 /// Common scheduling fields for recurring measurements
@@ -1096,10 +1109,23 @@ fn parse_cronline(cmd: &str) -> TelnetCommand {
             )
         }
 
-        // Hardware-probe spool plumbing: rotates result files between
-        // data/new/ → data/out/ → data/storage/ and clears stale spool.
-        // starla queues results in memory, so the spool model doesn't apply.
-        "condmv" | "dfrm" => {
+        // condmv: a timed line of the cron daemon that reads its crontab,
+        // whose run moves data/new/ to data/out/ — the uploader's here, as
+        // Starla keeps its results in memory. Its timer is kept all the
+        // same: eperd writes a record of it when the time is off
+        // (eperd.c:1268-1303).
+        "condmv" => TelnetCommand::Condmv(CondmvSpec {
+            spread: Some(spread),
+            schedule: ScheduleSpec {
+                interval,
+                start_time: 0,
+                stop_time: end_time,
+            },
+        }),
+
+        // Hardware-probe spool plumbing: dfrm clears stale spool, which
+        // starla, queueing results in memory, does not have.
+        "dfrm" => {
             trace!(
                 "Ignoring {} CRONLINE (no on-disk spool to manage)",
                 measurement_cmd
@@ -1201,6 +1227,7 @@ fn set_start_time(cmd: &mut TelnetCommand, start_time: i64) {
         TelnetCommand::Http(s) => &mut s.schedule,
         TelnetCommand::Tls(s) => &mut s.schedule,
         TelnetCommand::Ntp(s) => &mut s.schedule,
+        TelnetCommand::Condmv(s) => &mut s.schedule,
         _ => return,
     };
     schedule.start_time = start_time;
@@ -3343,11 +3370,24 @@ mod tests {
         ));
     }
 
+    /// crons/7's condmv line, as ctr-dub-sw02 sent it (the twin's scenario
+    /// enodia-2026-10-13T0131): its timing, for eperd's timer of it.
     #[test]
-    fn test_parse_cronline_condmv_ignored() {
-        let cmd = parse_command(
-            "CRONLINE 60 0 0 UNIFORM 5 condmv /home/atlas/data/new/foo /home/atlas/data/out/foo",
+    fn test_parse_cronline_condmv_keeps_its_timing() {
+        let line = r#"CRONLINE 60 1 2000000000 UNIFORM 14 condmv -A "RESULT 9907 ongoing" /home/atlas/data/new/7 /home/atlas/data/out/7"#;
+        let TelnetCommand::Condmv(spec) = parse_command(line) else {
+            panic!("{:?}", parse_command(line));
+        };
+        assert_eq!(spec.spread, Some(14));
+        assert_eq!(
+            (
+                spec.schedule.interval,
+                spec.schedule.start_time,
+                spec.schedule.stop_time
+            ),
+            (60, 1, 2_000_000_000)
         );
+        let cmd = parse_command("CRONLINE 60 0 0 UNIFORM 5 dfrm /home/atlas/data/new/foo");
         assert!(matches!(cmd, TelnetCommand::Ignored(_)));
     }
 

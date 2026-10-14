@@ -767,8 +767,32 @@ async fn main() -> Result<()> {
                     debug!(msm_id, "Stop measurement request");
                     scheduler_tx_cmd.send(SchedulerCommand::Stop(msm_id)).await
                 }
+                TelnetCommand::Condmv(spec) => {
+                    // A crontab's condmv line keeps its timer, for eperd's
+                    // record of it when the time is off; the scheduler
+                    // takes it in eperd's crontab, crons/7, only
+                    // (MeasurementSpec::Condmv). Outside a crontab, or as a
+                    // one-off, it is the uploader's, and nothing here.
+                    match (&mut crontab, &shell) {
+                        (Some(crontab), Some(shell)) if spec.schedule.interval > 0 => {
+                            crontab.lines.push(starla_scheduler::CrontabLine {
+                                command: shell.clone(),
+                                job: MeasurementJob {
+                                    msm_id: 0,
+                                    interval: spec.schedule.interval,
+                                    start_time: spec.schedule.start_time,
+                                    end_time: spec.schedule.stop_time,
+                                    spread: spec.spread.unwrap_or(0) as u64,
+                                    spec: MeasurementSpec::Condmv,
+                                },
+                            });
+                        }
+                        _ => debug!("condmv line outside a crontab: the uploader's"),
+                    }
+                    Ok(())
+                }
                 TelnetCommand::Ignored(_) => {
-                    // Known commands that we don't need to handle (condmv,
+                    // Known commands that we don't need to handle (dfrm,
                     // internal Atlas commands)
                     Ok(())
                 }

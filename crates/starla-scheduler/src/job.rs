@@ -14,7 +14,7 @@ use starla_measurements::{
     traceroute::{Run as TracerouteRun, TracerouteConfig},
     Dns, Http, Measurement, Ntp, Ping, Tls, Traceroute,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// evtdig's options, as the measurement takes them: the server and the
@@ -59,6 +59,15 @@ pub enum MeasurementSpec {
     Http(HttpJobSpec),
     Tls(TlsJobSpec),
     Ntp(NtpJobSpec),
+    /// eperd's condmv line in crons/7 (`condmv -A "RESULT 9907 ongoing"
+    /// /home/atlas/data/new/7 /home/atlas/data/out/7`): a timed line like
+    /// any other — condmv is one of eperd's built-ins (eperd.c:932), so
+    /// Start arms it and RunJob fires it, and writes its 9807 record when
+    /// the time is off (eperd.c:838-848, 1268-1303) — whose run is the
+    /// uploader's to do: Starla has no data/new/7 to move, and writes the
+    /// 9907 marker itself (starla_results::system_status). A run of it
+    /// starts nothing.
+    Condmv,
 }
 
 impl MeasurementSpec {
@@ -70,7 +79,13 @@ impl MeasurementSpec {
             MeasurementSpec::Http(_) => "http",
             MeasurementSpec::Tls(_) => "tls",
             MeasurementSpec::Ntp(_) => "ntp",
+            MeasurementSpec::Condmv => "condmv",
         }
+    }
+
+    /// Whether a run of the line measures anything: condmv's does not.
+    pub(crate) fn measures(&self) -> bool {
+        !matches!(self, MeasurementSpec::Condmv)
     }
 }
 
@@ -135,13 +150,15 @@ pub struct NtpJobSpec {
 }
 
 impl MeasurementSpec {
-    /// The target ping and traceroute look up when they run, and the family
-    /// -4/-6 asked for. None for the other kinds, which are built with their
-    /// target resolved as before (resolve_target), or look it up themselves.
+    /// The target ping, traceroute and NTP look up when they run, and the
+    /// family -4/-6 asked for. evntp asks for one family, IPv6 with -6 and
+    /// IPv4 otherwise (ntp.c:1488-1494). None for the other kinds, which
+    /// look their target up themselves.
     fn target(&self) -> Option<(&str, u8)> {
         match self {
             MeasurementSpec::Ping(s) => Some((&s.target, s.af)),
             MeasurementSpec::Traceroute(s) => Some((&s.target, s.af)),
+            MeasurementSpec::Ntp(s) => Some((&s.target, if s.af == 6 { 6 } else { 4 })),
             _ => None,
         }
     }
@@ -168,23 +185,27 @@ impl MeasurementSpec {
         }
     }
 
-    fn measurement_type(&self) -> MeasurementType {
-        match self {
+    /// The measurement the line runs; none for condmv.
+    pub(crate) fn measurement_type(&self) -> Option<MeasurementType> {
+        Some(match self {
             MeasurementSpec::Ping(_) => MeasurementType::Ping,
             MeasurementSpec::Traceroute(_) => MeasurementType::Traceroute,
             MeasurementSpec::Dns(_) => MeasurementType::Dns,
             MeasurementSpec::Http(_) => MeasurementType::Http,
             MeasurementSpec::Tls(_) => MeasurementType::Tls,
             MeasurementSpec::Ntp(_) => MeasurementType::Ntp,
-        }
+            MeasurementSpec::Condmv => return None,
+        })
     }
 }
 
 impl MeasurementJob {
-    /// Convert this job to an executable measurement. A ping's or a
-    /// traceroute's target is looked up each time it runs, as eperd looks
-    /// one up at every start (ping.c:1746-1800, traceroute.c:4940-4971),
-    /// with [`starla_measurements::target`].
+    /// Convert this job to an executable measurement. A ping's, a
+    /// traceroute's or an NTP measurement's target is looked up each time it
+    /// runs, as eperd looks one up at every start (ping.c:1746-1800,
+    /// traceroute.c:4940-4971, ntp.c:1454-1496), with
+    /// [`starla_measurements::target`]: on the runtime, never a blocking
+    /// getaddrinfo on one of its two workers.
     pub fn to_measurement(&self, probe_id: ProbeId) -> anyhow::Result<Box<dyn Measurement>> {
         if self.spec.target().is_none() {
             return self.build(probe_id, None);
@@ -276,11 +297,10 @@ impl MeasurementJob {
                 msm_id,
             })),
             MeasurementSpec::Ntp(spec) => {
-                let target = resolve_target(&spec.target, spec.af)?;
+                let (target, dst_name) = looked_up.ok_or_else(no_target)?;
                 Ok(Box::new(Ntp {
                     config: NtpConfig {
                         target,
-                        dst_name: spec.target.clone(),
                         timeout_ms: spec.timeout_ms as u64,
                         port: 123,
                         count: spec.packets,
@@ -288,8 +308,10 @@ impl MeasurementJob {
                     },
                     probe_id,
                     msm_id,
+                    dst_name,
                 }))
             }
+            MeasurementSpec::Condmv => anyhow::bail!("condmv: a line that measures nothing"),
         }
     }
 
@@ -330,34 +352,6 @@ fn dns_probe_id(probe_id: ProbeId) -> ProbeId {
     }
 }
 
-/// Resolve a hostname or IP string to an IpAddr
-fn resolve_target(target: &str, af: u8) -> anyhow::Result<IpAddr> {
-    // First try to parse as IP address directly
-    if let Ok(ip) = target.parse::<IpAddr>() {
-        return Ok(ip);
-    }
-
-    // Try DNS resolution
-    let addr_str = format!("{}:0", target);
-    let addrs: Vec<_> = addr_str.to_socket_addrs()?.collect();
-
-    // Filter by address family if specified
-    for addr in &addrs {
-        let ip = addr.ip();
-        match af {
-            4 if ip.is_ipv4() => return Ok(ip),
-            6 if ip.is_ipv6() => return Ok(ip),
-            _ => {}
-        }
-    }
-
-    // If no AF preference or no match, return first result
-    addrs
-        .first()
-        .map(|a| a.ip())
-        .ok_or_else(|| anyhow::anyhow!("Could not resolve target: {}", target))
-}
-
 /// A run of a ping or traceroute line, from its busy check to its report:
 /// report() clears the flag (ping.c:324, traceroute.c:454) when this goes.
 enum LineRun<'a> {
@@ -367,11 +361,19 @@ enum LineRun<'a> {
     Traceroute(TracerouteRun<'a>),
 }
 
-/// A ping or traceroute that looks its target up when it runs, then runs.
-/// When the lookup fails it reports that as the reference does
-/// ([`Measurement::lookup_failed`]: ping.c's PING_ERR_DNS line,
-/// traceroute.c's "name resolution failed" one). A line still busy with
-/// its last run does neither ([`MeasurementSpec::start`]).
+/// A ping, traceroute or NTP measurement that looks its target up when it
+/// runs, then runs. When the lookup fails it reports that as the reference
+/// does ([`Measurement::lookup_failed`]: ping.c's PING_ERR_DNS line,
+/// traceroute.c's and ntp.c's "name resolution failed" ones). A ping or
+/// traceroute line still busy with its last run does neither
+/// ([`MeasurementSpec::start`]).
+///
+/// NTP was resolved with the libc resolver (`to_socket_addrs`) when the
+/// job was built, inside the run's task: a blocking getaddrinfo on one of
+/// the runtime's two workers on enodia (CPUAffinity 5 11), for as long as
+/// glibc waits on the remote resolvers (5 s a try), with every other
+/// measurement's receive times and the uploader behind it. RIPE stores a
+/// 5130 probe's NTP lookups that took 15 s (msm 58749906, "ttr":15002.36).
 struct LookUpThenRun {
     job: MeasurementJob,
     probe_id: ProbeId,
@@ -383,7 +385,12 @@ struct LookUpThenRun {
 #[async_trait]
 impl Measurement for LookUpThenRun {
     fn measurement_type(&self) -> MeasurementType {
-        self.job.spec.measurement_type()
+        // to_measurement makes one only of a job with a target, which a
+        // condmv line has not
+        self.job
+            .spec
+            .measurement_type()
+            .expect("a job with a target measures")
     }
 
     async fn execute(&self) -> anyhow::Result<MeasurementResult> {
@@ -913,11 +920,12 @@ mod tests {
             .is_ok());
     }
 
-    /// Only ping and traceroute look their target up here. DNS and TLS
-    /// resolve on their own, with their own ttr and errors (evtdig's resolver,
-    /// tls/resolve.rs), and NTP through resolve_target.
+    /// Ping, traceroute and NTP look their target up here, NTP for one
+    /// family: IPv6 with -6, IPv4 otherwise (ntp.c:1488-1494). DNS and TLS
+    /// resolve on their own, with their own ttr and errors (evtdig's
+    /// resolver, tls/resolve.rs).
     #[test]
-    fn only_ping_and_traceroute_are_looked_up_first() {
+    fn ping_traceroute_and_ntp_are_looked_up_first() {
         let dns = MeasurementSpec::Dns(DnsJobSpec {
             server: "k.root-servers.net".into(),
             ..Default::default()
@@ -928,20 +936,17 @@ mod tests {
             af: 6,
             hostname: None,
         });
-        let ntp = MeasurementSpec::Ntp(NtpJobSpec {
-            target: "pool.ntp.org".into(),
-            af: 6,
-            packets: 3,
-            timeout_ms: 4000,
-            gap_ms: 0,
-        });
-        for spec in [dns, tls, ntp] {
+        for spec in [dns, tls] {
             assert_eq!(spec.target(), None, "{}", spec.type_name());
         }
         assert_eq!(
             ping("bits.wikimedia.org").target(),
             Some(("bits.wikimedia.org", 6))
         );
+        assert_eq!(ntp("pool.ntp.org", 6).target(), Some(("pool.ntp.org", 6)));
+        for af in [4, 0] {
+            assert_eq!(ntp("pool.ntp.org", af).target(), Some(("pool.ntp.org", 4)));
+        }
     }
 
     #[test]
@@ -967,16 +972,114 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_ipv4() {
-        let ip = resolve_target("8.8.8.8", 4).unwrap();
-        assert!(ip.is_ipv4());
+    /// `evntp [-6] -c 3 -A 58749906 <target>`
+    fn ntp(target: &str, af: u8) -> MeasurementSpec {
+        MeasurementSpec::Ntp(NtpJobSpec {
+            target: target.into(),
+            af,
+            packets: 3,
+            timeout_ms: 1000,
+            gap_ms: 4000,
+        })
     }
 
-    #[test]
-    fn test_resolve_ipv6() {
-        let ip = resolve_target("::1", 6).unwrap();
-        assert!(ip.is_ipv6());
+    /// A resolver that answers nothing: each lookup waits `timeout`.
+    async fn silent_resolver(timeout: Duration) -> Resolver {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        });
+        Resolver::new(
+            ResolvConf {
+                nameservers: vec![addr],
+                timeout,
+                attempts: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+    }
+
+    /// NTP runs whose lookups wait on resolvers that do not answer, and a
+    /// task that wants the runtime every 10 ms meanwhile: the ticks keep
+    /// time, and the runs report evntp's dns_cb line (ntp.c:1353-1366,
+    /// with the error RIPE stores from 5130 probes for msm 58749906).
+    /// Starla resolved NTP targets with a blocking getaddrinfo on the
+    /// worker, which held the runtime for the whole lookup.
+    async fn ntp_lookups_hold_no_worker(runs: usize) {
+        let resolver = silent_resolver(Duration::from_millis(600)).await;
+        let ticker = tokio::spawn(async {
+            let mut worst = Duration::ZERO;
+            for _ in 0..20 {
+                let asked = std::time::Instant::now();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                worst = worst.max(asked.elapsed());
+            }
+            worst
+        });
+        let started = std::time::Instant::now();
+        let lines = futures::future::join_all((0..runs).map(|_| {
+            let run = LookUpThenRun {
+                job: job(ntp("pool.ntp.example", 6)),
+                probe_id: ProbeId(1018212),
+                resolver: Some(resolver.clone()),
+            };
+            async move { run.execute().await.unwrap() }
+        }))
+        .await;
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(ticker.is_finished(), "the ticks waited for the lookups");
+        let worst = ticker.await.unwrap();
+        assert!(worst < Duration::from_millis(300), "a tick took {worst:?}");
+        for result in lines {
+            assert_eq!(result.measurement_type, MeasurementType::Ntp);
+            let MeasurementData::FullLine(body) = result.data else {
+                panic!("{:?}", result.data);
+            };
+            let (head, tail) = body.split_once(r#", "ttr":"#).unwrap();
+            assert!(head.ends_with(r#""dst_name":"pool.ntp.example""#), "{body}");
+            assert!(
+                tail.ends_with(
+                    r#", "proto":"UDP", "af": 6, "result": [ { "error":"name resolution failed: non-recoverable failure in name resolution" } ]"#
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ntp_lookup_holds_no_worker() {
+        ntp_lookups_hold_no_worker(1).await;
+    }
+
+    /// enodia's runtime: two workers (CPUAffinity 5 11), here with two
+    /// lookups in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_ntp_lookups_hold_neither_worker() {
+        ntp_lookups_hold_no_worker(2).await;
+    }
+
+    /// An address atlas_check_addr refuses is reported, not measured
+    /// (ntp.c:1417-1432), a literal's too. Starla measured it.
+    #[tokio::test]
+    async fn a_refused_ntp_address_is_reported_not_measured() {
+        let run = LookUpThenRun {
+            job: job(ntp("192.168.1.1", 4)),
+            probe_id: ProbeId(1018212),
+            resolver: Some(nxdomain_resolver().await),
+        };
+        let result = run.execute().await.unwrap();
+        let MeasurementData::FullLine(body) = result.data else {
+            panic!("{:?}", result.data);
+        };
+        assert!(
+            body.ends_with(
+                r#", "dst_name":"192.168.1.1", "dst_addr":"192.168.1.1", "proto":"UDP", "af": 4, "result": [ { "error":"address not allowed" } ]"#
+            ),
+            "{body}"
+        );
     }
 
     /// `$p` is the registered probe id, not the scheduler's 0: on the twin of

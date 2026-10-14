@@ -11,22 +11,24 @@
 //! A crontab the controller sends is read as SynchronizeFile reads one
 //! (eperd.c:513-645): every line of that file is marked to delete
 //! (:528-529); a line of the new file that the file already had keeps its
-//! cycle, its offset and its test state, and takes only the new end_time
-//! (Insert, :815-827) — unless it had stopped at its old end time and its
-//! time has passed by more than 10 s, when it waits for its first slot
-//! after now (RunJob, :1268-1310); a new line waits for its first slot
-//! after now, with an offset of its own (Start, :838-848, and set_timeout,
-//! :736-777); and DeleteFile (:856-895) removes the lines still marked.
+//! cycle, its offset and its test state, takes only the new end_time, and
+//! has its timer set again for its time (Insert, :815-827) — so a line that
+//! had stopped at its old end time and whose time has passed by more than
+//! 10 s gives eperd's "inconsistent time" record at the push and waits
+//! for its first slot after now (RunJob, :1268-1310); a new line waits for
+//! its first slot after now, with an offset of its own (Start, :838-848,
+//! and set_timeout, :736-777); and DeleteFile (:856-895) removes the lines
+//! still marked.
 //! RIPE's controller sends the whole crontab again on every session (the
 //! hourly REREGISTER, each reconnect). Starla made each re-sent line a new
 //! one, with a new offset, from the first slot after now, so a line that
 //! had run early in its cycle (a negative offset) and was re-sent before
 //! that cycle's slot ran in it again: two results for one slot.
 
-use crate::task::ScheduledTask;
+use crate::task::{Fired, Now, ScheduledTask};
 use crate::MeasurementJob;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{debug, info};
 
 /// A crontab file's recurring measurement lines, as the controller last
 /// sent the file.
@@ -42,6 +44,11 @@ pub struct Crontab {
     /// Its lines, in the order the file has them
     pub lines: Vec<CrontabLine>,
 }
+
+/// eperd's crontab: `eperd -c $CRON_DIR/7 -A 9807 … -O $ATLAS_DATA/new/7`
+/// (bin/ripe-atlas.in:130-133), its directory rebased as telnetd rebases a
+/// CRONTAB line's onto the spool directory (configure.ac:145).
+const EPERD_CRONTAB: &str = "/var/spool/ripe-atlas/crons/7";
 
 /// One line of a crontab, scheduled.
 #[derive(Debug, Clone)]
@@ -85,6 +92,31 @@ pub(crate) struct Synchronized {
     pub dropped: usize,
 }
 
+/// What the lines' timers did at a tick.
+#[derive(Debug, Default)]
+pub(crate) struct Due {
+    /// The jobs to run
+    pub jobs: Vec<MeasurementJob>,
+    /// The records of the lines found more than 10 s from their time, in
+    /// the order their timers were set to fire
+    pub inconsistent: Vec<InconsistentRecord>,
+}
+
+/// RunJob's "inconsistent time" record of a crontab line (eperd.c:1268-1303)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InconsistentRecord {
+    /// The body of its RESULT line (InconsistentTime::record_body)
+    pub body: String,
+}
+
+/// The passes of eperd's loop [`Lines::take_due`] makes at most in one
+/// second. A pass fires a line again only when its last drew a time at or
+/// before now, which needs an offset back past the next slot; a few passes
+/// at most, unless the spread is many times the interval. The bound only
+/// keeps such a line from holding up the tick: what is left is the next
+/// tick's.
+const TIMER_PASSES: usize = 64;
+
 /// The recurring lines, every crontab's and Starla's own.
 #[derive(Default)]
 pub(crate) struct Lines {
@@ -94,14 +126,14 @@ pub(crate) struct Lines {
 impl Lines {
     /// A job scheduled on its own replaces the one with its msm id, and
     /// starts afresh: the first slot after `now`.
-    pub(crate) fn schedule(&mut self, job: MeasurementJob, now: i64) {
+    pub(crate) fn schedule(&mut self, job: MeasurementJob, now: Now) {
         self.lines.insert(LineKey::Own(job.msm_id), start(job, now));
     }
 
     /// The file's lines are now the crontab's, as SynchronizeFile then
     /// DeleteFile leave them (eperd.c:513-645, 856-895). The other files'
     /// lines are untouched.
-    pub(crate) fn synchronize(&mut self, crontab: Crontab, now: i64) -> Synchronized {
+    pub(crate) fn synchronize(&mut self, crontab: Crontab, now: Now) -> Synchronized {
         let Crontab { file, lines } = crontab;
         // Every line of the file needs delete (eperd.c:528-529)
         let (mut old, others): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.lines)
@@ -111,6 +143,13 @@ impl Lines {
 
         let mut synchronized = Synchronized::default();
         for CrontabLine { command, job } in lines {
+            // condmv is a line of eperd's crontab, crons/7, which eperd
+            // arms like any other (MeasurementSpec::Condmv). In crons/main
+            // it is perd's, which runs a late line without a record
+            // (perd.c:1226-1248); crons/2 no daemon reads.
+            if !job.spec.measures() && file != EPERD_CRONTAB {
+                continue;
+            }
             let key = LineKey::Crontab {
                 file: file.clone(),
                 interval: job.interval,
@@ -159,22 +198,85 @@ impl Lines {
         before - self.lines.len()
     }
 
-    /// The jobs due at `now`, each line once, its next cycle drawn (RunJob,
-    /// eperd.c:1245-1339). A crontab's line past its end time stays, never
-    /// due again, until a push leaves it out: eperd removes lines only in
-    /// DeleteFile (856-895), never on expiry. Dropped here instead, a line
-    /// the controller then sends again with a later end time would come
-    /// back as a new line, on a fresh first slot that can be the cycle it
-    /// has just run. A job of Starla's own goes once it has run past its end.
-    pub(crate) fn take_due(&mut self, now: i64) -> Vec<MeasurementJob> {
-        let mut due = Vec::new();
+    /// The lines whose timers fire at `now`, each as RunJob takes it
+    /// (eperd.c:1245-1339, ScheduledTask::fire): the jobs to run, each line
+    /// once, its next cycle drawn; and the records of the lines found more
+    /// than 10 s off their time, which do not run and wait for their first
+    /// slot after now. A host back from a suspend gives one record for each
+    /// line whose time passed meanwhile, and no burst of runs; a wall clock
+    /// stepped back by more than 10 s, one for each line as its monotonic
+    /// wait runs out, and runs on the clock as it now is.
+    ///
+    /// A crontab's line past its end time stays, never due again, until a
+    /// push leaves it out: eperd removes lines only in DeleteFile (856-895),
+    /// never on expiry. Dropped here instead, a line the controller then
+    /// sends again with a later end time would come back as a new line, on
+    /// a fresh first slot that can be the cycle it has just run.
+    ///
+    /// A job of Starla's own goes once its timer has fired past its end.
+    /// It keeps RunJob's rule — its slots are eperd's, and a run more than
+    /// 10 s off its time would be off its slot — but gives no record: eperd's record
+    /// is of a line of its crontab, by the line's command (cl_Shell), and a
+    /// job of Starla's own (a JSON command, never one of RIPE's) has none.
+    pub(crate) fn take_due(&mut self, now: Now) -> Due {
+        // libevent runs each timer that has run out, and then, in its loop's
+        // next pass, microseconds on, a timer set meanwhile for a time
+        // already past: set_timeout's wait of 0 (eperd.c:764-765) — a run's
+        // next cycle, or a cycle drawn afresh, whose offset put it at or
+        // before now. RunJob reads the same second for it. Taken at the next
+        // tick, a second on, it would run or give its record by a clock a
+        // second later than eperd's.
+        let mut due = Due::default();
+        for _ in 0..TIMER_PASSES {
+            if self.fire_due(now, &mut due) == 0 {
+                break;
+            }
+        }
+        due
+    }
+
+    /// One pass of eperd's loop over the lines' timers: each line whose
+    /// timer fires at `now`, once, its job or its record added to `due`.
+    /// How many fired.
+    fn fire_due(&mut self, now: Now, due: &mut Due) -> usize {
+        let mut fired = 0;
+        let mut inconsistent = Vec::new();
         self.lines.retain(|key, task| {
-            if !task.is_due(now) {
+            let fire = task.fire(now);
+            if fire == Fired::NotYet {
                 return true;
             }
-            due.push(task.job.clone());
-            task.schedule_next(now);
-            if matches!(key, LineKey::Own(_)) && task.is_expired(now) {
+            fired += 1;
+            match fire {
+                Fired::NotYet => {}
+                // condmv's run is the uploader's (MeasurementSpec::Condmv)
+                Fired::Run if !task.job.spec.measures() => {}
+                Fired::Run => due.jobs.push(task.job.clone()),
+                Fired::Expired => {}
+                Fired::Inconsistent(times) => match key {
+                    LineKey::Crontab { command, .. } => {
+                        debug!(
+                            msm_id = task.job.msm_id,
+                            now = now.wall,
+                            nexttime = times.nexttime,
+                            "Inconsistent time: not run, next cycle drawn"
+                        );
+                        inconsistent.push((
+                            times.nexttime,
+                            InconsistentRecord {
+                                body: times.record_body(command),
+                            },
+                        ));
+                    }
+                    LineKey::Own(msm_id) => info!(
+                        msm_id,
+                        now = now.wall,
+                        nexttime = times.nexttime,
+                        "Measurement more than 10 s off its time: not run, next cycle drawn"
+                    ),
+                },
+            }
+            if matches!(key, LineKey::Own(_)) && task.is_expired(now.wall) {
                 info!(
                     msm_id = task.job.msm_id,
                     "Measurement expired, removing from schedule"
@@ -183,17 +285,22 @@ impl Lines {
             }
             true
         });
-        due
+        // libevent fires timers in the order of their time
+        inconsistent.sort_by_key(|(nexttime, _)| *nexttime);
+        due.inconsistent
+            .extend(inconsistent.into_iter().map(|(_, record)| record));
+        fired
     }
 
     pub(crate) fn len(&self) -> usize {
         self.lines.len()
     }
 
-    /// The lines by measurement type ("ping", "dns", ...).
+    /// The lines by measurement type ("ping", "dns", ...): crons/7's
+    /// condmv line, which measures nothing, is not one.
     pub(crate) fn counts(&self) -> HashMap<String, u64> {
         let mut counts: HashMap<String, u64> = HashMap::new();
-        for task in self.lines.values() {
+        for task in self.lines.values().filter(|task| task.job.spec.measures()) {
             *counts
                 .entry(task.job.spec.type_name().to_string())
                 .or_insert(0) += 1;
@@ -224,7 +331,7 @@ impl Lines {
 }
 
 /// A line just loaded: its first slot after `now`, never `now` itself.
-fn start(job: MeasurementJob, now: i64) -> ScheduledTask {
+fn start(job: MeasurementJob, now: Now) -> ScheduledTask {
     ScheduledTask::new_at(
         now,
         job.msm_id,
@@ -240,9 +347,31 @@ fn start(job: MeasurementJob, now: i64) -> ScheduledTask {
 mod tests {
     use super::*;
     use crate::job::{DnsJobSpec, MeasurementSpec, PingJobSpec};
+    use crate::task::{at, Now};
 
     const CRONS_2: &str = "/var/spool/ripe-atlas/crons/2";
     const CRONS_7: &str = "/var/spool/ripe-atlas/crons/7";
+    const CRONS_MAIN: &str = "/var/spool/ripe-atlas/crons/main";
+
+    /// crons/7's condmv line, as ctr-dub-sw02 sent it in the twin's scenario
+    /// enodia-2026-10-13T0131: `CRONLINE 60 1 2000000000 UNIFORM 14 condmv
+    /// -A "RESULT 9907 ongoing" /home/atlas/data/new/7
+    /// /home/atlas/data/out/7`.
+    fn condmv_line() -> CrontabLine {
+        CrontabLine {
+            command:
+                r#"condmv -A "RESULT 9907 ongoing" /home/atlas/data/new/7 /home/atlas/data/out/7"#
+                    .into(),
+            job: MeasurementJob {
+                msm_id: 0,
+                interval: 60,
+                start_time: 1,
+                end_time: 2_000_000_000,
+                spread: 14,
+                spec: MeasurementSpec::Condmv,
+            },
+        }
+    }
 
     fn crontab(file: &str, lines: &[CrontabLine]) -> Crontab {
         Crontab {
@@ -354,9 +483,57 @@ mod tests {
 
     /// Every run from `from` to `to`, a scheduler tick each second.
     fn runs(lines: &mut Lines, from: i64, to: i64) -> Vec<(i64, MeasurementJob)> {
-        (from..=to)
-            .flat_map(|now| lines.take_due(now).into_iter().map(move |job| (now, job)))
-            .collect()
+        ticks(lines, from, to).0
+    }
+
+    /// Every run and every record from `from` to `to`, a tick each second.
+    fn ticks(
+        lines: &mut Lines,
+        from: i64,
+        to: i64,
+    ) -> (Vec<(i64, MeasurementJob)>, Vec<InconsistentRecord>) {
+        ticks_from(lines, at(from), to)
+    }
+
+    /// Every run and every record from `from` until the wall clock reads
+    /// `to`, a tick each second of both clocks.
+    fn ticks_from(
+        lines: &mut Lines,
+        from: Now,
+        to: i64,
+    ) -> (Vec<(i64, MeasurementJob)>, Vec<InconsistentRecord>) {
+        let mut ran = Vec::new();
+        let mut records = Vec::new();
+        for now in from.wall..=to {
+            let due = lines.take_due(Now {
+                wall: now,
+                mono: from.mono + std::time::Duration::from_secs((now - from.wall) as u64),
+            });
+            ran.extend(due.jobs.into_iter().map(|job| (now, job)));
+            records.extend(due.inconsistent);
+        }
+        (ran, records)
+    }
+
+    /// RunJob's record of `line` (eperd.c:1268-1303).
+    fn record(
+        now: i64,
+        nexttime: i64,
+        waittime: i64,
+        cycle: i64,
+        generated: i64,
+        line: &CrontabLine,
+    ) -> InconsistentRecord {
+        InconsistentRecord {
+            body: crate::task::InconsistentTime {
+                now,
+                nexttime,
+                waittime,
+                cycle,
+                generated,
+            }
+            .record_body(&line.command),
+        }
     }
 
     #[test]
@@ -369,7 +546,7 @@ mod tests {
         // windows are ahead, and each line runs once, in its window — at
         // its slot, moved by UNIFORM 3's -1..=2 s (do_distr, eperd.c:489-511)
         let mut lines = Lines::default();
-        let synced = lines.synchronize(crontab(CRONS_7, &push), first - 120);
+        let synced = lines.synchronize(crontab(CRONS_7, &push), at(first - 120));
         assert_eq!(synced.added, 26);
         assert_eq!(lines.len(), 26, "keyed by msm id, Starla kept 1");
         assert_eq!(lines.counts(), HashMap::from([("dns".to_string(), 26)]));
@@ -391,7 +568,7 @@ mod tests {
         // 24 others each run once.
         let mut lines = Lines::default();
         let pushed = 1_791_855_121;
-        lines.synchronize(crontab(CRONS_7, &push), pushed);
+        lines.synchronize(crontab(CRONS_7, &push), at(pushed));
         let ran = runs(&mut lines, pushed, last + 3_600);
         let queries: Vec<String> = ran.iter().map(|(_, job)| query(job)).collect();
         let wanted: Vec<String> = push[2..].iter().map(|line| query(&line.job)).collect();
@@ -405,13 +582,16 @@ mod tests {
         let line = ping_line(1001, 900, 312, 2_000_000_000, 20, "193.0.14.129");
         let slot = 1_791_836_412;
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), slot - 400);
+        lines.synchronize(
+            crontab(CRONS_7, std::slice::from_ref(&line)),
+            at(slot - 400),
+        );
         let task = lines.line_mut(CRONS_7, &line).unwrap();
         assert!((slot - 10..=slot + 10).contains(&task.next_run));
         // This cycle's offset came out -8: the line runs 8 s before its slot
-        task.next_run = slot - 8;
+        task.set_next_run(slot - 8, at(slot - 400));
         assert!(runs(&mut lines, slot - 400, slot - 9).is_empty());
-        assert_eq!(lines.take_due(slot - 8).len(), 1);
+        assert_eq!(lines.take_due(at(slot - 8)).jobs.len(), 1);
         let task = lines.line(CRONS_7, &line).unwrap();
         let after_the_run = (task.cycle, task.next_run);
         assert!((slot + 890..=slot + 910).contains(&task.next_run));
@@ -422,7 +602,7 @@ mod tests {
         // cycle's: it would have run again.
         assert_eq!(
             ScheduledTask::new_at(
-                slot - 3,
+                at(slot - 3),
                 1001,
                 900,
                 312,
@@ -435,7 +615,7 @@ mod tests {
         );
         let mut resent = line.clone();
         resent.job.end_time = 2_100_000_000;
-        let synced = lines.synchronize(crontab(CRONS_7, &[resent]), slot - 3);
+        let synced = lines.synchronize(crontab(CRONS_7, &[resent]), at(slot - 3));
         assert_eq!(
             synced,
             Synchronized {
@@ -450,7 +630,7 @@ mod tests {
         assert_eq!(task.job.end_time, 2_100_000_000);
         // Nothing more in this cycle; the next runs on the slot it had
         assert!(runs(&mut lines, slot - 3, after_the_run.1 - 1).is_empty());
-        assert_eq!(lines.take_due(after_the_run.1).len(), 1);
+        assert_eq!(lines.take_due(at(after_the_run.1)).jobs.len(), 1);
 
         // The same job is kept, and with it what its runs share: the
         // re-sent line's own (a PingKept of its own here) is dropped.
@@ -462,7 +642,7 @@ mod tests {
         };
         let before = kept(&lines);
         let resent = ping_line(1001, 900, 312, 2_000_000_000, 20, "193.0.14.129");
-        lines.synchronize(crontab(CRONS_7, &[resent]), slot + 1_000);
+        lines.synchronize(crontab(CRONS_7, &[resent]), at(slot + 1_000));
         assert!(std::sync::Arc::ptr_eq(&before, &kept(&lines)));
 
         // An end time moved before the next slot is taken: no more runs
@@ -470,7 +650,7 @@ mod tests {
         let next = task.next_run;
         let mut ending = line.clone();
         ending.job.end_time = next - 1;
-        lines.synchronize(crontab(CRONS_7, &[ending]), slot + 1_000);
+        lines.synchronize(crontab(CRONS_7, &[ending]), at(slot + 1_000));
         assert!(runs(&mut lines, slot + 1_000, next + 3_600).is_empty());
     }
 
@@ -481,7 +661,7 @@ mod tests {
         // end time. It stays a line of its file, as it stays in eperd's
         // LineBase.
         let slot = 1_791_836_412;
-        let at = |ran: Vec<(i64, MeasurementJob)>| ran.into_iter().map(|(at, _)| at).collect();
+        let times = |ran: Vec<(i64, MeasurementJob)>| ran.into_iter().map(|(at, _)| at).collect();
         let kept = |lines: &Lines, line: &CrontabLine| {
             let MeasurementSpec::Ping(spec) = &lines.line(CRONS_7, line).unwrap().job.spec else {
                 unreachable!()
@@ -490,8 +670,11 @@ mod tests {
         };
         let line = ping_line(1001, 900, 312, slot + 100, 20, "193.0.14.129");
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), slot - 400);
-        let ran: Vec<i64> = at(runs(&mut lines, slot - 400, slot + 900 * 40));
+        lines.synchronize(
+            crontab(CRONS_7, std::slice::from_ref(&line)),
+            at(slot - 400),
+        );
+        let ran: Vec<i64> = times(runs(&mut lines, slot - 400, slot + 900 * 40));
         assert_eq!(ran.len(), 1);
         assert!((slot - 10..=slot + 10).contains(&ran[0]), "{ran:?}");
         assert_eq!(lines.len(), 1);
@@ -503,16 +686,25 @@ mod tests {
         // the line, its end time 8 h on. Kept with the next run it had, the
         // line ran at once, between slots, and again at the next: two
         // results in one interval. eperd's re-armed timer fires at once
-        // and RunJob, finding the time inconsistent, runs nothing and draws
-        // the first cycle after now (eperd.c:1268-1310).
+        // and RunJob, finding the time inconsistent, writes its record, runs
+        // nothing and draws the first cycle after now (eperd.c:1268-1310).
         let back = slot + 36_000 + 450;
         let next = slot + 36_900;
         let mut extended = line.clone();
         extended.job.end_time = back + 28_800;
-        let synced = lines.synchronize(crontab(CRONS_7, &[extended]), back);
+        let synced = lines.synchronize(crontab(CRONS_7, &[extended]), at(back));
         assert_eq!(synced.kept, 1);
         let task = lines.line(CRONS_7, &line).unwrap();
         assert_eq!(task.end_time, back + 28_800);
+        let stopped = (task.next_run, task.cycle);
+        let due = lines.take_due(at(back));
+        assert!(due.jobs.is_empty());
+        assert_eq!(
+            due.inconsistent,
+            // the timer set at the push, for a time long past: no wait
+            vec![record(back, stopped.0, 0, stopped.1, back, &line)]
+        );
+        let task = lines.line(CRONS_7, &line).unwrap();
         assert!(
             (next - 10..=next + 10).contains(&task.next_run),
             "{} is not the slot after {back}",
@@ -520,40 +712,55 @@ mod tests {
         );
         let next_run = task.next_run;
         // (the cycle after starts at next + 890 at the earliest)
-        assert_eq!(at(runs(&mut lines, back, next + 889)), vec![next_run]);
+        assert_eq!(times(runs(&mut lines, back, next + 889)), vec![next_run]);
         // still the line it was, with its job
         assert!(std::sync::Arc::ptr_eq(&before, &kept(&lines, &line)));
 
         // Within 10 s of the time it stopped at, the line runs at once, as
         // RunJob runs a line within 10 s of its time (eperd.c:1268); from
-        // 11 s on, it waits for its next slot.
-        for (late, wanted) in [
-            (10, vec![slot + 910, slot + 1_800]),
-            (11, vec![slot + 1_800]),
-        ] {
+        // 11 s on, it gives its record and waits for its next slot.
+        for (late, runs_at_once) in [(10, true), (11, false)] {
             let line = ping_line(1001, 900, 312, slot + 100, 0, "193.0.14.129");
             let mut lines = Lines::default();
-            lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), slot - 400);
+            lines.synchronize(
+                crontab(CRONS_7, std::slice::from_ref(&line)),
+                at(slot - 400),
+            );
             assert_eq!(
-                at(runs(&mut lines, slot - 400, slot + 900 + late)),
+                times(runs(&mut lines, slot - 400, slot + 900 + late - 1)),
                 vec![slot]
             );
             let mut extended = line.clone();
             extended.job.end_time = 2_000_000_000;
-            lines.synchronize(crontab(CRONS_7, &[extended]), slot + 900 + late);
-            let ran = at(runs(&mut lines, slot + 900 + late, slot + 1_800));
-            assert_eq!(ran, wanted, "re-sent {late} s after its time");
+            lines.synchronize(crontab(CRONS_7, &[extended]), at(slot + 900 + late));
+            let due = lines.take_due(at(slot + 900 + late));
+            assert_eq!(
+                (due.jobs.len(), due.inconsistent.len()),
+                (usize::from(runs_at_once), usize::from(!runs_at_once)),
+                "re-sent {late} s after its time"
+            );
+            let ran = times(runs(&mut lines, slot + 900 + late + 1, slot + 1_800));
+            assert_eq!(ran, vec![slot + 1_800], "re-sent {late} s after its time");
         }
 
-        // A line that had not stopped keeps its time however late the tick
-        // that takes it: the scheduler loop runs a one-off in line, and a
-        // tick held up behind it runs a line late, as it did before
+        // A line that had not stopped, re-sent, keeps its time; a tick that
+        // takes it more than 10 s after it finds the time inconsistent, as
+        // RunJob does. (0025 ran it: the scheduler loop ran a one-off in
+        // line then, and a tick held up behind it was Starla's own doing.)
         let line = ping_line(1001, 900, 312, 2_000_000_000, 0, "193.0.14.129");
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), slot - 400);
-        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), slot + 30);
+        lines.synchronize(
+            crontab(CRONS_7, std::slice::from_ref(&line)),
+            at(slot - 400),
+        );
+        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), at(slot + 30));
         assert_eq!(lines.line(CRONS_7, &line).unwrap().next_run, slot);
-        assert_eq!(lines.take_due(slot + 30).len(), 1);
+        let due = lines.take_due(at(slot + 30));
+        assert!(due.jobs.is_empty());
+        assert_eq!(
+            due.inconsistent,
+            vec![record(slot + 30, slot, 0, 1_990_929, slot + 30, &line)]
+        );
     }
 
     /// A line that ran late in its last cycle, past its end time, stays;
@@ -566,11 +773,17 @@ mod tests {
         let mut ending = line.clone();
         ending.job.end_time = slot - 7;
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&ending)), slot - 400);
+        lines.synchronize(
+            crontab(CRONS_7, std::slice::from_ref(&ending)),
+            at(slot - 400),
+        );
         // This cycle's offset came out -8, inside the end time, and the
         // tick that runs it comes late, after the end time has passed
-        lines.line_mut(CRONS_7, &line).unwrap().next_run = slot - 8;
-        assert_eq!(lines.take_due(slot - 6).len(), 1);
+        lines
+            .line_mut(CRONS_7, &line)
+            .unwrap()
+            .set_next_run(slot - 8, at(slot - 400));
+        assert_eq!(lines.take_due(at(slot - 6)).jobs.len(), 1);
         assert!(runs(&mut lines, slot - 5, slot + 2_000).is_empty());
         let task = lines.line(CRONS_7, &line).expect("kept past its end time");
         let after_the_run = (task.cycle, task.next_run);
@@ -579,15 +792,15 @@ mod tests {
         // with a later end time
         let mut extended = line.clone();
         extended.job.end_time = 2_000_000_000;
-        let synced = lines.synchronize(crontab(CRONS_7, &[extended]), slot - 3);
+        let synced = lines.synchronize(crontab(CRONS_7, &[extended]), at(slot - 3));
         assert_eq!(synced.kept, 1);
         let task = lines.line(CRONS_7, &line).unwrap();
         assert_eq!((task.cycle, task.next_run), after_the_run);
         assert!(runs(&mut lines, slot - 3, after_the_run.1 - 1).is_empty());
-        assert_eq!(lines.take_due(after_the_run.1).len(), 1);
+        assert_eq!(lines.take_due(at(after_the_run.1)).jobs.len(), 1);
 
         // A push without it is what removes it
-        lines.synchronize(crontab(CRONS_7, &[]), slot + 1_000);
+        lines.synchronize(crontab(CRONS_7, &[]), at(slot + 1_000));
         assert!(lines.line(CRONS_7, &line).is_none());
     }
 
@@ -606,8 +819,9 @@ mod tests {
             changed(&|l| l.command = l.command.replace("-c 3", "-c 4")),
         ] {
             let mut lines = Lines::default();
-            lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), now);
-            let synced = lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&other)), now + 1);
+            lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), at(now));
+            let synced =
+                lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&other)), at(now + 1));
             assert_eq!(
                 synced,
                 Synchronized {
@@ -627,13 +841,13 @@ mod tests {
         // changes only those is the same line, which keeps its spread and
         // offset and takes the end time (Insert, eperd.c:820)
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), now);
+        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), at(now));
         let before = lines.line(CRONS_7, &line).unwrap().next_run;
         let other = changed(&|l| {
             l.job.end_time = 2_000_000_100;
             l.job.spread = 200;
         });
-        let synced = lines.synchronize(crontab(CRONS_7, &[other]), now + 1);
+        let synced = lines.synchronize(crontab(CRONS_7, &[other]), at(now + 1));
         assert_eq!(synced.kept, 1);
         let task = lines.line(CRONS_7, &line).unwrap();
         assert_eq!((task.next_run, task.spread), (before, 20));
@@ -642,7 +856,7 @@ mod tests {
         // A line twice in one crontab is one line, with the later end time
         let mut lines = Lines::default();
         let twice = [line.clone(), changed(&|l| l.job.end_time = 2_000_000_200)];
-        let synced = lines.synchronize(crontab(CRONS_7, &twice), now);
+        let synced = lines.synchronize(crontab(CRONS_7, &twice), at(now));
         assert_eq!((synced.added, lines.len()), (1, 1));
         assert_eq!(lines.line(CRONS_7, &line).unwrap().end_time, 2_000_000_200);
     }
@@ -654,16 +868,16 @@ mod tests {
         let b = ping_line(1002, 240, 17, 2_000_000_000, 3, "2001:7fd::1");
         let c = ping_line(1003, 240, 18, 2_000_000_000, 3, "192.0.2.1");
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_2, std::slice::from_ref(&c)), now);
-        lines.synchronize(crontab(CRONS_7, &[a.clone(), b.clone()]), now);
-        lines.schedule(ping_line(7, 60, 0, 0, 0, "192.0.2.7").job, now);
+        lines.synchronize(crontab(CRONS_2, std::slice::from_ref(&c)), at(now));
+        lines.synchronize(crontab(CRONS_7, &[a.clone(), b.clone()]), at(now));
+        lines.schedule(ping_line(7, 60, 0, 0, 0, "192.0.2.7").job, at(now));
         assert_eq!(lines.len(), 4);
 
         // crons/7 again without b: b stops, a keeps its slot, crons/2's line
         // and Starla's own job are untouched
         let a_next = lines.line(CRONS_7, &a).unwrap().next_run;
         let c_next = lines.line(CRONS_2, &c).unwrap().next_run;
-        let synced = lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&a)), now + 10);
+        let synced = lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&a)), at(now + 10));
         assert_eq!(
             synced,
             Synchronized {
@@ -684,13 +898,13 @@ mod tests {
         assert!(ran.contains(&1001) && ran.contains(&1003) && ran.contains(&7));
 
         // The same line in another file is another line
-        lines.synchronize(crontab(CRONS_2, &[c.clone(), a.clone()]), now + 1_000);
+        lines.synchronize(crontab(CRONS_2, &[c.clone(), a.clone()]), at(now + 1_000));
         assert!(lines.line(CRONS_2, &a).is_some());
         assert!(lines.line(CRONS_7, &a).is_some());
         assert_eq!(lines.len(), 4);
 
         // An empty crontab empties its file
-        let synced = lines.synchronize(crontab(CRONS_2, &[]), now + 1_001);
+        let synced = lines.synchronize(crontab(CRONS_2, &[]), at(now + 1_001));
         assert_eq!(synced.dropped, 2);
         assert_eq!(lines.len(), 2);
     }
@@ -702,9 +916,9 @@ mod tests {
         let other = ping_line(1001, 900, 312, 2_000_000_000, 20, "193.0.14.129");
         push.push(other.clone());
         let mut lines = Lines::default();
-        lines.synchronize(crontab(CRONS_7, &push), now);
-        lines.synchronize(crontab(CRONS_2, &msm_30002()[..3]), now);
-        lines.schedule(ping_line(30002, 60, 0, 0, 0, "192.0.2.7").job, now);
+        lines.synchronize(crontab(CRONS_7, &push), at(now));
+        lines.synchronize(crontab(CRONS_2, &msm_30002()[..3]), at(now));
+        lines.schedule(ping_line(30002, 60, 0, 0, 0, "192.0.2.7").job, at(now));
         assert_eq!(lines.len(), 31);
         assert_eq!(lines.stop(30002), 30);
         assert_eq!(lines.len(), 1);
@@ -716,11 +930,378 @@ mod tests {
     fn a_job_of_its_own_replaces_the_one_with_its_id() {
         let now = 1_791_836_000;
         let mut lines = Lines::default();
-        lines.schedule(ping_line(7, 60, 0, 0, 0, "192.0.2.7").job, now);
-        lines.schedule(ping_line(7, 120, 0, 0, 0, "192.0.2.7").job, now);
+        lines.schedule(ping_line(7, 60, 0, 0, 0, "192.0.2.7").job, at(now));
+        lines.schedule(ping_line(7, 120, 0, 0, 0, "192.0.2.7").job, at(now));
         assert_eq!(lines.len(), 1);
         // and no crontab touches it
-        lines.synchronize(crontab(CRONS_7, &[]), now);
+        lines.synchronize(crontab(CRONS_7, &[]), at(now));
         assert_eq!(lines.len(), 1);
+    }
+
+    /// RunJob runs a line whose timer fires within 10 s of its time; from
+    /// 11 s on it runs nothing, appends its "inconsistent time" record and
+    /// draws the first cycle after now (eperd.c:1268-1310). Starla ran any
+    /// due line, however late.
+    #[test]
+    fn a_line_more_than_10_s_late_gives_eperds_record_and_waits_for_the_next_cycle() {
+        // `CRONLINE 900 312 2000000000 UNIFORM 0 evping …`, loaded 400 s
+        // before its slot, of cycle 1990929
+        let slot = 1_791_836_412;
+        let line = ping_line(1001, 900, 312, 2_000_000_000, 0, "193.0.14.129");
+        let loaded = || {
+            let mut lines = Lines::default();
+            lines.synchronize(
+                crontab(CRONS_7, std::slice::from_ref(&line)),
+                at(slot - 400),
+            );
+            lines
+        };
+        for late in [0, 1, 9, 10] {
+            let mut lines = loaded();
+            let due = lines.take_due(at(slot + late));
+            assert_eq!(due.jobs.len(), 1, "{late} s late");
+            assert!(due.inconsistent.is_empty(), "{late} s late");
+        }
+
+        let mut lines = loaded();
+        let due = lines.take_due(at(slot + 11));
+        assert!(due.jobs.is_empty());
+        assert_eq!(
+            due.inconsistent,
+            vec![InconsistentRecord {
+                body: "\"id\":\"9807\", \"fw\":5130, \"mver\": \"2.6.4\", \"time\":1791836423, \
+                       \"reason\": \"inconsistent time; now 1791836423; nexttime 1791836412; \
+                       waittime 399; cycle 1990929; generated 1791836012\", \"cmd\": \"evping -4 \
+                       -c 3 -A \\\"1001\\\" -O /home/atlas/data/new/7 193.0.14.129\""
+                    .into(),
+            }]
+        );
+        // It runs at the next slot, once a cycle, and gives no more records
+        let (ran, records) = ticks(&mut lines, slot + 12, slot + 2_699);
+        let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(ran, vec![slot + 900, slot + 1_800]);
+        assert!(records.is_empty(), "{records:?}");
+
+        // However late, one record: the cycle drawn is the first after now
+        for late in [12, 60, 899, 900, 3_600 * 5 + 7] {
+            let mut lines = loaded();
+            let (ran, records) = ticks(&mut lines, slot + late, slot + late + 1_800);
+            assert_eq!(records.len(), 1, "{late} s late");
+            let next = slot + (late / 900 + 1) * 900;
+            let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+            assert_eq!(ran, vec![next, next + 900], "{late} s late");
+        }
+    }
+
+    /// The workstation slept under the twin (wire comparison 2026-10-13,
+    /// W12): on waking, the reference found every timer more than 10 s
+    /// late and wrote one record for each, 191, running none, while Starla
+    /// ran every overdue line at once. A host suspended for 3 h here: one
+    /// record for each line whose timer was set for a time in the suspend —
+    /// the timer of a line past its end time too, which RunJob checks for
+    /// time before expiry — no run at the wake, and each line on from its
+    /// first slot after it, once a cycle.
+    #[test]
+    fn a_suspended_host_gives_one_record_a_line_and_no_burst_of_runs() {
+        let t0 = 1_791_836_000;
+        let periodic = [
+            ping_line(1001, 60, 1, 2_000_000_000, 14, "192.0.2.1"),
+            ping_line(1002, 240, 17, 2_000_000_000, 2, "192.0.2.2"),
+            ping_line(1003, 900, 312, 2_000_000_000, 20, "192.0.2.3"),
+            ping_line(1004, 3_600, 3_000, 2_000_000_000, 60, "192.0.2.4"),
+        ];
+        // a 30 s window a minute on, as msm 30002's: it runs, and its
+        // timer is then set for the next slot, past its end time
+        let window = ping_line(30002, 600, t0 + 60, t0 + 90, 0, "192.0.2.5");
+        // a daily line whose first slot comes after the wake. The wake is
+        // more than half a spread before each periodic line's next slot, so
+        // none's cycle drawn at the wake has a time at or before it (which
+        // libevent would run at once, as a_timer_set_for_a_time_past_fires_
+        // again_at_the_same_now): 1001's next slot is 31 s after it.
+        let wake = t0 + 130 + 3 * 3_600;
+        let daily = ping_line(1005, 86_400, wake + 599, 2_000_000_000, 0, "192.0.2.6");
+        let mut all = periodic.to_vec();
+        all.extend([window.clone(), daily.clone()]);
+        let mut lines = Lines::default();
+        lines.synchronize(crontab(CRONS_7, &all), at(t0));
+        let (ran, records) = ticks(&mut lines, t0, t0 + 100);
+        assert!(records.is_empty());
+        assert!(ran.iter().any(|(_, job)| job.msm_id == 30002));
+
+        // Asleep until `wake`: no tick
+        let due = lines.take_due(at(wake));
+        assert!(due.jobs.is_empty(), "a burst: {:?}", due.jobs);
+        // one record for each line but the daily one, in the order their
+        // timers were set to fire
+        let ids: Vec<&str> = due
+            .inconsistent
+            .iter()
+            .map(|r| {
+                let at = r.body.find("-A \\\"").unwrap() + 5;
+                &r.body[at..at + r.body[at..].find('\\').unwrap()]
+            })
+            .collect();
+        assert_eq!(ids, ["1001", "1002", "1003", "30002", "1004"]);
+        for record in &due.inconsistent {
+            assert!(
+                record
+                    .body
+                    .contains(&format!("inconsistent time; now {wake}; nexttime ")),
+                "{}",
+                record.body
+            );
+        }
+
+        // On from the wake: each line once a cycle, from its first slot
+        // after it; the window's line no more; no record
+        let (ran, records) = ticks(&mut lines, wake + 1, wake + 3_600);
+        assert!(records.is_empty(), "{records:?}");
+        for line in periodic.iter().chain([&daily]) {
+            let times: Vec<i64> = ran
+                .iter()
+                .filter(|(_, job)| job.msm_id == line.job.msm_id)
+                .map(|(at, _)| *at)
+                .collect();
+            let interval = line.job.interval as i64;
+            let half = (line.job.spread / 2) as i64;
+            let first_slot = if wake < line.job.start_time {
+                line.job.start_time
+            } else {
+                line.job.start_time + ((wake - line.job.start_time) / interval + 1) * interval
+            };
+            assert!(
+                (first_slot - half..=first_slot + half + 1).contains(&times[0]),
+                "{}: first run {} after the wake, its slot {first_slot}",
+                line.job.msm_id,
+                times[0]
+            );
+            for pair in times.windows(2) {
+                assert!(
+                    pair[1] - pair[0] >= interval - 2 * half - 1,
+                    "{}: {times:?}",
+                    line.job.msm_id
+                );
+            }
+        }
+        assert!(!ran.iter().any(|(_, job)| job.msm_id == 30002));
+    }
+
+    /// crons/7's condmv line is one of eperd's timed lines — condmv is an
+    /// eperd built-in (eperd.c:932), so Start arms its line (:838-848) — and
+    /// after a suspend RunJob writes its record with the other lines', in
+    /// the order of their times: the record the twin's reference wrote
+    /// (task.rs, a_timer_more_than_10_s_late_runs_nothing_and_gives_eperds_
+    /// record). Starla parsed the line to Ignored and never wrote it. Its
+    /// runs start nothing, the uploader writing the 9907 marker. In
+    /// crons/main condmv is perd's, which writes no record (perd.c:
+    /// 1226-1248), and crons/2 no daemon reads: there it is no line.
+    #[test]
+    fn crons_7s_condmv_line_is_timed_runs_nothing_and_gives_its_record() {
+        let t0 = 1_791_936_000;
+        let condmv = condmv_line();
+        let ping = ping_line(1002, 240, 17, 2_000_000_000, 2, "192.0.2.2");
+        let mut lines = Lines::default();
+        let synced = lines.synchronize(crontab(CRONS_7, &[ping.clone(), condmv.clone()]), at(t0));
+        assert_eq!(synced.added, 2);
+        assert_eq!(lines.counts(), HashMap::from([("ping".to_string(), 1)]));
+
+        // It fires once a minute, and starts nothing
+        let awake = t0 + 600;
+        let (ran, records) = ticks(&mut lines, t0, awake);
+        assert!(records.is_empty(), "{records:?}");
+        assert!(ran.iter().all(|(_, job)| job.msm_id == 1002), "{ran:?}");
+        assert_eq!(ran.len(), 3, "{ran:?}"); // slots 17 + k * 240
+                                             // its slots are 1 + k * 60, each moved by -7..=7 s: the one after
+                                             // `awake` is awake + 1, and the line has run in its cycle or not
+        let task = lines.line(CRONS_7, &condmv).unwrap();
+        assert!(
+            (awake + 1..=awake + 1 + 60 + 7).contains(&task.next_run),
+            "{} is not its next time after {awake}",
+            task.next_run
+        );
+        let times = [&condmv, &ping].map(|line| lines.line(CRONS_7, line).unwrap().next_run);
+
+        // Suspended for 3 h: a record of each line, condmv's among them, in
+        // the order of their times; no run
+        let wake = awake + 3 * 3_600;
+        let due = lines.take_due(at(wake));
+        assert!(due.jobs.is_empty(), "{:?}", due.jobs);
+        let nexttime = |record: &InconsistentRecord| -> i64 {
+            let at = record.body.find("nexttime ").unwrap() + "nexttime ".len();
+            let len = record.body[at..].find(';').unwrap();
+            record.body[at..at + len].parse().unwrap()
+        };
+        let got: Vec<i64> = due.inconsistent.iter().map(nexttime).collect();
+        let mut wanted = times.to_vec();
+        wanted.sort();
+        assert_eq!(got, wanted);
+        let condmvs = due
+            .inconsistent
+            .iter()
+            .filter(|record| {
+                record.body.ends_with(
+                    r#""cmd": "condmv -A \"RESULT 9907 ongoing\" /home/atlas/data/new/7 /home/atlas/data/out/7""#,
+                )
+            })
+            .count();
+        assert_eq!(condmvs, 1, "{:?}", due.inconsistent);
+
+        // and on from the wake, once a minute, with no record
+        let (ran, records) = ticks(&mut lines, wake + 1, wake + 600);
+        assert!(records.is_empty(), "{records:?}");
+        assert!(ran.iter().all(|(_, job)| job.msm_id == 1002), "{ran:?}");
+
+        // perd's and crons/2's condmv lines are no lines
+        for file in [CRONS_MAIN, CRONS_2] {
+            let mut lines = Lines::default();
+            let synced = lines.synchronize(crontab(file, std::slice::from_ref(&condmv)), at(t0));
+            assert_eq!((synced.added, lines.len()), (0, 0), "{file}");
+        }
+    }
+
+    /// A line whose run, or whose cycle drawn afresh, sets its timer for a
+    /// time at or before now fires again at the same now: libevent runs a
+    /// timer set with set_timeout's wait of 0 in its loop's next pass,
+    /// microseconds on (eperd.c:764-765), not a second later.
+    #[test]
+    fn a_timer_set_for_a_time_past_fires_again_at_the_same_now() {
+        // `CRONLINE 5 0 …`, its tick 5 s late: RunJob runs it; its next
+        // cycle's slot is now itself, which set_timeout sets the timer for
+        // with no wait, and it runs again (eperd.c:1328-1338)
+        let now = 1_791_836_000;
+        let line = ping_line(1001, 5, 0, 2_000_000_000, 0, "192.0.2.1");
+        let mut lines = Lines::default();
+        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), at(now));
+        let first = lines.line(CRONS_7, &line).unwrap().next_run;
+        assert_eq!(first, now + 5);
+        let due = lines.take_due(at(first + 5));
+        assert_eq!(due.jobs.len(), 2);
+        assert!(due.inconsistent.is_empty());
+        assert_eq!(lines.line(CRONS_7, &line).unwrap().next_run, first + 10);
+
+        // Spreads many times the interval draw times well before now: after
+        // each tick, no timer is left set for a time at or before it
+        let wide: Vec<CrontabLine> = (0..20)
+            .map(|i| ping_line(2000 + i, 7, i as i64, 2_000_000_000, 120, "192.0.2.2"))
+            .collect();
+        let mut lines = Lines::default();
+        lines.synchronize(crontab(CRONS_7, &wide), at(now));
+        let mut records = 0;
+        for tick in now..now + 300 {
+            records += lines.take_due(at(tick)).inconsistent.len();
+            for line in &wide {
+                let task = lines.line(CRONS_7, line).unwrap();
+                assert!(
+                    !task.is_due(at(tick)),
+                    "{} left due at {tick}",
+                    task.next_run
+                );
+            }
+        }
+        assert!(records > 0, "draws more than 10 s back give records");
+    }
+
+    /// A job of Starla's own keeps RunJob's rule — its slots are eperd's —
+    /// but gives no record: eperd's names a line of its crontab by its
+    /// command, which a JSON job does not have.
+    #[test]
+    fn a_job_of_its_own_more_than_10_s_late_waits_for_its_next_slot_without_a_record() {
+        let now = 1_791_836_000;
+        // `interval 60, start 0`: its first slot after now
+        let slot = 1_791_836_040;
+        let job = ping_line(7, 60, 0, 0, 0, "192.0.2.7").job;
+        let mut lines = Lines::default();
+        lines.schedule(job.clone(), at(now));
+        assert_eq!(lines.take_due(at(slot + 9)).jobs.len(), 1);
+
+        let mut lines = Lines::default();
+        lines.schedule(job, at(now));
+        let due = lines.take_due(at(slot + 11));
+        assert!(due.jobs.is_empty() && due.inconsistent.is_empty());
+        let ran: Vec<i64> = runs(&mut lines, slot + 12, slot + 120)
+            .into_iter()
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(ran, vec![slot + 60, slot + 120]);
+
+        // Past its end once its late timer fires, it goes
+        let mut ending = ping_line(8, 60, 0, 0, 0, "192.0.2.8").job;
+        ending.end_time = slot + 5;
+        lines.schedule(ending, at(now));
+        assert_eq!(lines.len(), 2);
+        let due = lines.take_due(at(slot + 11));
+        assert!(due.jobs.is_empty() && due.inconsistent.is_empty());
+        assert_eq!(lines.len(), 1);
+    }
+
+    /// A wall clock stepped back by more than 10 s: the line's timer, a wait
+    /// on the monotonic clock (libevent's, event_add, eperd.c:776), runs out
+    /// at its time less the step by the wall clock; RunJob finds now <
+    /// nexttime - 10, writes its record and draws the first cycle after now
+    /// (eperd.c:1268-1310), and the line runs on from there, once a cycle.
+    /// Starla's timer was the wall clock reaching next_run, which a clock
+    /// stepped back an hour put off for that hour: here, the record and four
+    /// runs of a 900 s line.
+    #[test]
+    fn a_clock_stepped_back_gives_eperds_record_and_runs_on_the_new_slots() {
+        let slot = 1_791_836_412;
+        let line = ping_line(1001, 900, 312, 2_000_000_000, 0, "193.0.14.129");
+        let mut lines = Lines::default();
+        lines.synchronize(
+            crontab(CRONS_7, std::slice::from_ref(&line)),
+            at(slot - 400),
+        );
+        let (ran, records) = ticks(&mut lines, slot - 400, slot - 100);
+        assert!(ran.is_empty() && records.is_empty());
+        // A second on, the wall clock steps back 3601 s; the monotonic clock
+        // goes on. The timer's wait runs out at slot - 3601 by the stepped
+        // clock: 399 s from slot - 400 (and the second into it).
+        let stepped = Now {
+            wall: slot - 3_700,
+            mono: at(slot - 99).mono,
+        };
+        let (ran, records) = ticks_from(&mut lines, stepped, slot - 1);
+        assert_eq!(
+            records,
+            vec![record(
+                slot - 3_601,
+                slot,
+                399,
+                1_990_929,
+                slot - 400,
+                &line
+            )]
+        );
+        let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(
+            ran,
+            vec![slot - 3_600, slot - 2_700, slot - 1_800, slot - 900]
+        );
+
+        // Stepped back by up to 10 s, the timer fires as much early, and
+        // RunJob runs the line; by 11 s, its record (eperd.c:1268)
+        for (step, runs) in [(10, true), (11, false)] {
+            let mut lines = Lines::default();
+            lines.synchronize(
+                crontab(CRONS_7, std::slice::from_ref(&line)),
+                at(slot - 400),
+            );
+            let stepped = Now {
+                wall: slot - 100 - step,
+                mono: at(slot - 100).mono,
+            };
+            let (ran, records) = ticks_from(&mut lines, stepped, slot - step);
+            let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+            if runs {
+                assert_eq!(ran, vec![slot - step], "stepped back {step} s");
+                assert!(records.is_empty(), "stepped back {step} s");
+            } else {
+                assert!(ran.is_empty(), "stepped back {step} s");
+                assert_eq!(
+                    records,
+                    vec![record(slot - step, slot, 399, 1_990_929, slot - 400, &line)]
+                );
+            }
+        }
     }
 }
