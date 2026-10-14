@@ -3,6 +3,7 @@
 use super::HttpConfig;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,9 @@ pub struct HttpResult {
     /// Error message if request failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
+    /// The address the response came from: the connection's peer
+    #[serde(skip)]
+    pub remote_addr: Option<SocketAddr>,
 }
 
 pub async fn execute_http_request(config: &HttpConfig) -> anyhow::Result<HttpResult> {
@@ -51,6 +55,15 @@ pub async fn execute_http_request(config: &HttpConfig) -> anyhow::Result<HttpRes
         .timeout(Duration::from_millis(config.timeout_ms))
         .danger_accept_invalid_certs(!config.verify_ssl)
         .redirect(reqwest::redirect::Policy::none()); // Usually probes follow redirects manually or not at all
+
+    // -4/-6: connect over that family only, as httpget asks evdns for it
+    // alone (httpget.c:2163-2170). A local address of one family makes the
+    // connector try only the target's addresses of that family.
+    match config.af {
+        4 => builder = builder.local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        6 => builder = builder.local_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        _ => {}
+    }
 
     if let Some(ref v) = config.version {
         if v == "2" {
@@ -86,6 +99,7 @@ pub async fn execute_http_request(config: &HttpConfig) -> anyhow::Result<HttpRes
     let start = Instant::now();
     let response = request.send().await?;
     let rtt = start.elapsed().as_secs_f64() * 1000.0;
+    let remote_addr = response.remote_addr();
 
     let status = response.status().as_u16();
     let version = match response.version() {
@@ -140,5 +154,6 @@ pub async fn execute_http_request(config: &HttpConfig) -> anyhow::Result<HttpRes
         response_headers: Some(response_headers),
         readbuf,
         err: None,
+        remote_addr,
     })
 }

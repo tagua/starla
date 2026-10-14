@@ -1810,6 +1810,43 @@ mod tests {
         assert!(line.ends_with(r#""src_addr" : "127.0.0.1" , "ttl" : 42 , "proto" : "UDP" , "error" : { "timeout" : 100} }"#), "{line}");
     }
 
+    /// rt counts from when the socket takes the query, just before its send
+    /// (evtdig.c:1459-1465). Each attempt's socket is new to the reactor, so
+    /// its send waits a reactor turn for writable: a run held there 50 ms —
+    /// a busy runtime — still reports the local server's answer at once.
+    /// Stamped before that wait, as c9cb056 stamped it, rt took the 50 ms
+    /// in.
+    #[tokio::test]
+    async fn rt_counts_from_when_the_socket_takes_the_query() {
+        use std::future::Future;
+        let (server, mut queries) = udp_server("127.0.0.1:0").await;
+        let cfg = DnsConfig {
+            query: "hostname.bind.".into(),
+            timeout_ms: 2000,
+            disable_check_addr: true,
+            ..Default::default()
+        };
+        let servers = [server];
+        let mut attempt = std::pin::pin!(resolver::udp_query(
+            &cfg,
+            "127.0.0.1",
+            &servers,
+            "hostname.bind.",
+            1
+        ));
+        let first = attempt
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(first.is_pending(), "a new socket is not known writable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(queries.try_recv().is_err(), "sent before it was writable");
+        let a = attempt.await;
+        let Outcome::Reply { rt, .. } = a.outcome else {
+            panic!("{:?}", a.outcome)
+        };
+        assert!(rt < 40.0, "the wait for writable is in rt: {rt} ms");
+    }
+
     /// A server name with several addresses of the family gets the query at
     /// each, each from its own socket, and the last one's reply is the
     /// result (tdig_send_query_callback()'s loop, evtdig.c:1255-1495).

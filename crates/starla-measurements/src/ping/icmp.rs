@@ -206,13 +206,23 @@ pub async fn execute_ping(config: &PingConfig) -> anyhow::Result<PingOutcome> {
     let mut recv_buf = vec![0u8; 65536];
 
     for _ in 0..config.count {
-        let stamp = Stamp {
-            cookie,
-            sent: start.elapsed(),
-        };
-        let packet = echo_request(v4, identifier, u16::from(session.seq()), config.size, stamp)?;
+        let seq = u16::from(session.seq());
         let local = local_addr();
-        let error = socket.send(&packet).await.err().map(|e| strerror(&e));
+        // Stamped once the socket takes the send, just before it, as
+        // fmticmp stamps right before ping_xmit's sendto (ping.c:559, 635,
+        // 732, 757). Starla stamped first, so the first echo of every run,
+        // on a socket new to the reactor, carried a reactor turn in its rtt.
+        let error = socket
+            .send_with(|| {
+                let stamp = Stamp {
+                    cookie,
+                    sent: start.elapsed(),
+                };
+                echo_request(v4, identifier, seq, config.size, stamp)
+            })
+            .await
+            .err()
+            .map(|e| strerror(&e));
         session.sent(local, error);
 
         let deadline = tokio::time::Instant::now() + interval;
@@ -642,6 +652,52 @@ mod tests {
             interval_ms: 300,
             backend: Default::default(),
             kept: Default::default(),
+        }
+    }
+
+    /// The echo's send time is stamped once the socket takes it, just before
+    /// its send (fmticmp, ping.c:559, 635; ping_xmit's sendto, 732, 757).
+    /// The run's socket is new to the reactor, so its first send waits a
+    /// reactor turn for writable: a run held there 50 ms — a busy runtime —
+    /// still times loopback's reply at well under that. Stamped before the
+    /// wait, as c9cb056 stamped it, the rtt took the 50 ms in. Skipped where
+    /// no ICMP socket can be had.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_send_time_is_stamped_when_the_socket_takes_the_echo() {
+        use crate::ping::PingEvent;
+        use std::future::Future;
+
+        for target in ["127.0.0.1", "::1"] {
+            let config = PingConfig {
+                count: 1,
+                ..config(target)
+            };
+            let mut run = std::pin::pin!(execute_ping(&config));
+            let first = run
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            if let std::task::Poll::Ready(outcome) = first {
+                eprintln!("skipping {target}: {outcome:?}");
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let events = match run.await {
+                Ok(PingOutcome::Ran { events, .. }) => events,
+                other => panic!("{target}: {other:?}"),
+            };
+            let rtt: Vec<f64> = events
+                .iter()
+                .filter_map(|e| match e {
+                    PingEvent::Reply { rtt, .. } => Some(*rtt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rtt.len(), 1, "{target}: {events:?}");
+            assert!(
+                rtt[0] < 40.0,
+                "{target}: the wait for writable is in the rtt: {rtt:?} ms"
+            );
         }
     }
 
