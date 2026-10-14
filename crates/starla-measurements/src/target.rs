@@ -1041,10 +1041,15 @@ thread_local! {
 }
 
 /// evdns, set up as eperd sets it up.
+///
+/// A clone is three reference counts: [`Resolver::system`] hands every
+/// lookup one, on the measurement runtime, and a hosts file of thousands of
+/// lines (an ad-block list) copied at each lookup would be as many
+/// allocations there.
 #[derive(Debug, Clone)]
 pub struct Resolver {
-    pub conf: ResolvConf,
-    pub hosts: Vec<(String, IpAddr)>,
+    pub conf: Arc<ResolvConf>,
+    pub hosts: Arc<[(String, IpAddr)]>,
     /// The servers' sockets and state, made from `conf.nameservers` when
     /// the resolver is.
     base: Arc<Base>,
@@ -1060,8 +1065,8 @@ impl Resolver {
     pub fn new(conf: ResolvConf, hosts: Vec<(String, IpAddr)>) -> Self {
         Self {
             base: Base::new(&conf),
-            conf,
-            hosts,
+            conf: Arc::new(conf),
+            hosts: hosts.into(),
         }
     }
 
@@ -1092,10 +1097,14 @@ impl Resolver {
         let hosts = parse_hosts(&std::fs::read_to_string(hosts_path()).unwrap_or_default());
         let mut system = lock(&SYSTEM);
         let base = match system.as_ref() {
-            Some(system) if system.conf == conf => system.base.clone(),
+            Some(system) if *system.conf == conf => system.base.clone(),
             _ => Base::new(&conf),
         };
-        let resolver = Self { conf, hosts, base };
+        let resolver = Self {
+            conf: Arc::new(conf),
+            hosts: hosts.into(),
+            base,
+        };
         *system = Some(resolver.clone());
         resolver
     }
@@ -1199,7 +1208,7 @@ impl Resolver {
     fn hosts_entry(&self, name: &str, af: u8) -> Option<Vec<IpAddr>> {
         let mut found = false;
         let mut addrs = Vec::new();
-        for (host, addr) in &self.hosts {
+        for (host, addr) in self.hosts.iter() {
             if host.eq_ignore_ascii_case(name) {
                 found = true;
                 if !matches!((af, addr), (4, IpAddr::V6(_)) | (6, IpAddr::V4(_))) {
@@ -1507,7 +1516,7 @@ mod tests {
     async fn randomize_case_0_sends_the_name_as_written() {
         let (server, seen) = fake_server(answer_both).await;
         let mut resolver = resolver(server);
-        resolver.conf.randomize_case = false;
+        Arc::make_mut(&mut resolver.conf).randomize_case = false;
         resolver.lookup("YouTube.com", 6).await.addr.unwrap();
         assert_eq!(
             queries(&seen)[0].queries[0].name().to_ascii(),
@@ -1544,8 +1553,8 @@ mod tests {
         for answer in [None, Some(2u16)] {
             let (server, seen) = fake_server(move |q| answer.map(|rc| reply(q, rc))).await;
             let mut resolver = resolver(server);
-            resolver.conf.timeout = Duration::from_millis(50);
-            resolver.conf.attempts = 3;
+            Arc::make_mut(&mut resolver.conf).timeout = Duration::from_millis(50);
+            Arc::make_mut(&mut resolver.conf).attempts = 3;
             let found = resolver.lookup("www.ripe.net", 6).await;
             assert_eq!(found.addr, Err(LookupError::Fail));
             let seen = seen.lock().unwrap();
@@ -1612,7 +1621,8 @@ mod tests {
         resolver.hosts = parse_hosts(
             "# comment\n127.0.0.1\tlocalhost\n::1 localhost ip6-localhost # x\n\
              192.0.2.1 v4only.lan\n",
-        );
+        )
+        .into();
         let found = resolver.lookup("LocalHost", 6).await;
         assert_eq!(found.addr, Ok("::1".parse().unwrap()));
         assert!(found.dst_name.ttr.is_some());
@@ -1748,9 +1758,9 @@ mod tests {
     /// transmission per query; what it found and how long it took.
     async fn either_family(a: Then, aaaa: Then) -> (Result<Vec<IpAddr>, LookupError>, Duration) {
         let mut resolver = resolver(skewed_server(a, aaaa).await);
-        resolver.conf.getaddrinfo_allow_skew = Duration::from_millis(300);
-        resolver.conf.timeout = Duration::from_secs(2);
-        resolver.conf.attempts = 1;
+        Arc::make_mut(&mut resolver.conf).getaddrinfo_allow_skew = Duration::from_millis(300);
+        Arc::make_mut(&mut resolver.conf).timeout = Duration::from_secs(2);
+        Arc::make_mut(&mut resolver.conf).attempts = 1;
         let started = std::time::Instant::now();
         let found = resolver.addresses("www.ripe.net", 0).await;
         (found, started.elapsed())
@@ -1814,8 +1824,9 @@ mod tests {
         let reads = reads_here();
         for _ in 0..100 {
             let system = Resolver::system();
-            assert_eq!(system.conf, read.conf);
-            assert_eq!(system.hosts, read.hosts);
+            // the snapshot itself, shared: nothing is copied
+            assert!(Arc::ptr_eq(&system.conf, &read.conf));
+            assert!(Arc::ptr_eq(&system.hosts, &read.hosts));
             assert!(Arc::ptr_eq(&system.base, &read.base));
         }
         assert_eq!(reads_here(), reads, "a lookup read the files");
@@ -1829,7 +1840,7 @@ mod tests {
     fn search_candidates_follow_ndots() {
         let mut resolver = Resolver::default();
         assert_eq!(resolver.candidates("www.ripe.net"), ["www.ripe.net"]);
-        resolver.conf.search = vec!["a.example".into(), "b.example".into()];
+        Arc::make_mut(&mut resolver.conf).search = vec!["a.example".into(), "b.example".into()];
         assert_eq!(
             resolver.candidates("www.ripe.net"),
             [
@@ -1860,7 +1871,7 @@ mod tests {
         })
         .await;
         let mut resolver = resolver(server);
-        resolver.conf.search = vec!["corp".into(), "lan".into()];
+        Arc::make_mut(&mut resolver.conf).search = vec!["corp".into(), "lan".into()];
         let found = resolver.lookup("printer", 4).await;
         assert_eq!(found.addr, Ok(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))));
         let asked: Vec<String> = queries(&seen)
@@ -2007,8 +2018,8 @@ mod tests {
         let (refusing, seen_r) = fake_server(|q| Some(reply(q, 5))).await;
         let (good, seen_g) = fake_server(answer_both).await;
         let mut resolver = resolver_of(&[refusing, good]);
-        resolver.conf.timeout = Duration::from_millis(100);
-        resolver.conf.probe_timeout = Duration::from_millis(300);
+        Arc::make_mut(&mut resolver.conf).timeout = Duration::from_millis(100);
+        Arc::make_mut(&mut resolver.conf).probe_timeout = Duration::from_millis(300);
         resolver.base = Base::new(&resolver.conf);
 
         // the reissue waits for the query's timer
@@ -2051,7 +2062,7 @@ mod tests {
         // no SO_BROADCAST: sendto fails with EACCES
         let unsendable: SocketAddr = "255.255.255.255:53".parse().unwrap();
         let mut resolver = resolver_of(&[unsendable, good]);
-        resolver.conf.timeout = Duration::from_millis(300);
+        Arc::make_mut(&mut resolver.conf).timeout = Duration::from_millis(300);
         let first = resolver.lookup("www.ripe.net", 6).await;
         assert!(first.addr.is_ok());
         assert!(first.dst_name.ttr.unwrap() >= 300.0, "{first:?}");
@@ -2073,7 +2084,7 @@ mod tests {
         .await;
         let mut resolver = resolver(server);
         assert!(resolver.lookup("WWW.ripe.net", 6).await.addr.is_ok());
-        resolver.conf.randomize_case = false;
+        Arc::make_mut(&mut resolver.conf).randomize_case = false;
         assert_eq!(
             resolver.lookup("WWW.ripe.net", 6).await.addr,
             Err(LookupError::Fail)

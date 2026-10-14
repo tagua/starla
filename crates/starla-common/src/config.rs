@@ -102,6 +102,12 @@ pub struct MeasurementSettings {
     /// starla_network::rxstamp.
     #[serde(default)]
     pub kernel_rx_timestamps: bool,
+    /// Run the background threads on SCHED_IDLE as well as 10 nice levels
+    /// lower, so that a measurement thread woken on their CPU preempts
+    /// them at once. Linux only; off by default. See
+    /// starla_common::priority::BACKGROUND_NICE_INCREMENT.
+    #[serde(default)]
+    pub background_sched_idle: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +240,16 @@ mod tests {
     /// Off unless asked for: by default, and in a config without the
     /// section or the key.
     #[test]
+    fn background_sched_idle_is_off_by_default() {
+        assert!(!ProbeConfig::default().measurements.background_sched_idle);
+        let parsed: ProbeConfig = toml::from_str("[measurements]\n").unwrap();
+        assert!(!parsed.measurements.background_sched_idle);
+        let on = "[measurements]\nbackground_sched_idle = true\n";
+        let parsed: ProbeConfig = toml::from_str(on).unwrap();
+        assert!(parsed.measurements.background_sched_idle);
+    }
+
+    #[test]
     fn kernel_rx_timestamps_are_off_by_default() {
         assert!(!ProbeConfig::default().measurements.kernel_rx_timestamps);
         let parsed: ProbeConfig = toml::from_str("[probe]\nlog_level = \"debug\"\n").unwrap();
@@ -252,6 +268,8 @@ mod tests {
         let parsed: ProbeConfig = toml::from_str(example).unwrap();
         assert!(!parsed.measurements.kernel_rx_timestamps);
         assert!(example.contains("\nkernel_rx_timestamps = false\n"));
+        assert!(!parsed.measurements.background_sched_idle);
+        assert!(example.contains("\nbackground_sched_idle = false\n"));
     }
 
     #[test]

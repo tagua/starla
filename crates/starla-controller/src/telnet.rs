@@ -301,6 +301,13 @@ pub struct HttpSpec {
     /// `-0`: HTTP/1.0 (evhttpget's default, and `-1`, is HTTP/1.1)
     #[serde(default)]
     pub http10: bool,
+    /// `--sni`: the server name an https fetch sends, the URL's host when
+    /// None (httpget.c:560, 773)
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// `--timeout`, ms: httpget's 5000 (CONN_TO) when None
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
     pub spread: Option<u32>,
     pub schedule: ScheduleSpec,
 }
@@ -1933,6 +1940,8 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
     let mut max_body_size: Option<u32> = None;
     let mut store_headers: u32 = 0;
     let mut http10 = false;
+    let mut sni: Option<String> = None;
+    let mut timeout_ms: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -1965,11 +1974,30 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
                     i += 1;
                 }
             }
+            "--sni" => {
+                if i + 1 < args.len() {
+                    sni = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            // httpget_init refuses a line whose --timeout is not a number
+            // (httpget.c:712-720)
+            "--timeout" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse() {
+                        Ok(ms) => timeout_ms = Some(ms),
+                        Err(_) => {
+                            warn!("evhttpget: bad --timeout {:?}", args[i + 1]);
+                            return TelnetCommand::Unknown(format!("evhttpget {:?}", args));
+                        }
+                    }
+                    i += 1;
+                }
+            }
             // httpget options with a value Starla does not use: their value
             // must not be taken for the URL.
             "-I" | "-R" | "-W" | "-b" | "--host" | "--post-file" | "--post-header"
-            | "--post-footer" | "--read-limit" | "--store-body" | "--user-agent" | "--sni"
-            | "--timeout" => {
+            | "--post-footer" | "--read-limit" | "--store-body" | "--user-agent" => {
                 if i + 1 < args.len() {
                     i += 1;
                 }
@@ -2007,6 +2035,8 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
         max_body_size,
         store_headers,
         http10,
+        sni,
+        timeout_ms,
         spread: Some(spread),
         schedule: ScheduleSpec {
             interval,
@@ -2351,6 +2381,11 @@ fn parse_json_command(spec: &serde_json::Value) -> TelnetCommand {
                 .map(|v| v as u32),
             store_headers: 0,
             http10: false,
+            sni: spec.get("sni").and_then(|v| v.as_str()).map(String::from),
+            timeout_ms: spec
+                .get("timeout")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
             spread,
             schedule,
         }),
@@ -3474,5 +3509,26 @@ mod tests {
             spec.url, "http://www.ripe.net/favicon.ico",
             "option values are not the URL"
         );
+        assert_eq!(spec.sni, None);
+        assert_eq!(spec.timeout_ms, Some(5000));
+
+        // --sni names the server an https fetch asks for (httpget.c:560)
+        let spec = match parse_command(
+            r#"CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget -4 --sni www.ripe.net -A "1001" -O /home/atlas/data/new/7 https://193.0.6.139/"#,
+        ) {
+            TelnetCommand::Http(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(spec.sni.as_deref(), Some("www.ripe.net"));
+        assert_eq!(spec.url, "https://193.0.6.139/");
+        assert_eq!(spec.timeout_ms, None);
+
+        // a --timeout httpget cannot parse: the line is refused
+        assert!(matches!(
+            parse_command(
+                r#"CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget -4 --timeout 5s -A "1001" -O /home/atlas/data/new/7 http://193.0.6.139/"#,
+            ),
+            TelnetCommand::Unknown(_)
+        ));
     }
 }

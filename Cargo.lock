@@ -5529,7 +5529,6 @@ dependencies = [
  "pnet",
  "pnet_packet",
  "rand 0.10.3",
- "reqwest",
  "rscamper",
  "rustls",
  "serde",

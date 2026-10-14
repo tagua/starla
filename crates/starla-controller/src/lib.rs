@@ -18,8 +18,8 @@ pub use channel_stream::channel_to_stream;
 pub use registration::{RegState, RegStep};
 pub use ssh::{
     generate_key, key_fingerprint, load_key, load_key_from_string, load_or_create_key,
-    parse_init_response, public_key_openssh, save_key, ControllerInfo, InitResponse, KnownHosts,
-    ProbeInitInfo, SshConfig, SshConnection, TelnetState,
+    parse_init_response, public_key_openssh, save_key, ControllerInfo, InitResponse, KeepRefused,
+    KnownHosts, ProbeInitInfo, SshConfig, SshConnection, TelnetState,
 };
 pub use telnet::{
     CondmvSpec, CrontabLine, CrontabSpec, DnsSpec, HostTelemetryKind, HostTelemetrySpec, HttpSpec,

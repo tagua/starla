@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use starla_common::{MeasurementId, MeasurementResult, MeasurementType, ProbeId};
 use starla_measurements::{
-    http::HttpConfig,
+    http::{raw, HttpConfig},
     ntp::NtpConfig,
     ping::PingConfig,
     target::{self, DstName, Resolver},
@@ -15,7 +15,7 @@ use starla_measurements::{
     Dns, Http, Measurement, Ntp, Ping, Tls, Traceroute,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// evtdig's options, as the measurement takes them: the server and the
 /// query, and everything else its command line says.
@@ -130,6 +130,10 @@ pub struct HttpJobSpec {
     pub max_body_size: Option<u32>,
     pub store_headers: u32,
     pub http10: bool,
+    /// `--sni`
+    pub sni: Option<String>,
+    /// `--timeout`, ms
+    pub timeout_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +151,38 @@ pub struct NtpJobSpec {
     pub packets: u32,
     pub timeout_ms: u32,
     pub gap_ms: u32,
+    /// ntpstate->busy, shared by the line's runs: a line a push repeats
+    /// keeps its job, and this with it
+    pub busy: std::sync::Arc<NtpBusy>,
+}
+
+/// evntp's busy flag: set by ntp_start, which returns at once while it is
+/// set (`ntp_start: busy, can't start`, ntp.c:1461-1466), and cleared by
+/// report() (ntp.c:497), whatever the run came to — the failed lookup's
+/// line too (dns_cb, ntp.c:1353-1366). Starla started every due NTP run,
+/// so a run that outlasted the gap to the next (a lookup can take 15 s,
+/// then `-c 3` with its timeouts) had two under way, both reporting.
+#[derive(Debug, Default)]
+pub struct NtpBusy(AtomicBool);
+
+/// A run of an NTP line under way, from ntp_start to report(): the line is
+/// busy until this goes.
+#[derive(Debug)]
+pub struct NtpRun<'a>(&'a NtpBusy);
+
+impl NtpBusy {
+    /// ntp_start: a run starts unless the line's last run is still under
+    /// way; None then, and the run reports nothing.
+    pub fn start(&self) -> Option<NtpRun<'_>> {
+        (!self.0.swap(true, Ordering::AcqRel)).then_some(NtpRun(self))
+    }
+}
+
+impl Drop for NtpRun<'_> {
+    /// report() clears busy (ntp.c:497)
+    fn drop(&mut self) {
+        self.0 .0.store(false, Ordering::Release);
+    }
 }
 
 impl MeasurementSpec {
@@ -163,11 +199,12 @@ impl MeasurementSpec {
         }
     }
 
-    /// ping_start's and traceroute_start's busy check, which comes before
-    /// the lookup (ping.c:1751-1752, 1787-1798; traceroute.c:4934-4938,
-    /// 4940-4971): a line whose last run is still under way does not start,
-    /// and reports nothing — not even a failed lookup. The flag is the
-    /// line's own (PingKept, TracerouteInstance), taken here once; the run
+    /// ping_start's, traceroute_start's and ntp_start's busy check, which
+    /// comes before the lookup (ping.c:1751-1752, 1787-1798;
+    /// traceroute.c:4934-4938, 4940-4971; ntp.c:1461-1466, 1488-1494): a
+    /// line whose last run is still under way does not start, and reports
+    /// nothing — not even a failed lookup. The flag is the line's own
+    /// (PingKept, TracerouteInstance, NtpBusy), taken here once; the run
     /// holds it until its line is reported, and a traceroute's run is
     /// handed to the measurement ([`Traceroute::execute_run`]) instead of
     /// the measurement taking it again.
@@ -180,6 +217,10 @@ impl MeasurementSpec {
             MeasurementSpec::Traceroute(spec) => match spec.instance.start() {
                 Some(run) => Ok(Some(LineRun::Traceroute(run))),
                 None => anyhow::bail!("traceroute {msm_id}: busy, can't start"),
+            },
+            MeasurementSpec::Ntp(spec) => match spec.busy.start() {
+                Some(run) => Ok(Some(LineRun::Ntp(run))),
+                None => anyhow::bail!("ntp {msm_id}: busy, can't start"),
             },
             _ => Ok(None),
         }
@@ -278,12 +319,16 @@ impl MeasurementJob {
                             Some(headers)
                         },
                         body: spec.body.clone(),
-                        timeout_ms: 30000,
+                        // httpget's one timer, connect to response
+                        // (CONN_TO when the line has no --timeout); Starla
+                        // gave the connect and the read 30 s each
+                        timeout_ms: spec.timeout_ms.map_or(raw::DEFAULT_TIMEOUT_MS, u64::from),
                         verify_ssl: true,
                         version: None,
                         af: spec.af,
                         store_headers: spec.store_headers as usize,
                         http10: spec.http10,
+                        sni: spec.sni.clone(),
                     },
                     probe_id,
                     msm_id,
@@ -352,20 +397,23 @@ fn dns_probe_id(probe_id: ProbeId) -> ProbeId {
     }
 }
 
-/// A run of a ping or traceroute line, from its busy check to its report:
-/// report() clears the flag (ping.c:324, traceroute.c:454) when this goes.
+/// A run of a ping, traceroute or NTP line, from its busy check to its
+/// report: report() clears the flag (ping.c:324, traceroute.c:454,
+/// ntp.c:497) when this goes.
 enum LineRun<'a> {
     /// Held for its drop only: the ping measurement keeps no run.
     Ping(#[allow(dead_code)] PingRun<'a>),
     /// Handed to the traceroute, whose run gets it under way (its Paris id).
     Traceroute(TracerouteRun<'a>),
+    /// Held for its drop only, as a ping's.
+    Ntp(#[allow(dead_code)] NtpRun<'a>),
 }
 
 /// A ping, traceroute or NTP measurement that looks its target up when it
 /// runs, then runs. When the lookup fails it reports that as the reference
 /// does ([`Measurement::lookup_failed`]: ping.c's PING_ERR_DNS line,
-/// traceroute.c's and ntp.c's "name resolution failed" ones). A ping or
-/// traceroute line still busy with its last run does neither
+/// traceroute.c's and ntp.c's "name resolution failed" ones). A ping,
+/// traceroute or NTP line still busy with its last run does neither
 /// ([`MeasurementSpec::start`]).
 ///
 /// NTP was resolved with the libc resolver (`to_socket_addrs`) when the
@@ -631,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_answer_reports_nothing() {
         let mut resolver = nxdomain_resolver().await;
-        resolver.hosts = vec![("v4only.lan".into(), "192.0.2.1".parse().unwrap())];
+        resolver.hosts = vec![("v4only.lan".into(), "192.0.2.1".parse().unwrap())].into();
         let run = LookUpThenRun {
             job: job(ping("v4only.lan")),
             probe_id: ProbeId(1018212),
@@ -648,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_address_is_reported_not_measured() {
         let mut resolver = nxdomain_resolver().await;
-        resolver.hosts = vec![("lan.example".into(), "fd00::20".parse().unwrap())];
+        resolver.hosts = vec![("lan.example".into(), "fd00::20".parse().unwrap())].into();
         let run = LookUpThenRun {
             job: job(ping("lan.example")),
             probe_id: ProbeId(1018212),
@@ -764,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn after_an_empty_answer_a_ping_line_reports_nothing_again() {
         let mut resolver = nxdomain_resolver().await;
-        resolver.hosts = vec![("v4only.lan".into(), "192.0.2.1".parse().unwrap())];
+        resolver.hosts = vec![("v4only.lan".into(), "192.0.2.1".parse().unwrap())].into();
         let job = job(ping("v4only.lan"));
         let mut run = LookUpThenRun {
             job,
@@ -772,7 +820,7 @@ mod tests {
             resolver: Some(resolver.clone()),
         };
         assert!(run.execute().await.is_err());
-        resolver.hosts = Vec::new();
+        resolver.hosts = Vec::new().into();
         run.resolver = Some(resolver);
         let err = run.execute().await.unwrap_err().to_string();
         assert_eq!(err, "ping 1040114: busy, not started");
@@ -854,7 +902,7 @@ mod tests {
         // line's first (paris_id 1), and the line is free once reported.
         // 0.0.0.0 is an address atlas_check_addr lets through that leaves
         // no packet off this host.
-        resolver.hosts = vec![("local.example".into(), "0.0.0.0".parse().unwrap())];
+        resolver.hosts = vec![("local.example".into(), "0.0.0.0".parse().unwrap())].into();
         let job = traceroute_line(
             r#"CRONLINE 900 1 2000000000 UNIFORM 3 evtraceroute -4 -I -c 1 -m 1 -w 200 -A "7002" local.example"#,
         );
@@ -963,6 +1011,8 @@ mod tests {
                     max_body_size: None,
                     store_headers: 1024,
                     http10: false,
+                    sni: None,
+                    timeout_ms: None,
                 }),
                 MeasurementType::Http,
             ),
@@ -980,7 +1030,42 @@ mod tests {
             packets: 3,
             timeout_ms: 1000,
             gap_ms: 4000,
+            busy: Default::default(),
         })
+    }
+
+    /// While a run of an NTP line is under way the next one does not
+    /// start: ntp_start returns at once, before its lookup, and nothing is
+    /// reported (ntp.c:1461-1466). Starla started every due run. Once the
+    /// run has reported, the next goes ahead.
+    #[tokio::test]
+    async fn a_busy_ntp_line_does_not_look_up_or_report() {
+        let (resolver, queries) = counting_resolver().await;
+        let job = job(ntp("pool.ntp.example", 4));
+        let MeasurementSpec::Ntp(spec) = &job.spec else {
+            unreachable!()
+        };
+        let busy = spec.busy.clone();
+        let run = LookUpThenRun {
+            job: job.clone(),
+            probe_id: ProbeId(1018212),
+            resolver: Some(resolver),
+        };
+        let under_way = busy.start().unwrap();
+        let err = run.execute().await.unwrap_err().to_string();
+        assert_eq!(err, "ntp 1040114: busy, can't start");
+        assert_eq!(queries.load(Ordering::SeqCst), 0);
+        // reported: the next run looks its target up, and reports dns_cb's
+        // line when that fails
+        drop(under_way);
+        let result = run.execute().await.unwrap();
+        assert!(queries.load(Ordering::SeqCst) > 0);
+        let MeasurementData::FullLine(body) = result.data else {
+            panic!("{:?}", result.data);
+        };
+        assert!(body.contains("name resolution failed"), "{body}");
+        // and the line is free again
+        assert!(busy.start().is_some());
     }
 
     /// A resolver that answers nothing: each lookup waits `timeout`.

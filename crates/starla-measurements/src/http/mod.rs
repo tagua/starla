@@ -1,6 +1,5 @@
 //! HTTP measurement implementation
 
-pub mod client;
 pub mod raw;
 
 use crate::traits::Measurement;
@@ -9,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use starla_common::{
     MeasurementData, MeasurementId, MeasurementResult, MeasurementType, ProbeId, Timestamp,
 };
-use starla_network::get_source_addr_for_dest;
 use std::fmt::Write;
-use std::net::IpAddr;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +29,10 @@ pub struct HttpConfig {
     /// `-0`: send HTTP/1.0 instead of HTTP/1.1
     #[serde(default)]
     pub http10: bool,
+    /// `--sni`: the server name an https fetch sends, the URL's host when
+    /// None (httpget.c:773)
+    #[serde(default)]
+    pub sni: Option<String>,
 }
 
 pub struct Http {
@@ -55,6 +56,14 @@ pub fn result_body(msm_id: u64, gstart: i64, out: &raw::RawHttpOutcome) -> Strin
     if let Some(dnserr) = &out.dnserr {
         // reporterr()'s TU_DNS_ERR: report() adds nothing to it
         let _ = write!(r, "\"dnserr\":{} }}", raw::quoted(dnserr));
+        return envelope(msm_id, gstart, out, &r);
+    }
+    if let (true, Some(dst)) = (out.refused, out.dst_addr) {
+        // reporterr()'s TU_BAD_ADDR, nothing added either
+        let _ = write!(
+            r,
+            "\"error\": \"address not allowed\", \"dst_addr\":\"{dst}\" }}"
+        );
         return envelope(msm_id, gstart, out, &r);
     }
     if let Some(header) = &out.header {
@@ -113,20 +122,18 @@ impl Measurement for Http {
     async fn execute(&self) -> anyhow::Result<MeasurementResult> {
         let gstart = Timestamp::now();
         let timeout = Duration::from_millis(self.config.timeout_ms);
-        let out = match raw::parse_http_url(&self.config.url) {
-            Ok(url) => {
-                raw::fetch(
-                    &url,
-                    self.config.af,
-                    self.config.http10,
-                    self.config.store_headers,
-                    timeout,
-                )
-                .await?
-            }
-            // https: still through reqwest, reported in the same shape.
-            Err(_) => self.fetch_tls().await?,
-        };
+        // http:// and https:// alike, as httpget fetches both; another URL
+        // is httpget_init's "bad prefix", and nothing runs
+        let url = raw::parse_http_url(&self.config.url)?;
+        let out = raw::fetch(
+            &url,
+            self.config.af,
+            self.config.http10,
+            self.config.store_headers,
+            timeout,
+            self.config.sni.as_deref(),
+        )
+        .await?;
 
         let af = out.af;
         let dst_addr = out
@@ -146,46 +153,6 @@ impl Measurement for Http {
             ttl: None,
             size: None,
             data: MeasurementData::FullLine(result_body(self.msm_id.0, gstart.0, &out)),
-        })
-    }
-}
-
-impl Http {
-    /// An https:// fetch through reqwest, its host name looked up by
-    /// Starla's evdns as an http:// one is (client::Evdns). Header lines
-    /// are rebuilt from the parsed map (names lowercased), so stored
-    /// headers are approximate here.
-    ///
-    /// dst_addr is the address the connection went to, as httpget reports
-    /// the one it connected to (beforeconnect, httpget.c:1980-1989, 910-918).
-    /// Starla looked the host up a second time for it, with a blocking
-    /// getaddrinfo on a runtime worker (`to_socket_addrs`), and reported
-    /// that lookup's first address of the family, whichever one reqwest
-    /// had fetched from.
-    async fn fetch_tls(&self) -> anyhow::Result<raw::RawHttpOutcome> {
-        let results = client::execute_http_request(&self.config).await?;
-        let dst: Option<IpAddr> = results.remote_addr.map(|a| a.ip());
-        Ok(raw::RawHttpOutcome {
-            ttr: None,
-            af: if dst.is_some_and(|d| d.is_ipv6()) {
-                6
-            } else {
-                4
-            },
-            dst_addr: dst,
-            src_addr: dst.and_then(|d| get_source_addr_for_dest(d).ok()),
-            rt: results.rt,
-            res: results.status,
-            ver: results.ver,
-            hsize: results.header_size,
-            bsize: results.body_size,
-            header: raw::stored_headers(
-                results.response_headers.as_deref().unwrap_or(&[]),
-                self.config.store_headers,
-            ),
-            err: None,
-            dnserr: None,
-            done: true,
         })
     }
 }
@@ -215,6 +182,7 @@ mod tests {
             header: p.header,
             err: None,
             dnserr: None,
+            refused: false,
             done: true,
         };
         let body = result_body(13027, 1791860335, &out);
@@ -258,74 +226,25 @@ mod tests {
         assert!(!body.contains("\"rt\""), "{body}");
     }
 
-    /// An HTTP server on `listener` that answers every request with `body`.
-    fn serve(listener: tokio::net::TcpListener, body: &'static str) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    let mut buf = [0u8; 1024];
-                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => request.extend_from_slice(&buf[..n]),
-                        }
-                    }
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(reply.as_bytes()).await;
-                });
-            }
-        });
-    }
-
-    /// reqwest's fetch reports the address its connection went to, of the
-    /// family -4/-6 asked for, as httpget reports the address it connected
-    /// to (httpget.c:1980-1989): a server on 127.0.0.1 and one on ::1, the
-    /// same port, answer with bodies of different sizes. Starla looked the
-    /// host up again with a blocking getaddrinfo on the worker for
-    /// dst_addr, and reqwest connected over either family.
-    #[tokio::test]
-    async fn the_dst_addr_is_the_connections() {
-        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = v4.local_addr().unwrap().port();
-        let v6 = tokio::net::TcpListener::bind(("::1", port)).await.ok();
-        // The -6 case needs "localhost" to name ::1 as well; some hosts' files
-        // give it 127.0.0.1 only (aletheia's), and then -6 has no address.
-        let localhost_v6 = tokio::net::lookup_host(("localhost", port))
-            .await
-            .is_ok_and(|mut a| a.any(|a| a.is_ipv6()));
-        let mut cases = vec![(4, "127.0.0.1", 2)];
-        serve(v4, "v4");
-        if let Some(v6) = v6.filter(|_| localhost_v6) {
-            serve(v6, "v6v6");
-            cases.push((6, "::1", 4));
-        }
-        for (af, dst, bsize) in cases {
-            let http = Http {
-                config: HttpConfig {
-                    url: format!("http://localhost:{port}/"),
-                    method: "GET".into(),
-                    headers: None,
-                    body: None,
-                    timeout_ms: 5000,
-                    verify_ssl: true,
-                    version: None,
-                    af,
-                    store_headers: 0,
-                    http10: false,
-                },
-                probe_id: ProbeId(1018212),
-                msm_id: MeasurementId(12023),
-            };
-            let out = http.fetch_tls().await.unwrap();
-            assert_eq!(out.dst_addr, Some(dst.parse().unwrap()), "-{af}");
-            assert_eq!(out.af, af);
-            assert_eq!(out.bsize, bsize, "-{af}: the server that answered");
-            assert_eq!(out.src_addr, Some(dst.parse().unwrap()));
-        }
+    /// reporterr()'s TU_BAD_ADDR line, with the name's ttr in the envelope
+    /// (httpget.c:2073-2087, 872-876)
+    #[test]
+    fn a_refused_address_is_reported_as_httpget_reports_it() {
+        let out = raw::RawHttpOutcome {
+            ttr: Some(0.5),
+            af: 4,
+            dst_addr: Some("10.1.2.3".parse().unwrap()),
+            refused: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            result_body(12023, 1, &out),
+            format!(
+                "\"id\":\"12023\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1, \
+                 \"ttr\":0.500000, \"result\":[ {{ \"error\": \"address not allowed\", \
+                 \"dst_addr\":\"10.1.2.3\" }} ]",
+                starla_common::FIRMWARE_VERSION
+            )
+        );
     }
 }

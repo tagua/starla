@@ -19,6 +19,10 @@ pub const MAX_WAIT_SECS: i64 = 28 * 24 * 3600;
 /// (ATLAS_DEFAULT_WAIT), and after a controller's REFUSED.
 pub const DEFAULT_WAIT_SECS: i64 = 100;
 
+/// The reason the reference writes to force_reg.txt when the controller
+/// kicked us out from KEEP (ripe-atlas.in:221).
+pub const CON_KEEP_BROKEN: &str = "CON_KEEP_BROKEN";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RegState {
     /// The assigned controller (CONTROLLER_1_HOST / _PORT) and probe id.
@@ -78,8 +82,14 @@ impl RegState {
     }
 
     /// A registration server said WAIT (or answered something else).
+    ///
+    /// Its answer ends a forced registration: reginit removes force_reg.txt
+    /// once a registration server has answered at all (reginit.sh.in:161-163).
+    /// Kept, `forced` came before the wait in next_step, and a forced
+    /// registration told to wait registered again at once, and again.
     pub fn told_to_wait(&mut self, secs: i64, now: i64) {
         self.wait_until = Some(now + clamp_wait(secs));
+        self.forced = None;
     }
 
     /// A controller said REFUSED: drop the assignment, register again.
@@ -87,6 +97,17 @@ impl RegState {
         self.controller = None;
         self.rereg_at = None;
         self.forced = Some(reason.to_string());
+    }
+
+    /// The controller kicked us out from KEEP: it wrote on the KEEP channel
+    /// ([`KeepRefused`](crate::KeepRefused)). The reference's main loop,
+    /// finding con_keep_reply.vol non-empty, kills ssh and writes
+    /// REASON=CON_KEEP_BROKEN to force_reg.txt (ripe-atlas.in:217-226);
+    /// reginit then drops con_init_conf.txt and registers with R=FORCE_REG
+    /// (reginit.sh.in:56-60), and a controller INIT gives a new SESSION_ID.
+    /// KEEP again on the old session is refused each time.
+    pub fn kicked_out(&mut self) {
+        self.refused(CON_KEEP_BROKEN);
     }
 
     /// Read the saved state; a missing or unreadable file is no state (a
@@ -227,6 +248,47 @@ mod tests {
         let saved = RegState::parse(&st.render());
         assert_eq!(saved.next_step(NOW + 1), RegStep::Register("FORCE_REG"));
         assert_eq!(saved.controller, None);
+    }
+
+    #[test]
+    fn a_kick_from_keep_forces_a_registration_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("starla-reg-kick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("con_init_conf.txt");
+
+        let mut st = RegState::default();
+        st.registered(&ctr(Some(86_400)), NOW);
+        assert!(matches!(st.next_step(NOW + 1), RegStep::Cached(_)));
+        st.kicked_out();
+        assert_eq!(st.next_step(NOW + 1), RegStep::Register("FORCE_REG"));
+        assert_eq!(st.controller, None, "reginit drops con_init_conf.txt");
+        assert_eq!(st.forced.as_deref(), Some(CON_KEEP_BROKEN));
+
+        st.save(&path).unwrap();
+        let back = RegState::load(&path);
+        assert_eq!(back, st);
+        assert_eq!(back.next_step(NOW + 1), RegStep::Register("FORCE_REG"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // the registration that follows ends it
+        let mut back = back;
+        back.registered(&ctr(Some(86_400)), NOW + 2);
+        assert_eq!(back.forced, None);
+        assert!(matches!(back.next_step(NOW + 3), RegStep::Cached(_)));
+    }
+
+    /// reginit removes force_reg.txt once a registration server answers:
+    /// a forced registration told to wait waits, then registers WAIT_OVER,
+    /// rather than registering again at once.
+    #[test]
+    fn a_forced_registration_told_to_wait_waits() {
+        let mut st = RegState::default();
+        st.kicked_out();
+        st.told_to_wait(300, NOW);
+        assert_eq!(st.forced, None);
+        let saved = RegState::parse(&st.render());
+        assert_eq!(saved.next_step(NOW + 1), RegStep::WaitUntil(NOW + 300));
+        assert_eq!(saved.next_step(NOW + 300), RegStep::Register("WAIT_OVER"));
     }
 
     #[test]

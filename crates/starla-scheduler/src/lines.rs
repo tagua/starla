@@ -144,9 +144,13 @@ pub(crate) struct Lines {
 
 impl Lines {
     /// A job scheduled on its own replaces the one with its msm id, and
-    /// starts afresh: the first slot after `now`.
+    /// starts afresh: the first slot after `now`. The one replaced has
+    /// gone, as a crontab line a push leaves out has: a run of it taken and
+    /// still sleeping to its microseconds does not start ([`LineGone`]).
     pub(crate) fn schedule(&mut self, job: MeasurementJob, now: Now) {
-        self.lines.insert(LineKey::Own(job.msm_id), start(job, now));
+        if let Some(old) = self.lines.insert(LineKey::Own(job.msm_id), start(job, now)) {
+            old.gone.set();
+        }
         self.changed = true;
     }
 
@@ -260,9 +264,12 @@ impl Lines {
 
     /// The lines whose timers fire at `now`, each as RunJob takes it
     /// (eperd.c:1245-1339, ScheduledTask::fire): the jobs to run, each line
-    /// once, its next cycle drawn; and the records of the lines found more
-    /// than 10 s off their time, which do not run and wait for their first
-    /// slot after now. A host back from a suspend gives one record for each
+    /// once, its next cycle drawn; and the records of eperd's lines
+    /// (crons/7) found more than 10 s off their time, which do not run and
+    /// wait for their first slot after now. Another crontab's lines are
+    /// perd's (crons/main; crons/2 no daemon of 5130's reads, and its lines
+    /// run as perd's would): they run by the wall clock, however late, and
+    /// give no record ([`ScheduledTask::fire_perd`]). A host back from a suspend gives one record for each
     /// line whose time passed meanwhile, and no burst of runs; a wall clock
     /// stepped back by more than 10 s, one for each line as its monotonic
     /// wait runs out, and runs on the clock as it now is.
@@ -304,7 +311,10 @@ impl Lines {
         let changed = &mut self.changed;
         self.lines.retain(|key, task| {
             let start = task.start();
-            let fire = task.fire(now);
+            let fire = match key {
+                LineKey::Crontab { file, .. } if &**file != EPERD_CRONTAB => task.fire_perd(now),
+                _ => task.fire(now),
+            };
             if fire == Fired::NotYet {
                 return true;
             }
@@ -591,6 +601,7 @@ mod tests {
         for now in from.wall..=to {
             let due = lines.take_due(Now {
                 wall: now,
+                usec: 0,
                 mono: from.mono + std::time::Duration::from_secs((now - from.wall) as u64),
             });
             ran.extend(due.jobs.into_iter().map(|job| (now, job)));
@@ -1096,6 +1107,28 @@ mod tests {
         assert!(gone.is_set());
     }
 
+    /// A job of Starla's own scheduled again replaces its line, and the
+    /// run the old line had taken does not start: the replaced line has
+    /// gone, as DeleteFile takes a line with its timer. Its new line starts
+    /// on the first slot after now.
+    #[test]
+    fn a_run_of_a_replaced_job_of_its_own_does_not_start() {
+        let slot = 1_791_836_412;
+        let mut lines = Lines::default();
+        let job = || ping_line(7, 900, 312, 2_000_000_000, 0, "192.0.2.7").job;
+        lines.schedule(job(), at(slot - 400));
+        let due = lines.take_due(at(slot));
+        assert_eq!(due.jobs.len(), 1);
+        let gone = due.gone[0].clone();
+        assert!(!gone.is_set());
+
+        lines.schedule(job(), at(slot));
+        assert!(gone.is_set());
+        assert_eq!(lines.len(), 1);
+        assert!(lines.take_due(at(slot)).jobs.is_empty());
+        assert_eq!(lines.take_due(at(slot + 900)).jobs.len(), 1);
+    }
+
     /// RunJob runs a line whose timer fires within 10 s of its time; from
     /// 11 s on it runs nothing, appends its "inconsistent time" record and
     /// draws the first cycle after now (eperd.c:1268-1310). Starla ran any
@@ -1129,7 +1162,7 @@ mod tests {
             vec![InconsistentRecord {
                 body: "\"id\":\"9807\", \"fw\":5130, \"mver\": \"2.6.4\", \"time\":1791836423, \
                        \"reason\": \"inconsistent time; now 1791836423; nexttime 1791836412; \
-                       waittime 399; cycle 1990929; generated 1791836012\", \"cmd\": \"evping -4 \
+                       waittime 400; cycle 1990929; generated 1791836012\", \"cmd\": \"evping -4 \
                        -c 3 -A \\\"1001\\\" -O /home/atlas/data/new/7 193.0.14.129\""
                     .into(),
             }]
@@ -1149,6 +1182,83 @@ mod tests {
             let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
             assert_eq!(ran, vec![next, next + 900], "{late} s late");
         }
+    }
+
+    /// perd, which runs crons/main, has no 10 s rule: a late line runs,
+    /// with a log line only, and no record (perd.c:1226-1248). Starla gave
+    /// every crontab's lines eperd's rule and record. The line then goes on
+    /// from its first slot after now.
+    #[test]
+    fn a_late_line_of_perds_crontab_runs_and_gives_no_record() {
+        let slot = 1_791_836_412;
+        let line = ping_line(1001, 900, 312, 2_000_000_000, 0, "193.0.14.129");
+        for late in [11, 60, 899, 3_600 * 5 + 7] {
+            let mut lines = Lines::default();
+            lines.synchronize(
+                crontab(CRONS_MAIN, std::slice::from_ref(&line)),
+                at(slot - 400),
+            );
+            let due = lines.take_due(at(slot + late));
+            assert_eq!(due.jobs.len(), 1, "{late} s late");
+            assert!(due.inconsistent.is_empty(), "{late} s late");
+            let next = slot + (late / 900 + 1) * 900;
+            let (ran, records) = ticks(&mut lines, slot + late + 1, next + 900);
+            let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+            assert_eq!(ran, vec![next, next + 900], "{late} s late");
+            assert!(records.is_empty(), "{records:?}");
+        }
+
+        // Its time and its end time both passed meanwhile: perd runs a
+        // line only up to its end time (perd.c:814-818)
+        let ending = ping_line(1001, 900, 312, slot + 30, 0, "193.0.14.129");
+        let mut lines = Lines::default();
+        lines.synchronize(crontab(CRONS_MAIN, &[ending]), at(slot - 400));
+        let due = lines.take_due(at(slot + 60));
+        assert!(due.jobs.is_empty() && due.inconsistent.is_empty());
+    }
+
+    /// perd's timer is the wall clock: stepped back by less than 10
+    /// intervals, a crons/main line waits for its slot by the clock as it
+    /// now is, where eperd's monotonic wait fires and draws a cycle afresh;
+    /// by more, perd starts the line over and runs it at once
+    /// (perd.c:783-791, 814-818).
+    #[test]
+    fn a_line_of_perds_crontab_keeps_its_slot_by_the_wall_clock() {
+        let slot = 1_791_836_412;
+        let line = ping_line(1001, 900, 312, 2_000_000_000, 0, "193.0.14.129");
+        let loaded = || {
+            let mut lines = Lines::default();
+            lines.synchronize(
+                crontab(CRONS_MAIN, std::slice::from_ref(&line)),
+                at(slot - 400),
+            );
+            lines
+        };
+
+        // back 3 600 s, 4 intervals, a second on
+        let mut lines = loaded();
+        let stepped = Now {
+            wall: slot - 3_700,
+            usec: 0,
+            mono: at(slot - 99).mono,
+        };
+        let (ran, records) = ticks_from(&mut lines, stepped, slot + 900);
+        let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(ran, vec![slot, slot + 900], "its own slot, then on");
+        assert!(records.is_empty(), "{records:?}");
+
+        // back 11 intervals: at once, then the first slot after now
+        let mut lines = loaded();
+        let back = slot - 400 - 11 * 900;
+        let stepped = Now {
+            wall: back,
+            usec: 0,
+            mono: at(slot - 399).mono,
+        };
+        let (ran, records) = ticks_from(&mut lines, stepped, back + 900);
+        let ran: Vec<i64> = ran.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(ran, vec![back, slot - 11 * 900], "{ran:?}");
+        assert!(records.is_empty(), "{records:?}");
     }
 
     /// The workstation slept under the twin (wire comparison 2026-10-13,
@@ -1412,10 +1522,11 @@ mod tests {
         let (ran, records) = ticks(&mut lines, slot - 400, slot - 100);
         assert!(ran.is_empty() && records.is_empty());
         // A second on, the wall clock steps back 3601 s; the monotonic clock
-        // goes on. The timer's wait runs out at slot - 3601 by the stepped
-        // clock: 399 s from slot - 400 (and the second into it).
+        // goes on. The timer's wait, 400 s from slot - 400, runs out at
+        // slot - 3601 by the stepped clock.
         let stepped = Now {
             wall: slot - 3_700,
+            usec: 0,
             mono: at(slot - 99).mono,
         };
         let (ran, records) = ticks_from(&mut lines, stepped, slot - 1);
@@ -1424,7 +1535,7 @@ mod tests {
             vec![record(
                 slot - 3_601,
                 slot,
-                399,
+                400,
                 1_990_929,
                 slot - 400,
                 &line
@@ -1446,6 +1557,7 @@ mod tests {
             );
             let stepped = Now {
                 wall: slot - 100 - step,
+                usec: 0,
                 mono: at(slot - 100).mono,
             };
             let (ran, records) = ticks_from(&mut lines, stepped, slot - step);
@@ -1457,7 +1569,7 @@ mod tests {
                 assert!(ran.is_empty(), "stepped back {step} s");
                 assert_eq!(
                     records,
-                    vec![record(slot - step, slot, 399, 1_990_929, slot - 400, &line)]
+                    vec![record(slot - step, slot, 400, 1_990_929, slot - 400, &line)]
                 );
             }
         }
