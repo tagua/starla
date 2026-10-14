@@ -7,9 +7,11 @@
 //! way printReply() decodes it, which is less than a library would.
 
 use super::DnsConfig;
+use crate::target::{self, LookupError, Resolver};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use starla_network::rxstamp::Arrival;
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -47,11 +49,36 @@ const EAI_FAIL: &str = "non-recoverable failure in name resolution";
 
 /// gai_strerror(EAI_NONAME) as glibc, musl and the BSDs word it: the
 /// system resolver's "no such name".
+#[cfg(test)]
 const SYSTEM_EAI_NONAME: [&str; 3] = [
     "Name or service not known",
     "Name does not resolve",
     "nodename nor servname provided, or not known",
 ];
+
+/// The local resolvers as [`refresh_local_resolvers`] last read them. The
+/// probe's background runtime reads /etc/resolv.conf every minute, as eperd's
+/// CheckUpdates checks it (eperd.c:690-708), so a `--resolv` run reads no file
+/// on the measurement runtime. tdig_start reads it at each run; a changed
+/// resolv.conf therefore takes up to a minute, as for the probe's own lookups.
+static LOCAL_RESOLVERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// Read /etc/resolv.conf's resolvers now and keep them for [`local_resolvers`].
+pub fn refresh_local_resolvers() -> Vec<String> {
+    let list = read_resolv_conf(Path::new(RESOLV_CONF));
+    *LOCAL_RESOLVERS.lock().unwrap_or_else(|e| e.into_inner()) = Some(list.clone());
+    list
+}
+
+/// The resolvers a `--resolv` run asks: those last read, or read now if
+/// nothing has read them yet.
+pub fn local_resolvers() -> Vec<String> {
+    let kept = LOCAL_RESOLVERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    kept.unwrap_or_else(refresh_local_resolvers)
+}
 
 /// The probe's resolvers, as get_local_resolvers() (eperd/readresolv.c:35)
 /// reads them: the token after `nameserver` on each line that starts with
@@ -395,36 +422,58 @@ fn interface_name(_index: u32) -> Option<String> {
 /// hints: `-6` asks for IPv6, `-4` (the default) for IPv4, and `-4 -6`,
 /// `-a` and `--resolv` for either. Never empty.
 ///
+/// An address literal of the family is taken as it is. A name is asked of
+/// the probe's resolvers by Starla's evdns ([`Resolver`], the hosts file
+/// first), on the runtime, as tdig_start() and tu_connect_to_name() ask
+/// DnsBase (evtdig.c:3223, tcputil.c:78): nothing bounds the lookup but
+/// evdns's own timeout and attempts from resolv.conf, and when they run
+/// out it fails as any other failure does. Starla asked the system
+/// resolver with getaddrinfo() on the blocking pool, unbounded: on enodia
+/// a name that does not resolve held a blocking thread for 18 to 20 s.
+/// `dns` is the resolver to ask, the probe's (Resolver::system) when None.
+///
 /// A failure is worded as evtdig words it, with evutil_gai_strerror()'s
 /// text for the only two answers evdns gives: EAI_NONAME for a name that
-/// does not exist, EAI_FAIL for anything else. RIPE stored both from
-/// firmware 5130 on 2026-10-13: `"rcz.ns.ua nodename nor servname provided,
-/// or not known"` (msm 218956432, probe 1017360) and `"ns1.criteo.com.
-/// non-recoverable failure in name resolution"` (msm 211294130, probe
-/// 1008241). The system resolver's own words ("Name or service not known")
-/// are not what the reference reports.
-async fn resolve(server: &str, port: u16, af: u8) -> Result<Vec<SocketAddr>, &'static str> {
-    let family = |a: &SocketAddr| match af {
-        4 => a.is_ipv4(),
-        6 => a.is_ipv6(),
-        _ => true,
-    };
-    match tokio::net::lookup_host((server, port)).await {
-        Ok(addrs) => {
-            let addrs: Vec<SocketAddr> = addrs.filter(family).collect();
-            if !addrs.is_empty() {
-                Ok(addrs)
-            } else if server.parse::<IpAddr>().is_ok() {
-                // A literal of the other family is no numeric host to evdns:
-                // it asks the DNS for it as a name, which has no such TLD
-                Err(EAI_NONAME)
-            } else {
-                // The name exists without an address of this family: the
-                // A/AAAA query comes back empty, DNS_ERR_NODATA, EAI_FAIL
-                Err(EAI_FAIL)
-            }
+/// does not exist, EAI_FAIL for anything else, a timeout included. RIPE
+/// stored both from firmware 5130 on 2026-10-13: `"rcz.ns.ua nodename nor
+/// servname provided, or not known"` (msm 218956432, probe 1017360) and
+/// `"ns1.criteo.com. non-recoverable failure in name resolution"` (msm
+/// 211294130, probe 1008241). The system resolver's own words ("Name or
+/// service not known") are not what the reference reports.
+async fn resolve(
+    dns: Option<&Resolver>,
+    server: &str,
+    port: u16,
+    af: u8,
+) -> Result<Vec<SocketAddr>, &'static str> {
+    if let Some(addr) = target::literal(server, port, af) {
+        return Ok(vec![addr]);
+    }
+    if target::literal(server, port, 0).is_some() {
+        // A literal of the other family is no numeric host to evdns: it
+        // asks the DNS for it as a name, which has no such TLD
+        return Err(EAI_NONAME);
+    }
+    let system;
+    let dns = match dns {
+        Some(dns) => dns,
+        None => {
+            system = Resolver::system();
+            &system
         }
-        Err(e) => Err(evdns_error(&e)),
+    };
+    match dns.addresses(server, af).await {
+        Ok(addrs) => Ok(addrs
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()),
+        Err(LookupError::NoName) => Err(EAI_NONAME),
+        // The name exists without an address of this family: the A/AAAA
+        // query comes back empty, DNS_ERR_NODATA, EAI_FAIL. A hosts file
+        // entry without one is evdns's empty answer, which
+        // tdig_send_query_callback() would read through a null pointer:
+        // EAI_FAIL too, as Starla reported it.
+        Err(LookupError::Fail | LookupError::NoAddress) => Err(EAI_FAIL),
     }
 }
 
@@ -433,7 +482,11 @@ pub(crate) fn getaddrinfo_failed(server: &str, why: &str) -> String {
     format!("\"evdns_getaddrinfo\": \"{server} {why}\"")
 }
 
-/// What evdns would have answered where the system resolver failed with `e`.
+/// What evdns would have answered where the system resolver failed with
+/// `e`: the words Starla gave a server's failed getaddrinfo() before it
+/// asked its own evdns, which the tests of RIPE's lines still word their
+/// failures with.
+#[cfg(test)]
 pub(crate) fn evdns_error(e: &std::io::Error) -> &'static str {
     let text = e.to_string();
     if SYSTEM_EAI_NONAME.iter().any(|t| text.contains(t)) {
@@ -506,14 +559,28 @@ fn ask_for_ttl(_socket: &UdpSocket, _v6: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `kernel_rx_timestamps`: have the kernel stamp each reply's arrival
+/// ([`starla_network::rxstamp`]). Linux only; elsewhere nothing is asked.
+#[cfg(unix)]
+fn ask_for_stamps(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    if let Err(e) = starla_network::rxstamp::enable(socket.as_raw_fd()) {
+        tracing::debug!("dns: no receive stamps from the kernel: {}", e);
+    }
+}
+
+#[cfg(not(unix))]
+fn ask_for_stamps(_socket: &UdpSocket) {}
+
 /// recv() with the TTL or hop limit [`ask_for_ttl`] asked for, read from
 /// the control messages as process_reply() reads them (evtdig.c:1986):
 /// IP_TTL / IPV6_HOPLIMIT, an int (Linux), or IP_RECVTTL, one byte (the
-/// BSDs and macOS). None when there is none.
+/// BSDs and macOS); and the kernel's receive stamp [`ask_for_stamps`]
+/// asked for. None for each that is not there.
 async fn recv_with_ttl(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> std::io::Result<(usize, Option<i32>)> {
+) -> std::io::Result<(usize, Option<i32>, Option<Duration>)> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -524,12 +591,15 @@ async fn recv_with_ttl(
     }
     #[cfg(not(unix))]
     {
-        socket.recv(buf).await.map(|n| (n, None))
+        socket.recv(buf).await.map(|n| (n, None, None))
     }
 }
 
 #[cfg(unix)]
-fn recvmsg_ttl(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<(usize, Option<i32>)> {
+fn recvmsg_ttl(
+    fd: std::os::fd::RawFd,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<i32>, Option<Duration>)> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
@@ -547,7 +617,7 @@ fn recvmsg_ttl(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<(usize
     if n < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let mut ttl = None;
+    let (mut ttl, mut stamp) = (None, None);
     // SAFETY: the CMSG_* walk stays within msg_controllen, which recvmsg()
     // set; each header is read only after CMSG_FIRSTHDR/NXTHDR vouched for it
     unsafe {
@@ -570,11 +640,17 @@ fn recvmsg_ttl(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<(usize
                 } else {
                     ttl
                 };
+            } else if hdr.cmsg_level == libc::SOL_SOCKET {
+                let data = libc::CMSG_DATA(cmsg);
+                let len = (hdr.cmsg_len as usize).saturating_sub(data as usize - cmsg as usize);
+                let data = std::slice::from_raw_parts(data, len);
+                stamp = starla_network::rxstamp::from_cmsg(hdr.cmsg_level, hdr.cmsg_type, data)
+                    .or(stamp);
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
-    Ok((n as usize, ttl))
+    Ok((n as usize, ttl, stamp))
 }
 
 /// One UDP query, as tdig_send_query_callback() and ready_callback() make
@@ -593,10 +669,22 @@ fn recvmsg_ttl(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<(usize
 /// Except with `--resolv`, an address atlas_check_addr() refuses gets no
 /// query: `"reason" : "address not allowed"` with that address
 /// (evtdig.c:1358-1375).
-pub async fn udp_attempt(cfg: &DnsConfig, server: &str, name: &str, probe_id: i64) -> Attempt {
+///
+/// A server name is looked up with `dns` (see [`resolve`]).
+///
+/// With `kernel_rx_timestamps` on, `rt` runs to the kernel's stamp of the
+/// reply's arrival ([`starla_network::rxstamp`]).
+pub async fn udp_attempt(
+    cfg: &DnsConfig,
+    dns: Option<&Resolver>,
+    server: &str,
+    name: &str,
+    probe_id: i64,
+) -> Attempt {
     let time = unix_now();
-    match resolve(server, cfg.port, family(cfg)).await {
-        Ok(addrs) => udp_query(cfg, server, &addrs, name, probe_id).await,
+    let kernel_rx = starla_network::rxstamp::enabled();
+    match resolve(dns, server, cfg.port, family(cfg)).await {
+        Ok(addrs) => udp_query(cfg, server, &addrs, name, probe_id, kernel_rx).await,
         Err(msg) => {
             let text = getaddrinfo_failed(server, msg);
             Attempt::failed(time, Dst::Name(server.into()), None, text, false)
@@ -604,13 +692,15 @@ pub async fn udp_attempt(cfg: &DnsConfig, server: &str, name: &str, probe_id: i6
     }
 }
 
-/// [`udp_attempt`] once `server` has resolved to `addrs` (at least one).
+/// [`udp_attempt`] once `server` has resolved to `addrs` (at least one),
+/// with the kernel's receive stamps or without.
 pub(crate) async fn udp_query(
     cfg: &DnsConfig,
     server: &str,
     addrs: &[SocketAddr],
     name: &str,
     probe_id: i64,
+    kernel_rx: bool,
 ) -> Attempt {
     let time = unix_now();
     // What printReply() would find if it stopped here
@@ -646,6 +736,9 @@ pub(crate) async fn udp_query(
         if cfg.ttl {
             // As the reference, whatever setsockopt() says (evtdig.c:1320)
             let _ = ask_for_ttl(&socket, addr.is_ipv6());
+        }
+        if kernel_rx {
+            ask_for_stamps(&socket);
         }
         if !cfg.resolv && !address_allowed(&addr, cfg) {
             // "Trigger printing of dst_addr" (evtdig.c:1371)
@@ -721,10 +814,10 @@ pub(crate) async fn udp_query(
     let mut buf = vec![0u8; MAX_DNS_BUF_SIZE];
     let (outcome, ttl) = loop {
         let recv = async {
-            if cfg.ttl {
+            if cfg.ttl || kernel_rx {
                 recv_with_ttl(&socket, &mut buf).await
             } else {
-                socket.recv(&mut buf).await.map(|n| (n, None))
+                socket.recv(&mut buf).await.map(|n| (n, None, None))
             }
         };
         match timeout_at(deadline, recv).await {
@@ -732,11 +825,16 @@ pub(crate) async fn udp_query(
             // recvfail: an ICMP error on the connected socket, say
             Ok(Err(_)) => continue,
             // shortpkt, and martian (someone else's id)
-            Ok(Ok((n, _))) if n < DNS_HEADER || buf[..2] != id.to_be_bytes() => continue,
-            Ok(Ok((n, ttl))) => {
+            Ok(Ok((n, ..))) if n < DNS_HEADER || buf[..2] != id.to_be_bytes() => continue,
+            Ok(Ok((n, ttl, stamp))) => {
+                let at = Arrival {
+                    user: Instant::now(),
+                    kernel: stamp
+                        .and_then(|stamp| starla_network::rxstamp::monotonic(stamp, Instant::now)),
+                };
                 let reply = Outcome::Reply {
                     wire: buf[..n].to_vec(),
-                    rt: start.elapsed().as_secs_f64() * 1000.0,
+                    rt: at.after(start).duration_since(start).as_secs_f64() * 1000.0,
                     qt: None,
                 };
                 break (reply, ttl);
@@ -761,9 +859,18 @@ pub(crate) async fn udp_query(
 /// refuses is not connected to, `--resolv` or not (tcputil.c:262): it is
 /// reported as `"TU_BAD_ADDR" : true` with that address, and tcp_reporterr()
 /// asks again while `--retry` allows (evtdig.c:1612).
-pub async fn tcp_attempt(cfg: &DnsConfig, server: &str, name: &str, probe_id: i64) -> Attempt {
+///
+/// A server name is looked up with `dns` (see [`resolve`]); a failure is
+/// tcp_reporterr()'s `"TUDNS"`.
+pub async fn tcp_attempt(
+    cfg: &DnsConfig,
+    dns: Option<&Resolver>,
+    server: &str,
+    name: &str,
+    probe_id: i64,
+) -> Attempt {
     let time = unix_now();
-    let addr = match resolve(server, cfg.port, family(cfg)).await {
+    let addr = match resolve(dns, server, cfg.port, family(cfg)).await {
         Ok(a) => a[0],
         Err(msg) => {
             let text = format!(" \"TUDNS\" : \"{msg}\"");
@@ -1402,6 +1509,12 @@ mod tests {
             vec!["172.30.74.20", "2001:db8:7769:6e00::20", "10.0.0.3"]
         );
         assert!(read_resolv_conf(&dir.join("missing")).is_empty());
+
+        // A --resolv run takes the list last read: set it, and nothing reads
+        // the file again until the next refresh
+        *LOCAL_RESOLVERS.lock().unwrap() = Some(vec!["192.0.2.53".into()]);
+        assert_eq!(local_resolvers(), ["192.0.2.53"]);
+        *LOCAL_RESOLVERS.lock().unwrap() = None;
         std::fs::remove_dir_all(&dir).ok();
     }
 

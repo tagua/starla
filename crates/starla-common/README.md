@@ -16,16 +16,20 @@ Common types and utilities shared across all Starla components.
 use starla_common::{ProbeId, MeasurementId, config_dir, state_dir};
 use starla_common::logging::{LogConfig, init_logging};
 
-// Initialize logging (stdout with info level by default)
-init_logging(LogConfig::default()).unwrap();
+// Initialize logging (stdout with info level by default). Hold the guard
+// it returns for the life of the process: the log is written by a thread
+// of its own, and dropping the guard stops it -- every line logged after
+// that is lost.
+let _log = init_logging(LogConfig::default())?;
 
-// Or with custom configuration
+// Or with custom configuration (once per process: it installs the global
+// subscriber)
 let log_config = LogConfig {
     log_dir: Some("/var/log/starla".into()),
     level: "debug".to_string(),
     json_format: false,
 };
-init_logging(log_config).unwrap();
+let _log = init_logging(log_config)?;
 
 // Access configuration and state directories
 let config = config_dir();  // ~/.config/starla or $XDG_CONFIG_HOME/starla

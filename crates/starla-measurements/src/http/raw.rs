@@ -9,6 +9,7 @@
 //! not kept), and it ignored `-4`/`-6` when resolving. So this client speaks
 //! HTTP/1.x itself and reports exactly what httpget reports.
 
+use crate::target::{self, Resolver};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -109,12 +110,15 @@ pub struct RawHttpOutcome {
     pub header: Option<Vec<String>>,
     /// httpget's "err" text, when the fetch failed after resolution
     pub err: Option<String>,
+    /// The lookup's failure, evutil_gai_strerror()'s words: reporterr()'s
+    /// TU_DNS_ERR, `{ "dnserr":"…" }` and nothing else in the result
+    /// (httpget.c:2038-2043)
+    pub dnserr: Option<String>,
     /// The response was read to the end (httpget's READ_DONE)
     pub done: bool,
 }
 
-/// Fetch `url` as evhttpget does. `af` is 4, 6, or 0 for either; resolution
-/// failure is an error (no result), as Starla treated it before.
+/// Fetch `url` as evhttpget does. `af` is 4, 6, or 0 for either.
 pub async fn fetch(
     url: &HttpUrl,
     af: u8,
@@ -122,25 +126,47 @@ pub async fn fetch(
     store_headers: usize,
     timeout: Duration,
 ) -> anyhow::Result<RawHttpOutcome> {
-    let (dst, ttr) = match url.host.parse::<IpAddr>() {
-        Ok(ip) => (SocketAddr::new(ip, url.port), None),
-        Err(_) => {
-            let t0 = Instant::now();
-            let addrs = tokio::time::timeout(
-                timeout,
-                tokio::net::lookup_host((url.host.as_str(), url.port)),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("dns timeout for {}", url.host))??;
-            let dst = addrs
-                .into_iter()
-                .find(|a| match af {
-                    4 => a.is_ipv4(),
-                    6 => a.is_ipv6(),
-                    _ => true,
-                })
-                .ok_or_else(|| anyhow::anyhow!("no IPv{af} address for {}", url.host))?;
-            (dst, Some(t0.elapsed().as_secs_f64() * 1000.0))
+    fetch_via(None, url, af, http10, store_headers, timeout).await
+}
+
+/// [`fetch`], a host name looked up with `dns`, the probe's resolver when
+/// None.
+///
+/// An address literal is fetched from as it is, with no ttr. A name is
+/// looked up as tu_connect_to_name() looks it up (tcputil.c:78): by
+/// Starla's evdns, on the runtime, the family `af` asks for, with no bound
+/// but evdns's own timeout and attempts (the fetch's timer is set once
+/// there is an address). A failure is reported as reporterr() reports
+/// TU_DNS_ERR, with the lookup's ttr. Starla asked the system resolver
+/// with getaddrinfo() on the blocking pool, cut off at the fetch's
+/// timeout, and reported nothing when it failed.
+async fn fetch_via(
+    dns: Option<&Resolver>,
+    url: &HttpUrl,
+    af: u8,
+    http10: bool,
+    store_headers: usize,
+    timeout: Duration,
+) -> anyhow::Result<RawHttpOutcome> {
+    let (dst, ttr) = match target::literal(&url.host, url.port, 0) {
+        Some(dst) => (dst, None),
+        None => {
+            let lookup = match dns {
+                Some(dns) => dns.lookup(&url.host, af).await,
+                None => target::lookup(&url.host, af).await,
+            };
+            let ttr = lookup.dst_name.ttr;
+            match lookup.addr {
+                Ok(ip) => (SocketAddr::new(ip, url.port), ttr),
+                Err(e) => {
+                    return Ok(RawHttpOutcome {
+                        ttr,
+                        af: if af == 6 { 6 } else { 4 },
+                        dnserr: Some(e.to_string()),
+                        ..Default::default()
+                    })
+                }
+            }
         }
     };
 
@@ -505,6 +531,74 @@ mod tests {
         assert_eq!(out.header.unwrap()[0], "X-Client-IP: 127.0.0.1");
         assert_eq!(out.src_addr, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(out.ttr, None, "a literal host is not resolved");
+    }
+
+    /// A host name is looked up as tu_connect_to_name() looks it up, by
+    /// Starla's evdns with the family -4/-6 asks for (tcputil.c:78), and a
+    /// failure is reporterr()'s TU_DNS_ERR: `"dnserr"` alone in the result,
+    /// the lookup's ttr beside it (httpget.c:2038-2043, 862-866). A
+    /// resolver that never answers ends the lookup when evdns's timeout and
+    /// attempts run out. Starla's getaddrinfo() on the blocking pool held a
+    /// thread until the system resolver gave up, and a failure reported
+    /// nothing.
+    #[tokio::test]
+    async fn a_host_name_is_looked_up_as_tu_connect_to_name_looks_it_up() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = server.accept().await.unwrap();
+            let mut req = vec![0u8; 512];
+            let _ = s.read(&mut req).await.unwrap();
+            s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let (dns, mut asked) = target::local_resolver(
+            Some(|name| (name == "echo.example").then(|| IpAddr::from([127, 0, 0, 1]))),
+            Duration::from_secs(2),
+            1,
+        )
+        .await;
+        let fetch = |url: String, dns| async move {
+            let url = parse_http_url(&url).unwrap();
+            fetch_via(Some(dns), &url, 4, false, 0, Duration::from_secs(5))
+                .await
+                .unwrap()
+        };
+        let out = fetch(format!("http://echo.example:{port}/"), &dns).await;
+        assert!(out.done && out.dnserr.is_none(), "{out:?}");
+        assert_eq!(out.dst_addr, Some(IpAddr::from([127, 0, 0, 1])));
+        assert!(out.ttr.is_some(), "a name has its ttr");
+        assert_eq!(
+            asked.try_recv().unwrap(),
+            ("echo.example".into(), hickory_proto::rr::RecordType::A)
+        );
+
+        let out = fetch(format!("http://nx.example:{port}/"), &dns).await;
+        let ttr = out.ttr.expect("a failed lookup has its ttr too");
+        let body = crate::http::result_body(12023, 1, &out);
+        assert_eq!(
+            body,
+            format!(
+                "\"id\":\"12023\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1, \
+                 \"ttr\":{ttr:.6}, \"result\":[ {{ \"dnserr\":\"nodename nor servname provided, \
+                 or not known\" }} ]",
+                starla_common::FIRMWARE_VERSION
+            )
+        );
+
+        let (dns, _) = target::local_resolver(None, Duration::from_millis(200), 2).await;
+        let start = Instant::now();
+        let out = fetch(format!("http://echo.example:{port}/"), &dns).await;
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(400) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert_eq!(
+            out.dnserr.as_deref(),
+            Some("non-recoverable failure in name resolution")
+        );
     }
 
     /// The live echo server, the URLs of built-ins 12027 and 13027. Network,

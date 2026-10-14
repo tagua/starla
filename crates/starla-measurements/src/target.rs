@@ -160,7 +160,7 @@ pub struct Lookup {
 
 /// Look `target` up as eperd does for a measurement with `af` (4 for -4, 6
 /// for -6, anything else for neither), with the probe's resolv.conf and
-/// hosts file as they are now.
+/// hosts file as last read ([`Resolver::system`]).
 pub async fn lookup(target: &str, af: u8) -> Lookup {
     Resolver::system().lookup(target, af).await
 }
@@ -183,6 +183,10 @@ pub struct ResolvConf {
     /// How long after a server goes down it is probed, the first time
     /// (global_nameserver_probe_initial_timeout, `initial-probe-timeout:`)
     pub probe_timeout: Duration,
+    /// How long a lookup of either family waits for the other family's
+    /// answer once one has come (global_getaddrinfo_allow_skew,
+    /// `getaddrinfo-allow-skew:`)
+    pub getaddrinfo_allow_skew: Duration,
 }
 
 impl Default for ResolvConf {
@@ -197,6 +201,7 @@ impl Default for ResolvConf {
             randomize_case: true,
             max_timeouts: 3,
             probe_timeout: Duration::from_secs(10),
+            getaddrinfo_allow_skew: Duration::from_secs(3),
         }
     }
 }
@@ -345,6 +350,11 @@ impl ResolvConf {
                     self.probe_timeout = t.min(Duration::from_secs(3600));
                 }
             }
+            "getaddrinfo-allow-skew" => {
+                if let Some(t) = strtotimeval(val) {
+                    self.getaddrinfo_allow_skew = t;
+                }
+            }
             _ => {}
         }
     }
@@ -412,6 +422,34 @@ fn parse_nameserver(s: &str) -> Option<SocketAddr> {
         Some(zone) => zone_index(zone)?,
     };
     Some(SocketAddr::V6(SocketAddrV6::new(addr, port, 0, scope)))
+}
+
+/// `host` as evutil_getaddrinfo_common_ takes an address literal before
+/// evdns_getaddrinfo asks the DNS for anything (evutil.c:1063-1100): an
+/// IPv6 address when -6 or neither asked, with the `%zone` RIPE's libevent
+/// takes (evutil_inet_pton_scope, evutil.c:1993-2026), then an IPv4 one
+/// when -4 or neither, at `port`. None for anything else, which evdns
+/// looks up as a name, an address of the other family included.
+pub(crate) fn literal(host: &str, port: u16, af: u8) -> Option<SocketAddr> {
+    if af != 4 {
+        let (addr, zone) = match host.split_once('%') {
+            Some((addr, zone)) => (addr, Some(zone)),
+            None => (host, None),
+        };
+        if let Ok(addr) = addr.parse::<Ipv6Addr>() {
+            let scope = match zone {
+                None => 0,
+                Some(zone) => zone_index(zone)?,
+            };
+            return Some(SocketAddr::V6(SocketAddrV6::new(addr, port, 0, scope)));
+        }
+    }
+    if af != 6 {
+        if let Ok(addr) = host.parse::<Ipv4Addr>() {
+            return Some(SocketAddr::new(addr.into(), port));
+        }
+    }
+    None
 }
 
 /// An IPv6 zone: the interface of that name, else a number (strtoul up to
@@ -992,6 +1030,16 @@ async fn probe(base: Weak<Base>, server: Arc<NameServer>, generation: u64) {
     }
 }
 
+/// The probe's resolver as [`Resolver::read_system`] last read it.
+static SYSTEM: Mutex<Option<Resolver>> = Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`Resolver::read_system`] has read the files on this
+    /// thread: other tests' threads count their own.
+    static SYSTEM_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// evdns, set up as eperd sets it up.
 #[derive(Debug, Clone)]
 pub struct Resolver {
@@ -1018,24 +1066,38 @@ impl Resolver {
     }
 
     /// From the probe's resolv.conf (or Windows's servers) and hosts file
-    /// as they are now. The servers, their sockets and their up/down state
-    /// stay the same for as long as the configuration does, as eperd keeps
-    /// its evdns base until resolv.conf changes (check_resolv_conf,
-    /// eperd.c:647-689).
+    /// as [`Resolver::read_system`] last read them, which reads them here
+    /// only the first time. A lookup reads no file: it runs on the
+    /// measurement runtime, where nothing may block. The servers, their
+    /// sockets and their up/down state stay the same for as long as the
+    /// configuration does, as eperd keeps its evdns base until resolv.conf
+    /// changes (check_resolv_conf, eperd.c:647-689).
     pub fn system() -> Self {
-        static SYSTEM: Mutex<Option<Arc<Base>>> = Mutex::new(None);
+        if let Some(system) = lock(&SYSTEM).as_ref() {
+            return system.clone();
+        }
+        Self::read_system()
+    }
+
+    /// Reads resolv.conf and the hosts file anew, for [`Resolver::system`]:
+    /// blocking reads, for a thread that may block. The probe reads them at
+    /// start-up, then every minute from its background runtime, as eperd
+    /// checks resolv.conf every minute (CheckUpdates, eperd.c:386-392,
+    /// 690-708). A lookup used to read both itself, on a measurement
+    /// worker.
+    pub fn read_system() -> Self {
+        #[cfg(test)]
+        SYSTEM_READS.with(|reads| reads.set(reads.get() + 1));
         let conf = ResolvConf::system();
         let hosts = parse_hosts(&std::fs::read_to_string(hosts_path()).unwrap_or_default());
         let mut system = lock(&SYSTEM);
         let base = match system.as_ref() {
-            Some(base) if base.conf == conf => base.clone(),
-            _ => {
-                let base = Base::new(&conf);
-                *system = Some(base.clone());
-                base
-            }
+            Some(system) if system.conf == conf => system.base.clone(),
+            _ => Base::new(&conf),
         };
-        Self { conf, hosts, base }
+        let resolver = Self { conf, hosts, base };
+        *system = Some(resolver.clone());
+        resolver
     }
 
     pub async fn lookup(&self, target: &str, af: u8) -> Lookup {
@@ -1067,22 +1129,69 @@ impl Resolver {
 
     /// evdns_getaddrinfo (evdns.c:4741-4870), first address.
     async fn resolve(&self, name: &str, af: u8) -> Result<IpAddr, LookupError> {
+        let addrs = self.addresses(name, af).await?;
+        addrs.first().copied().ok_or(LookupError::Fail)
+    }
+
+    /// Every address evdns_getaddrinfo (evdns.c:4741-4870) hands its
+    /// callback for `name`, which is not an address literal: the hosts
+    /// file's of the family, in the file's order (an entry without one is
+    /// [`LookupError::NoAddress`]), else the A answer's, the AAAA answer's,
+    /// or for neither -4 nor -6 both ([`Resolver::either_family`]). Never
+    /// empty.
+    pub async fn addresses(&self, name: &str, af: u8) -> Result<Vec<IpAddr>, LookupError> {
         if let Some(found) = self.hosts_entry(name, af) {
-            return found.first().copied().ok_or(LookupError::NoAddress);
+            return match found.is_empty() {
+                true => Err(LookupError::NoAddress),
+                false => Ok(found),
+            };
         }
-        let addrs = match af {
+        match af {
             4 => self.resolve_type(name, RecordType::A).await,
             6 => self.resolve_type(name, RecordType::AAAA).await,
-            _ => {
-                // Both at once; the IPv4 answers first (evdns.c:4663-4669).
-                let (a, aaaa) = tokio::join!(
-                    self.resolve_type(name, RecordType::A),
-                    self.resolve_type(name, RecordType::AAAA)
-                );
-                a.or(aaaa)
+            _ => self.either_family(name).await,
+        }
+    }
+
+    /// Both families at once, as evdns_getaddrinfo_gotresolve takes them
+    /// (evdns.c:4495-4680). Once the first has finished, answer or error,
+    /// the other has `getaddrinfo_allow_skew` (3 s) to finish too
+    /// (evdns_getaddrinfo_set_timeout, :4483-4488); past that it is
+    /// cancelled, and the first's addresses or error are the lookup's
+    /// (evdns_getaddrinfo_timeout_cb, :4425-4478). When both finish: both
+    /// answers, the IPv4 addresses first (:4661-4669); one answer, its
+    /// addresses; two errors, the error of the one that finished last
+    /// (getaddrinfo_merge_err, :4394-4401, 4590-4594).
+    async fn either_family(&self, name: &str) -> Result<Vec<IpAddr>, LookupError> {
+        let a = self.resolve_type(name, RecordType::A);
+        let aaaa = self.resolve_type(name, RecordType::AAAA);
+        tokio::pin!(a, aaaa);
+        let (first_is_a, first) = tokio::select! {
+            biased;
+            first = &mut a => (true, first),
+            first = &mut aaaa => (false, first),
+        };
+        let other = async {
+            match first_is_a {
+                true => aaaa.await,
+                false => a.await,
             }
-        }?;
-        addrs.first().copied().ok_or(LookupError::Fail)
+        };
+        let Ok(second) = tokio::time::timeout(self.conf.getaddrinfo_allow_skew, other).await else {
+            return first;
+        };
+        match (first, second) {
+            (Ok(first), Ok(second)) => {
+                let (mut v4, v6) = match first_is_a {
+                    true => (first, second),
+                    false => (second, first),
+                };
+                v4.extend(v6);
+                Ok(v4)
+            }
+            (Ok(addrs), Err(_)) | (Err(_), Ok(addrs)) => Ok(addrs),
+            (Err(_), Err(last)) => Err(last),
+        }
     }
 
     /// evdns_getaddrinfo_fromhosts (evdns.c:4701-4738): None when the hosts
@@ -1138,6 +1247,55 @@ impl Resolver {
         }
         Err(error)
     }
+}
+
+/// The probe's resolver on a local socket, for a test: Starla's evdns set
+/// up with it alone, `timeout` and `attempts`. Each A or AAAA question it
+/// gets is handed over, its name in lower case without the final dot, and
+/// `answer` says what comes back for that name: Some address for an
+/// answer, None for NXDOMAIN. Without `answer` it never replies.
+#[cfg(test)]
+pub(crate) async fn local_resolver(
+    answer: Option<fn(&str) -> Option<IpAddr>>,
+    timeout: Duration,
+    attempts: u32,
+) -> (Resolver, mpsc::UnboundedReceiver<(String, RecordType)>) {
+    use hickory_proto::rr::rdata::{A, AAAA};
+    use hickory_proto::rr::Record;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let conf = ResolvConf {
+        nameservers: vec![socket.local_addr().unwrap()],
+        timeout,
+        attempts,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let q = query.queries[0].clone();
+            let name = q.name().to_ascii().to_lowercase();
+            let name = name.trim_end_matches('.').to_string();
+            let _ = tx.send((name.clone(), q.query_type()));
+            let Some(answer) = answer else { continue };
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.metadata.recursion_desired = true;
+            reply.add_query(q.clone());
+            match answer(&name) {
+                None => reply.metadata.response_code = 3.into(),
+                Some(addr) => {
+                    let rdata = match addr {
+                        IpAddr::V4(v4) => RData::A(A(v4)),
+                        IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+                    };
+                    reply.add_answer(Record::from_rdata(q.name().clone(), 60, rdata));
+                }
+            }
+            let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
+        }
+    });
+    (Resolver::new(conf, Vec::new()), rx)
 }
 
 #[cfg(test)]
@@ -1529,6 +1687,11 @@ mod tests {
         // strtoint_clipped(1, 255); at most an hour
         assert_eq!(conf.max_timeouts, 255);
         assert_eq!(conf.probe_timeout, Duration::from_secs(3600));
+        assert_eq!(conf.getaddrinfo_allow_skew, Duration::from_secs(3));
+        assert_eq!(
+            ResolvConf::parse("options getaddrinfo-allow-skew:0.5", None).getaddrinfo_allow_skew,
+            Duration::from_millis(500)
+        );
 
         // nothing: 127.0.0.1, evdns's defaults, the host name's domain
         let conf = ResolvConf::parse("", Some("probe.lan.example"));
@@ -1539,6 +1702,127 @@ mod tests {
         assert_eq!(conf.probe_timeout, Duration::from_secs(10));
         assert!(ResolvConf::parse("", Some("aletheia")).search.is_empty());
         assert!(!ResolvConf::parse("options randomize-case:0", None).randomize_case);
+    }
+
+    /// What a [`skewed_server`] does with one family's question: after
+    /// the delay, an answer, NXDOMAIN or NOERROR with no data; or nothing.
+    #[derive(Clone, Copy)]
+    enum Then {
+        Answer(u64),
+        NxDomain(u64),
+        NoData(u64),
+        Silent,
+    }
+
+    /// A resolver on a local socket that replies to A and AAAA questions
+    /// each as told, after its delay in ms.
+    async fn skewed_server(a: Then, aaaa: Then) -> SocketAddr {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let query = Message::from_vec(&buf[..n]).unwrap();
+                let then = match query.queries[0].query_type() {
+                    RecordType::A => a,
+                    _ => aaaa,
+                };
+                let (ms, reply) = match then {
+                    Then::Answer(ms) => (ms, answer_both(&query).unwrap()),
+                    Then::NxDomain(ms) => (ms, reply(&query, 3)),
+                    Then::NoData(ms) => (ms, reply(&query, 0)),
+                    Then::Silent => continue,
+                };
+                let socket = socket.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    let _ = socket.send_to(&reply.to_vec().unwrap(), from).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// An either-family lookup (neither -4 nor -6) through a server that
+    /// answers each family as told, with a 300 ms skew allowed and one 2 s
+    /// transmission per query; what it found and how long it took.
+    async fn either_family(a: Then, aaaa: Then) -> (Result<Vec<IpAddr>, LookupError>, Duration) {
+        let mut resolver = resolver(skewed_server(a, aaaa).await);
+        resolver.conf.getaddrinfo_allow_skew = Duration::from_millis(300);
+        resolver.conf.timeout = Duration::from_secs(2);
+        resolver.conf.attempts = 1;
+        let started = std::time::Instant::now();
+        let found = resolver.addresses("www.ripe.net", 0).await;
+        (found, started.elapsed())
+    }
+
+    /// Once one family has answered, evdns waits getaddrinfo_allow_skew for
+    /// the other, then reports the first alone (evdns.c:4425-4488). Starla
+    /// waited for both, a silent AAAA holding the run for its whole
+    /// timeout.
+    #[tokio::test]
+    async fn either_family_waits_the_skew_for_the_second_answer() {
+        let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 7).into();
+        let v6: IpAddr = "2001:db8::7".parse().unwrap();
+
+        let (found, took) = either_family(Then::Answer(0), Then::Silent).await;
+        assert_eq!(found, Ok(vec![v4]));
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_millis(1_500),
+            "{took:?}"
+        );
+
+        // In time: both, the IPv4 addresses first whichever came first
+        let (found, _) = either_family(Then::Answer(0), Then::Answer(100)).await;
+        assert_eq!(found, Ok(vec![v4, v6]));
+        let (found, _) = either_family(Then::Answer(100), Then::Answer(0)).await;
+        assert_eq!(found, Ok(vec![v4, v6]));
+
+        // One answer and one error: the answer
+        let (found, _) = either_family(Then::NxDomain(0), Then::Answer(100)).await;
+        assert_eq!(found, Ok(vec![v6]));
+        let (found, _) = either_family(Then::Answer(0), Then::NxDomain(100)).await;
+        assert_eq!(found, Ok(vec![v4]));
+    }
+
+    /// Two errors: the error of the one that finished last
+    /// (getaddrinfo_merge_err, evdns.c:4590-4594); the first's when the
+    /// other is still out after the skew (evdns.c:4466-4470). Starla gave
+    /// AAAA's.
+    #[tokio::test]
+    async fn either_familys_error_is_the_last_ones() {
+        let (found, _) = either_family(Then::NxDomain(0), Then::NoData(100)).await;
+        assert_eq!(found, Err(LookupError::Fail));
+        let (found, _) = either_family(Then::NoData(100), Then::NxDomain(0)).await;
+        assert_eq!(found, Err(LookupError::Fail));
+        let (found, _) = either_family(Then::NoData(0), Then::NxDomain(100)).await;
+        assert_eq!(found, Err(LookupError::NoName));
+
+        let (found, took) = either_family(Then::NxDomain(0), Then::Silent).await;
+        assert_eq!(found, Err(LookupError::NoName));
+        assert!(took < Duration::from_millis(1_500), "{took:?}");
+    }
+
+    /// A lookup reads neither resolv.conf nor the hosts file: the system
+    /// resolver is the one last read, its evdns base kept, until
+    /// read_system reads them again (the probe's background runtime, every
+    /// minute).
+    #[test]
+    fn the_system_resolver_reads_no_file_once_read() {
+        let reads_here = || SYSTEM_READS.with(std::cell::Cell::get);
+        let read = Resolver::read_system();
+        let reads = reads_here();
+        for _ in 0..100 {
+            let system = Resolver::system();
+            assert_eq!(system.conf, read.conf);
+            assert_eq!(system.hosts, read.hosts);
+            assert!(Arc::ptr_eq(&system.base, &read.base));
+        }
+        assert_eq!(reads_here(), reads, "a lookup read the files");
+        // Read again, unchanged: the same base, servers' state and all
+        let again = Resolver::read_system();
+        assert_eq!(reads_here(), reads + 1);
+        assert!(Arc::ptr_eq(&again.base, &read.base));
     }
 
     #[test]

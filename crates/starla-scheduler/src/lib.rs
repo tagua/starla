@@ -18,8 +18,9 @@ pub use lines::{Crontab, CrontabLine};
 
 use lines::{Due, InconsistentRecord, Lines};
 use starla_common::{MeasurementData, MeasurementId, MeasurementResult, ProbeId, Timestamp};
-use starla_results::ResultHandler;
+use starla_results::{ResultHandler, ResultSink};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use task::Now;
@@ -43,13 +44,24 @@ pub enum SchedulerCommand {
     ExecuteNow(MeasurementJob),
 }
 
+/// How many of a crontab's lines the scheduler takes between yields. A push
+/// of 800 lines took ~0.5 ms in one stretch (release build, 2026-10-14) on
+/// a measurement worker, holding up every reply that worker would have
+/// taken; a slice of 64 takes tens of microseconds.
+const LINES_PER_YIELD: usize = 64;
+
 pub struct Scheduler {
-    /// The recurring lines, each crontab's and Starla's own
-    lines: Arc<Mutex<Lines>>,
+    /// The recurring lines, each crontab's and Starla's own. Only the
+    /// scheduler takes them; the status gets their counts handed over
+    /// (SchedulerStatus).
+    lines: Mutex<Lines>,
+    /// The counts the status shows
+    status: SchedulerStatus,
     /// Probe ID for measurement results
     probe_id: ProbeId,
-    /// Result handler for uploading results
-    result_handler: Option<Arc<ResultHandler>>,
+    /// Where the runs hand their results over for upload: without waiting,
+    /// whatever the result handler's runtime is doing (ResultSink)
+    results: Option<ResultSink>,
     /// Metrics registry for recording operations
     metrics: starla_metrics::MetricsRegistry,
     /// Command receiver
@@ -62,48 +74,94 @@ pub struct Scheduler {
     pause: Pause,
 }
 
-/// What tells the scheduler the probe is paused: the file the tray writes
-/// (starla_common::read_pause_state), or, in a test, a switch of its own,
-/// so that no test reads the pause of the host it runs on.
+/// What tells the scheduler the probe is paused: the file the tray writes,
+/// read at each tick ([`tray_paused`]), or a switch that something else sets
+/// from it ([`Scheduler::pause_switch`]), or, in a test, a switch of its
+/// own, so that no test reads the pause of the host it runs on.
 enum Pause {
     Tray,
-    #[cfg(test)]
-    Switch(Arc<std::sync::atomic::AtomicBool>),
+    Switch(PauseSwitch),
 }
 
 impl Pause {
-    /// Whether the pause holds the lines now. A tray pause whose end has
-    /// passed is over: its file is cleared, so that the tray's status
-    /// panel stops claiming the probe is still paused.
+    /// Whether the pause holds the lines now.
     fn on(&self) -> bool {
         match self {
-            Pause::Tray => match starla_common::read_pause_state() {
-                Some(state) if state.is_active(chrono::Utc::now()) => true,
-                Some(_) => {
-                    let _ = starla_common::write_pause_state(None);
-                    false
-                }
-                None => false,
-            },
-            #[cfg(test)]
-            Pause::Switch(on) => on.load(std::sync::atomic::Ordering::SeqCst),
+            Pause::Tray => tray_paused(),
+            Pause::Switch(switch) => switch.is_on(),
         }
     }
 }
 
-/// Read-only handle to the scheduler's task set. Exposed so the probe can
+/// Whether the tray's pause holds now. A tray pause whose end has passed is
+/// over: its file is cleared, so that the tray's status panel stops
+/// claiming the probe is still paused.
+fn tray_paused() -> bool {
+    match starla_common::read_pause_state() {
+        Some(state) if state.is_active(chrono::Utc::now()) => true,
+        Some(_) => {
+            let _ = starla_common::write_pause_state(None);
+            false
+        }
+        None => false,
+    }
+}
+
+/// The tray's pause as a switch the scheduler reads at each tick without a
+/// system call. [`PauseSwitch::follow_tray`] reads the tray's file once a
+/// second, off the measurement threads, and sets it: the scheduler's tick
+/// read the file itself, a file system call on a measurement worker every
+/// second.
+#[derive(Clone, Default)]
+pub struct PauseSwitch(Arc<AtomicBool>);
+
+impl PauseSwitch {
+    /// Whether the probe is paused
+    pub fn is_on(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Pause the probe, or end the pause
+    pub fn set(&self, on: bool) {
+        self.0.store(on, Ordering::Release);
+    }
+
+    /// Keep the switch set from the tray's pause file, read once a second
+    /// (a pause whose end has passed is cleared, as the tick cleared it),
+    /// until `cancel`. Run it on the background runtime.
+    pub async fn follow_tray(self, cancel: CancellationToken) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tick.tick() => self.set(tray_paused()),
+            }
+        }
+    }
+}
+
+/// Read-only handle to the scheduler's line counts. Exposed so the probe can
 /// report active measurement counts to the tray without leaking the
 /// internal task map type.
-#[derive(Clone)]
+///
+/// The scheduler hands the counts over when its lines change, and never
+/// waits to: a reader holding them only delays the hand-over to the next
+/// tick. It used to read the lines themselves, under the lock the
+/// scheduler's tick takes, from the background runtime.
+#[derive(Clone, Default)]
 pub struct SchedulerStatus {
-    lines: Arc<Mutex<Lines>>,
+    counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl SchedulerStatus {
     /// Count active recurring measurement lines grouped by type ("ping",
     /// "dns", ...).
     pub async fn measurement_counts(&self) -> HashMap<String, u64> {
-        self.lines.lock().await.counts()
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -112,9 +170,10 @@ impl Scheduler {
     pub fn new(probe_id: ProbeId, metrics: starla_metrics::MetricsRegistry) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(100);
         Self {
-            lines: Arc::new(Mutex::new(Lines::default())),
+            lines: Mutex::new(Lines::default()),
+            status: SchedulerStatus::default(),
             probe_id,
-            result_handler: None,
+            results: None,
             metrics,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
             cmd_tx,
@@ -128,9 +187,10 @@ impl Scheduler {
         self.cancel_token.clone()
     }
 
-    /// Set the result handler for uploading measurement results
+    /// Set the result handler for uploading measurement results: the runs
+    /// hand their results to its [`ResultSink`]
     pub fn set_result_handler(&mut self, handler: Arc<ResultHandler>) {
-        self.result_handler = Some(handler);
+        self.results = Some(handler.sink());
     }
 
     /// Get a command sender for scheduling measurements
@@ -138,13 +198,39 @@ impl Scheduler {
         self.cmd_tx.clone()
     }
 
-    /// Cheap clone of the line set for read-only status snapshots.
-    /// Hands out a SchedulerStatus rather than the line set itself so it
-    /// can stay private to this crate.
+    /// The line counts for read-only status snapshots. Hands out a
+    /// SchedulerStatus rather than the line set itself so it can stay
+    /// private to this crate.
     pub fn status_handle(&self) -> SchedulerStatus {
-        SchedulerStatus {
-            lines: self.lines.clone(),
+        self.status.clone()
+    }
+
+    /// Take the tray's pause from the returned switch from now on, instead
+    /// of reading the tray's file at every tick; it starts as the file is
+    /// now. Keep it set with [`PauseSwitch::follow_tray`].
+    pub fn pause_switch(&mut self) -> PauseSwitch {
+        let switch = PauseSwitch::default();
+        switch.set(tray_paused());
+        self.pause = Pause::Switch(switch.clone());
+        switch
+    }
+
+    /// Hand the status the lines' counts, if lines came or went: never
+    /// waiting, as the reader is on another runtime. If it is reading just
+    /// now, the next tick hands them over.
+    fn publish_counts(&self, lines: &mut Lines) {
+        if !lines.take_changed() {
+            return;
         }
+        let mut counts = match self.status.counts.try_lock() {
+            Ok(counts) => counts,
+            Err(std::sync::TryLockError::Poisoned(counts)) => counts.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                lines.mark_changed();
+                return;
+            }
+        };
+        *counts = lines.counts();
     }
 
     /// Schedule a measurement job on its own
@@ -165,7 +251,7 @@ impl Scheduler {
             // Execute immediately - resolve DNS now - beside the lines, not
             // in their way (spawn_run)
             debug!(msm_id = job.msm_id, "Executing one-shot measurement");
-            vec![self.spawn_run(job)]
+            vec![self.spawn_run(job, None)]
         } else {
             // Add to scheduled tasks - DNS resolution deferred to execution
             debug!(
@@ -182,7 +268,9 @@ impl Scheduler {
     /// A crontab the controller finished: its file's lines become the
     /// crontab's. Lines it repeats keep their slots, its new lines wait for
     /// their first, and lines it no longer has stop; other files' lines are
-    /// untouched.
+    /// untouched. Taken [`LINES_PER_YIELD`] lines at a time, yielding to
+    /// the measurements between them; the lines stay locked throughout, so
+    /// no tick sees a crontab half taken.
     pub async fn synchronize(&self, crontab: Crontab) {
         self.synchronize_at(crontab, Now::read()).await;
     }
@@ -198,9 +286,22 @@ impl Scheduler {
     /// second on, a stopped line set again for exactly 10 s ago gave a
     /// record where eperd runs it.
     async fn synchronize_at(&self, crontab: Crontab, now: Now) -> Vec<JoinHandle<()>> {
-        let file = crontab.file.clone();
-        let count = crontab.lines.len();
-        let synced = self.lines.lock().await.synchronize(crontab, now);
+        let Crontab {
+            file,
+            lines: crontab_lines,
+        } = crontab;
+        let count = crontab_lines.len();
+        let synced = {
+            let mut lines = self.lines.lock().await;
+            let mut sync = lines.begin_sync(&file, now);
+            for (i, line) in crontab_lines.into_iter().enumerate() {
+                if i > 0 && i.is_multiple_of(LINES_PER_YIELD) {
+                    tokio::task::yield_now().await;
+                }
+                lines.insert(&mut sync, line);
+            }
+            lines.end_sync(sync)
+        };
         if synced.added + synced.dropped > 0 {
             info!(
                 "Crontab {}: {} lines, {} new, {} kept, {} dropped",
@@ -214,7 +315,11 @@ impl Scheduler {
 
     /// Stop a measurement: every line with its id, in every crontab
     pub async fn stop(&self, msm_id: u64) {
-        match self.lines.lock().await.stop(msm_id) {
+        let mut lines = self.lines.lock().await;
+        let stopped = lines.stop(msm_id);
+        self.publish_counts(&mut lines);
+        drop(lines);
+        match stopped {
             0 => warn!(msm_id, "Measurement not found"),
             lines => info!(msm_id, lines, "Stopped measurement"),
         }
@@ -227,8 +332,18 @@ impl Scheduler {
     /// eooqd's, a daemon of its own beside eperd (bin/ripe-atlas.in:130-137),
     /// and eperd's tests are events on its loop, none of which holds up a
     /// line's timer.
-    fn spawn_run(&self, job: MeasurementJob) -> JoinHandle<()> {
-        let result_handler = self.result_handler.clone();
+    ///
+    /// A line's run starts at its offset's microseconds (`start`): it
+    /// sleeps them first, on its own task, as libevent fires each eperd
+    /// timer at its own moment (task::Start). A one-off starts at once. A
+    /// line that goes while its run sleeps — a push leaves it out, a STOP
+    /// takes it — does not start it (task::LineGone).
+    fn spawn_run(
+        &self,
+        job: MeasurementJob,
+        start: Option<(task::Start, task::LineGone)>,
+    ) -> JoinHandle<()> {
+        let results = self.results.clone();
         let metrics = self.metrics.clone();
         let probe_id = self.probe_id;
         tokio::spawn(async move {
@@ -239,6 +354,19 @@ impl Scheduler {
                     return;
                 }
             };
+            if let Some((start, gone)) = start {
+                let wait = start.wait(task::wall_now());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                if gone.is_set() {
+                    debug!(
+                        msm_id = job.msm_id,
+                        "Line gone before its run started: not run"
+                    );
+                    return;
+                }
+            }
             let start_time = std::time::Instant::now();
             let msm_type = measurement.measurement_type().to_string();
             match measurement.execute().await {
@@ -246,8 +374,8 @@ impl Scheduler {
                     let duration = start_time.elapsed().as_secs_f64();
                     debug!(msm_id = result.msm_id.0, "Measurement completed");
                     metrics.record_measurement_completed(&msm_type, duration);
-                    match result_handler {
-                        Some(handler) => handler.submit(result).await,
+                    match results {
+                        Some(results) => results.submit(result),
                         None => warn!("No result handler configured!"),
                     }
                 }
@@ -273,7 +401,13 @@ impl Scheduler {
         // Track if the command channel is closed
         let mut channel_closed = false;
 
-        let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
+        // The tick comes just after each second of the wall clock begins,
+        // and a line's run then sleeps its offset's microseconds
+        // (spawn_run): runs due in one second start spread over it, as
+        // eperd's timers fire. An interval ticked wherever in the second
+        // the scheduler happened to start.
+        let tick = tokio::time::sleep(task::until_next_tick(task::wall_now()));
+        tokio::pin!(tick);
 
         loop {
             tokio::select! {
@@ -310,7 +444,7 @@ impl Scheduler {
                         Some(SchedulerCommand::ExecuteNow(job)) => {
                             // Run beside the lines: awaited here, a one-off
                             // held up every tick until it was done (spawn_run)
-                            self.spawn_run(job);
+                            self.spawn_run(job, None);
                         }
                         None => {
                             // Channel closed - this can happen during shutdown
@@ -322,12 +456,15 @@ impl Scheduler {
                 }
 
                 // Check for due tasks
-                _ = tick_interval.tick() => {
+                () = &mut tick => {
                     self.check_due_tasks().await;
 
                     // Update metrics
                     let count = self.lines.lock().await.len() as i64;
                     self.metrics.update_scheduler_tasks(count);
+
+                    let next = task::until_next_tick(task::wall_now());
+                    tick.as_mut().reset(tokio::time::Instant::now() + next);
                 }
             }
         }
@@ -361,28 +498,36 @@ impl Scheduler {
     /// tick consulted the pause: a push during one ran the lines it set
     /// for a time past and queued their records.
     async fn run_due(&self, now: Now) -> Vec<JoinHandle<()>> {
+        let mut lines = self.lines.lock().await;
         if self.pause.on() {
+            self.publish_counts(&mut lines);
             return Vec::new();
         }
         // Collect due jobs first (to avoid holding lock during execution)
-        let Due { jobs, inconsistent } = self.lines.lock().await.take_due(now);
+        let Due {
+            jobs,
+            starts,
+            gone,
+            inconsistent,
+        } = lines.take_due(now);
+        self.publish_counts(&mut lines);
+        drop(lines);
         if !inconsistent.is_empty() {
             warn!(
                 lines = inconsistent.len(),
                 "Lines more than 10 s off their time: not run, their next cycles drawn"
             );
-            if let Some(handler) = &self.result_handler {
+            if let Some(results) = &self.results {
                 for record in inconsistent {
-                    handler
-                        .submit(self.inconsistent_result(now.wall, record))
-                        .await;
+                    results.submit(self.inconsistent_result(now.wall, record));
                 }
             }
         }
         jobs.into_iter()
-            .map(|job| {
+            .zip(starts.into_iter().zip(gone))
+            .map(|(job, start)| {
                 debug!(msm_id = job.msm_id, "Executing scheduled measurement");
-                self.spawn_run(job)
+                self.spawn_run(job, Some(start))
             })
             .collect()
     }
@@ -435,10 +580,10 @@ mod tests {
     fn scheduler_for(
         handler: &Arc<ResultHandler>,
         metrics: starla_metrics::MetricsRegistry,
-    ) -> (Scheduler, Arc<std::sync::atomic::AtomicBool>) {
+    ) -> (Scheduler, PauseSwitch) {
         let mut scheduler = Scheduler::new(ProbeId(1018212), metrics);
         scheduler.set_result_handler(handler.clone());
-        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paused = PauseSwitch::default();
         scheduler.pause = Pause::Switch(paused.clone());
         (scheduler, paused)
     }
@@ -473,6 +618,86 @@ mod tests {
                 }),
             },
         }
+    }
+
+    /// The runs a tick takes start spread over its second, each at its
+    /// offset's microseconds, and none in another second: lines' runs, each
+    /// to a server of its own, taken as a second of the wall clock begins
+    /// (the tick's 2 ms in), reach their servers at those microseconds, as
+    /// eperd's timers fire (set_timeout's tv_usec, eperd.c:758-762).
+    /// Starla started every run a tick took in that tick's millisecond.
+    #[tokio::test]
+    async fn the_runs_a_tick_takes_start_at_their_microseconds_in_its_second() {
+        let metrics = starla_metrics::MetricsRegistry::new().unwrap();
+        let handler = no_transport(&metrics);
+        let (scheduler, _) = scheduler_for(&handler, metrics);
+        let usecs = [100_000, 250_000, 400_000, 550_000, 700_000, 850_000];
+        let mut servers = Vec::new();
+        for _ in usecs {
+            servers.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        tokio::time::sleep(task::until_next_tick(task::wall_now())).await;
+        let second = task::wall_now().as_secs();
+        let mut runs = Vec::new();
+        for (server, usec) in servers.iter().zip(usecs) {
+            let job = slow_dns_line(server).await.job;
+            let start = task::Start {
+                second: second as i64,
+                usec,
+            };
+            runs.push(scheduler.spawn_run(job, Some((start, task::LineGone::default()))));
+        }
+        for (server, usec) in servers.iter().zip(usecs) {
+            let mut query = [0u8; 512];
+            server.recv(&mut query).await.unwrap();
+            let came = task::wall_now();
+            let due = Duration::from_secs(second) + Duration::from_micros(usec.into());
+            assert_eq!(came.as_secs(), second, "{usec} µs: in another second");
+            assert!(
+                came + Duration::from_millis(1) >= due && came < due + Duration::from_millis(100),
+                "{usec} µs: came {:?} in",
+                came - Duration::from_secs(second)
+            );
+        }
+        runs.into_iter().for_each(|run| run.abort());
+    }
+
+    /// A run taken at the tick whose line goes while it sleeps to its
+    /// microseconds does not start, as eperd's line goes with its timer
+    /// unfired (eperd.c:875-883, 1258-1262); a run beside it, whose line
+    /// stays, starts at its microseconds.
+    #[tokio::test]
+    async fn a_run_whose_line_goes_before_its_microseconds_does_not_start() {
+        let metrics = starla_metrics::MetricsRegistry::new().unwrap();
+        let handler = no_transport(&metrics);
+        let (scheduler, _) = scheduler_for(&handler, metrics);
+        let kept = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dropped = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::time::sleep(task::until_next_tick(task::wall_now())).await;
+        let start = task::Start {
+            second: task::wall_now().as_secs() as i64,
+            usec: 500_000,
+        };
+        let (stays, goes) = (task::LineGone::default(), task::LineGone::default());
+        let runs = [
+            scheduler.spawn_run(slow_dns_line(&kept).await.job, Some((start, stays))),
+            scheduler.spawn_run(
+                slow_dns_line(&dropped).await.job,
+                Some((start, goes.clone())),
+            ),
+        ];
+        // A push leaves the line out, in the run's second, before its
+        // microseconds
+        goes.set();
+
+        let mut query = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(2), kept.recv(&mut query))
+            .await
+            .expect("the kept line's run starts")
+            .unwrap();
+        let none = tokio::time::timeout(Duration::from_millis(1_500), dropped.recv(&mut query));
+        assert!(none.await.is_err(), "the gone line's run started");
+        runs.into_iter().for_each(|run| run.abort());
     }
 
     /// A line the next crontab drops while its run is under way stops, and
@@ -611,7 +836,6 @@ mod tests {
     /// ran the line or queued its record.
     #[tokio::test]
     async fn a_push_during_a_pause_runs_and_records_nothing() {
-        use std::sync::atomic::Ordering::SeqCst;
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let file = "/var/spool/ripe-atlas/crons/7".to_string();
         let slot = 1_791_836_407; // 7 + k * 60
@@ -636,7 +860,7 @@ mod tests {
             assert!(scheduler.run_due(at(slot + 60)).await.is_empty());
 
             // paused, the line is sent again with a later end time
-            paused.store(true, SeqCst);
+            paused.set(true);
             line.job.end_time = 2_000_000_000;
             let pushed = scheduler
                 .synchronize_at(
@@ -658,7 +882,7 @@ mod tests {
             assert_eq!(handler.queue_stats().await.count, 0, "sent {late} s late");
 
             // the pause ends
-            paused.store(false, SeqCst);
+            paused.set(false);
             assert!(scheduler.run_due(at(slot + 100)).await.is_empty());
             assert_eq!(handler.queue_stats().await.count, 1, "sent {late} s late");
             for now in slot + 101..slot + 120 {
@@ -679,13 +903,12 @@ mod tests {
     /// Only the tick consulted the pause, and scheduling one ran it.
     #[tokio::test]
     async fn a_job_scheduled_during_a_pause_runs_nothing() {
-        use std::sync::atomic::Ordering::SeqCst;
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let metrics = starla_metrics::MetricsRegistry::new().unwrap();
         let handler = no_transport(&metrics);
         let (scheduler, paused) = scheduler_for(&handler, metrics);
         let now = 1_791_836_407;
-        paused.store(true, SeqCst);
+        paused.set(true);
         for msm_id in 0..32 {
             let mut job = slow_dns_line(&server).await.job;
             job.msm_id = 1_000_000 + msm_id;
@@ -696,7 +919,7 @@ mod tests {
         }
         assert!(scheduler.run_due(at(now)).await.is_empty());
 
-        paused.store(false, SeqCst);
+        paused.set(false);
         let ran = scheduler.run_due(at(now)).await;
         assert!(!ran.is_empty(), "none of them due");
         ran.into_iter().for_each(|run| run.abort());
@@ -764,6 +987,122 @@ mod tests {
         .expect("the one-off reported");
         scheduler.cancel_token().cancel();
         looping.await.unwrap();
+    }
+
+    /// `n` evping lines of crons/7, none due for a while.
+    fn ping_crontab(n: u64, now: i64) -> Crontab {
+        Crontab {
+            file: "/var/spool/ripe-atlas/crons/7".into(),
+            lines: (0..n)
+                .map(|i| CrontabLine {
+                    command: format!(
+                        "evping -4 -c 3 -A \"{}\" -O /home/atlas/data/new/7 192.0.2.{}",
+                        2_000_000 + i,
+                        i % 250
+                    ),
+                    job: MeasurementJob {
+                        msm_id: 2_000_000 + i,
+                        interval: 240,
+                        start_time: now + 1_000 + i as i64,
+                        end_time: 2_000_000_000,
+                        spread: 0,
+                        spec: MeasurementSpec::Ping(PingJobSpec {
+                            target: format!("192.0.2.{}", i % 250),
+                            af: 4,
+                            packets: 3,
+                            packet_interval: 1000,
+                            size: 0,
+                            kept: Default::default(),
+                        }),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// The controller's crontabs come as one push of ~800 lines. Taken in
+    /// one stretch, a push held a measurement worker for ~0.5 ms (release
+    /// build); the scheduler now yields every 64 lines, and a task on the
+    /// same worker runs between the slices. On a current-thread runtime,
+    /// the other task runs only when the push yields.
+    #[tokio::test]
+    async fn a_crontab_is_taken_a_slice_at_a_time() {
+        let metrics = starla_metrics::MetricsRegistry::new().unwrap();
+        let handler = no_transport(&metrics);
+        let (scheduler, _) = scheduler_for(&handler, metrics);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let other = tokio::spawn({
+            let polls = polls.clone();
+            async move {
+                loop {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let now = 1_791_836_407;
+        let before = polls.load(Ordering::SeqCst);
+        let ran = scheduler
+            .synchronize_at(ping_crontab(800, now), at(now))
+            .await;
+        let between = polls.load(Ordering::SeqCst) - before;
+        other.abort();
+
+        assert!(ran.is_empty());
+        assert!(between >= 800 / LINES_PER_YIELD - 1, "{between} slices");
+        assert_eq!(
+            scheduler.status_handle().measurement_counts().await["ping"],
+            800
+        );
+        // and a push that repeats it keeps every line
+        scheduler
+            .synchronize_at(ping_crontab(800, now), at(now + 1))
+            .await;
+        assert_eq!(
+            scheduler.status_handle().measurement_counts().await["ping"],
+            800
+        );
+    }
+
+    /// The status's reader is on the background runtime. It used to read
+    /// the lines under the lock the tick takes; now the scheduler hands it
+    /// the counts, and a reader that holds them (the background thread
+    /// preempted mid-read) never holds up a push or a tick: they are handed
+    /// over at the next tick instead.
+    #[tokio::test]
+    async fn a_status_reader_never_holds_up_the_scheduler() {
+        let metrics = starla_metrics::MetricsRegistry::new().unwrap();
+        let handler = no_transport(&metrics);
+        let (scheduler, _) = scheduler_for(&handler, metrics);
+        let status = scheduler.status_handle();
+        let now = 1_791_836_407;
+
+        // A reader on another thread holds the counts until told
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (holding, held) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let status = status.clone();
+            move || {
+                let reading = status.counts.lock().unwrap();
+                holding.send(()).unwrap();
+                released.recv().unwrap();
+                reading.is_empty()
+            }
+        });
+        held.recv().unwrap();
+        let pushed = tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.synchronize_at(ping_crontab(3, now), at(now)),
+        )
+        .await;
+        assert!(pushed.is_ok(), "the push waited for the reader");
+        release.send(()).unwrap();
+        assert!(reader.join().unwrap(), "handed over while read");
+
+        assert!(scheduler.run_due(at(now + 1)).await.is_empty());
+        assert_eq!(status.measurement_counts().await["ping"], 3);
     }
 
     /// A controller that answers every POST 200 and hands over each body.

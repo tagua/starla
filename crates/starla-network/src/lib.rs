@@ -5,6 +5,7 @@ pub mod capabilities;
 pub mod icmp;
 #[cfg(unix)]
 pub mod raw_socket;
+pub mod rxstamp;
 #[cfg(windows)]
 pub mod windows_icmp;
 pub mod wsacmsg;
@@ -12,16 +13,20 @@ pub mod wsacmsg;
 pub use capabilities::*;
 pub use icmp::*;
 #[cfg(unix)]
-pub use raw_socket::{new_icmpv4_socket, new_icmpv6_socket, RawSocket};
+pub use raw_socket::{new_icmpv4_socket, new_icmpv6_socket, recvmsg_meta, RawSocket};
 
-/// What came with a packet: its TTL or hop limit, and the address it was
-/// sent to. On unix from recvmsg's ancillary data
-/// ([`RawSocket::recv_meta`]), on Windows from WSARecvMsg's
+/// What came with a packet: its TTL or hop limit, the address it was
+/// sent to, and the kernel's stamp of its arrival. On unix from recvmsg's
+/// ancillary data ([`RawSocket::recv_meta`]), on Windows from WSARecvMsg's
 /// ([`wsacmsg::recv_meta`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecvMeta {
     pub ttl: Option<u8>,
     pub dst: Option<std::net::IpAddr>,
+    /// The kernel's receive stamp, CLOCK_REALTIME since the epoch, when the
+    /// socket asked for it ([`RawSocket::set_rx_timestamps`]; Linux only):
+    /// [`rxstamp::monotonic`] puts it on a measurement's clock.
+    pub stamp: Option<std::time::Duration>,
 }
 
 /// The index of the network interface called `name`, as if_nametoindex(3)

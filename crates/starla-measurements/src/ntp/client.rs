@@ -39,11 +39,17 @@ pub(super) fn ntp_ts_to_f64(ts: u64) -> f64 {
 
 /// Current time as a raw 64-bit NTP timestamp
 fn now_ntp() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs() + NTP_OFFSET;
-    let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
+    ntp_ts(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
+}
+
+/// A time since the Unix epoch as a raw 64-bit NTP timestamp
+fn ntp_ts(since_epoch: Duration) -> u64 {
+    let secs = since_epoch.as_secs() + NTP_OFFSET;
+    let frac = ((since_epoch.subsec_nanos() as u64) << 32) / 1_000_000_000;
     (secs << 32) | (frac & 0xFFFF_FFFF)
 }
 
@@ -204,7 +210,15 @@ fn sample(reply: &[u8], t4: u64) -> Option<NtpSample> {
 /// nor the origin of a reply: a late one is reported, with its own origin
 /// and so its real delay, in the place of the request then in flight, and
 /// that request's own reply, if it comes, after it.
+///
+/// With `kernel_rx_timestamps` on, T4 is the kernel's stamp of the reply's
+/// arrival ([`starla_network::rxstamp`]): wall-clock time, as T4 is.
 pub async fn execute_ntp_query(config: &NtpConfig) -> anyhow::Result<NtpResult> {
+    run(config, starla_network::rxstamp::enabled()).await
+}
+
+/// [`execute_ntp_query`], with the kernel's receive stamps or without.
+async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
     use crate::ping::strerror;
 
     let start = Instant::now();
@@ -233,6 +247,9 @@ pub async fn execute_ntp_query(config: &NtpConfig) -> anyhow::Result<NtpResult> 
     }
     // getsockname once connected (ntp.c:1286-1293)
     result.src_addr = socket.local_addr().ok().map(|a| a.ip());
+    if kernel_rx {
+        ask_for_stamps(&socket);
+    }
 
     let timeout = Duration::from_millis(config.timeout_ms);
     let gap = Duration::from_millis(config.gap_ms);
@@ -300,9 +317,11 @@ pub async fn execute_ntp_query(config: &NtpConfig) -> anyhow::Result<NtpResult> 
         let gap_pending = gap_at.is_some_and(|at| at > now);
         // ready_callback stamps the time, then reads (ntp.c:688, 714)
         let t4 = now_ntp();
-        match read(&socket, &mut buf) {
-            Ok(len) => {
+        match read(&socket, &mut buf, kernel_rx) {
+            Ok((len, stamp)) => {
                 errors = 0;
+                // the kernel's, when it stamped the reply
+                let t4 = stamp.map(ntp_ts).unwrap_or(t4);
                 if let Some(sample) = sample(&buf[..len], t4) {
                     result.samples.push(Some(sample));
                     answered = true;
@@ -346,8 +365,13 @@ pub async fn execute_ntp_query(config: &NtpConfig) -> anyhow::Result<NtpResult> 
 /// Ready::ERROR, and its try_recv, seeing no READABLE, would not read: the
 /// error stayed, and the next request's send took it instead and did not
 /// go out. It is taken here with SO_ERROR, as the read takes it. (macOS
-/// reports the error readable, and the read takes it.)
-fn read(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<usize> {
+/// reports the error readable, and the read takes it.) With `stamped`, the
+/// datagram comes with the kernel's receive stamp, when there is one.
+fn read(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    stamped: bool,
+) -> std::io::Result<(usize, Option<Duration>)> {
     let pending = socket.try_io(Interest::ERROR, || match socket.take_error() {
         Ok(Some(e)) => Ok(e),
         // none: the readiness goes, until the next error
@@ -356,8 +380,37 @@ fn read(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<usize> {
     });
     match pending {
         Ok(e) => Err(e),
-        Err(_) => socket.try_recv(buf),
+        Err(_) if stamped => recv_stamped(socket, buf),
+        Err(_) => socket.try_recv(buf).map(|n| (n, None)),
     }
+}
+
+/// `kernel_rx_timestamps`: have the kernel stamp each reply's arrival
+/// ([`starla_network::rxstamp`]). Linux only; elsewhere nothing is asked.
+#[cfg(unix)]
+fn ask_for_stamps(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    if let Err(e) = starla_network::rxstamp::enable(socket.as_raw_fd()) {
+        tracing::debug!("NTP: no receive stamps from the kernel: {}", e);
+    }
+}
+
+#[cfg(not(unix))]
+fn ask_for_stamps(_socket: &UdpSocket) {}
+
+/// try_recv(), through recvmsg(2) for the kernel's receive stamp.
+#[cfg(unix)]
+fn recv_stamped(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Option<Duration>)> {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    socket
+        .try_io(Interest::READABLE, || starla_network::recvmsg_meta(fd, buf))
+        .map(|(n, meta)| (n, meta.stamp))
+}
+
+#[cfg(not(unix))]
+fn recv_stamped(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Option<Duration>)> {
+    socket.try_recv(buf).map(|n| (n, None))
 }
 
 /// The header fields of a reply of a header or more, as they came.
@@ -621,6 +674,53 @@ mod tests {
         let res = run.await.unwrap();
         let s = res.samples[0].as_ref().unwrap();
         assert!(s.rtt < 0.04, "the wait for writable is in the delay: {s:?}");
+    }
+
+    /// With `kernel_rx_timestamps`, T4 is the kernel's stamp of the reply's
+    /// arrival: a reply that waited 40 ms to be read — the run not polled,
+    /// a busy runtime — has the server's delay alone. Without, T4 is when
+    /// it was read, as ntp.c stamps it, and the wait is in the delay.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn t4_is_the_kernels_stamp_of_the_reply() {
+        use starla_network::rxstamp::{hold, stamping_at_arrival};
+        use std::future::Future;
+        // as set_enabled holds it
+        hold().unwrap();
+        assert!(stamping_at_arrival(Duration::from_secs(2)));
+        for kernel_rx in [false, true] {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = server.local_addr().unwrap().port();
+            let (came, mut answered) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 48];
+                let (_, from) = server.recv_from(&mut buf).await.unwrap();
+                let at = now_ntp();
+                server.send_to(&reply(&buf, at, at), from).await.unwrap();
+                let _ = came.send(());
+            });
+
+            let config = config(port, 1, 1000, 2000);
+            let mut run = std::pin::pin!(run(&config, kernel_rx));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // Polled until the request has gone and been answered, then
+            // left while the answer waits.
+            loop {
+                assert!(run.as_mut().poll(&mut cx).is_pending());
+                tokio::select! {
+                    _ = answered.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let res = run.await.unwrap();
+            let s = res.samples[0].as_ref().unwrap();
+            if kernel_rx {
+                assert!(s.rtt < 0.01, "the wait is in the delay: {s:?}");
+            } else {
+                assert!(s.rtt >= 0.04, "{s:?}");
+            }
+        }
     }
 
     /// Each reply's sample carries that reply's own header fields, as

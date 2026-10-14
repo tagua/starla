@@ -9,6 +9,7 @@
 
 use super::wire::{Answer, Branch, Outcome};
 use starla_common::{TracerouteOptions, TracerouteProtocol};
+use starla_network::rxstamp::Arrival;
 use std::fmt::Write;
 use std::time::Duration;
 
@@ -345,8 +346,11 @@ impl Trace {
     /// new end of the wait when it answers the probe in flight (then the
     /// reference waits `-z` ms for duplicates before the next probe), None
     /// when the wait goes on (a late reply, a duplicate, or one from the
-    /// future, which is ignored).
-    pub fn reply(&mut self, a: &Answer, now: Duration) -> Option<Duration> {
+    /// future, which is ignored). With `kernel_rx_timestamps` its rtt runs
+    /// to the kernel's stamp of its arrival ([`Arrival::after`]); the wait
+    /// for duplicates runs from when it was read, as the reference's timer.
+    pub fn reply(&mut self, a: &Answer, now: impl Into<Arrival<Duration>>) -> Option<Duration> {
+        let now = now.into();
         let cur = self.seq as u32;
         let tcp = matches!(a.branch, Branch::V4Tcp | Branch::V6Tcp);
         // A TCP answer acknowledges seq+1; ready_tcp4/6 only call it late
@@ -362,7 +366,7 @@ impl Trace {
         let late = stale.then(|| cur.wrapping_sub(a.seq) as i32);
         let dup = late.is_none() && self.gotresp;
 
-        let since = |t: Duration| (now.as_secs_f64() - t.as_secs_f64()) * 1000.0;
+        let since = |t: Duration| (now.after(t).as_secs_f64() - t.as_secs_f64()) * 1000.0;
         // A late IPv6 reply's rtt is from the send time it quotes; a TCP
         // probe quotes none, and the reference's lint value shows through
         // (traceroute.c:3278, 3777-3787). IPv4 writes no rtt when late.
@@ -427,7 +431,7 @@ impl Trace {
 
         if fresh {
             self.gotresp = true;
-            Some(now + self.dup_timeout)
+            Some(now.user + self.dup_timeout)
         } else {
             None
         }
@@ -500,6 +504,50 @@ mod tests {
              { \"from\":\"2001:db8:7769:6e00::20\", \"ttl\":64, \"rtt\":0.119, \"size\":88 }, \
              { \"from\":\"2001:db8:7769:6e00::20\", \"ttl\":64, \"rtt\":0.229, \"size\":88 } ] } ]"
         );
+    }
+
+    /// With `kernel_rx_timestamps`, a reply read 30 ms after it came is
+    /// timed by the kernel's stamp of its arrival, and a late one by the
+    /// same stamp from the send time it quotes; the wait for duplicates
+    /// still runs from when it was read, as the reference's timer does. A
+    /// stamp from before the probe went (the wall clock stepped) gives way
+    /// to the time it was read.
+    #[test]
+    fn the_kernels_stamp_times_a_reply_that_waited() {
+        let mut t = Trace::new(true, &udp6(), Some(1));
+        let p = t.next_probe(ms(0.0)).unwrap();
+        t.sent();
+        let read = ms(30.155);
+        let at = Arrival {
+            user: read,
+            kernel: Some(ms(0.155)),
+        };
+        let until = t.reply(&port_unreachable(p.seq as u32), at);
+        assert_eq!(until, Some(read + Duration::from_millis(10)));
+        t.timeout();
+        let p = t.next_probe(ms(40.0)).unwrap();
+        t.sent();
+        let stepped = Arrival {
+            user: ms(40.2),
+            kernel: Some(ms(39.0)),
+        };
+        t.reply(&port_unreachable(p.seq as u32), stepped);
+        t.timeout();
+        // the first probe's answer once more, late, quoting its send time
+        t.next_probe(ms(50.0)).unwrap();
+        t.sent();
+        let mut late = port_unreachable(p.seq as u32 - 1);
+        late.sent_tv = Some(ms(0.0));
+        let at = Arrival {
+            user: ms(80.0),
+            kernel: Some(ms(50.5)),
+        };
+        assert_eq!(t.reply(&late, at), None);
+        let hops = render_hops(t.hops());
+        assert!(hops.contains("\"rtt\":0.155, \"size\":88 }"), "{hops}");
+        assert!(hops.contains("\"rtt\":0.200, \"size\":88 }"), "{hops}");
+        assert!(hops.contains("\"late\":2"), "{hops}");
+        assert!(hops.contains("\"rtt\":50.500"), "{hops}");
     }
 
     /// Without answers the reference gives up after `-g` (5) silent hops,

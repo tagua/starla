@@ -15,6 +15,32 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
+/// The target of the trace event that carries a whole upload body: a
+/// target of its own, so that the body can be left out
+/// (`starla_results::uploader::body=off`) while the rest of the uploader
+/// traces. A directive for `starla_results::uploader` still takes it, as an
+/// EnvFilter directive names a prefix of the target: the debug drop-in's
+/// `starla_results::uploader=trace` logs it as before.
+pub const UPLOAD_BODY_TARGET: &str = "starla_results::uploader::body";
+
+/// How many results go into a body between yields: a batch after an outage
+/// can be thousands, each cloned and serialised, on the runtime that also
+/// runs the controller's SSH session and telnet.
+const RESULTS_PER_YIELD: usize = 64;
+
+/// Append each result's RESULT line to an upload body, yielding every
+/// [`RESULTS_PER_YIELD`].
+async fn append_result_lines(body: &mut Vec<u8>, results: &[QueuedResult]) {
+    for (i, queued) in results.iter().enumerate() {
+        if i > 0 && i.is_multiple_of(RESULTS_PER_YIELD) {
+            tokio::task::yield_now().await;
+        }
+        let atlas_result =
+            AtlasResult::from_measurement(queued.result.clone(), None).with_lts(queued.lts);
+        body.extend_from_slice(atlas_result.to_result_line().as_bytes());
+    }
+}
+
 /// An async bidirectional stream for upload transport.
 pub trait UploadStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> UploadStream for T {}
@@ -222,11 +248,7 @@ impl ResultUploader {
             body.extend_from_slice(line.as_bytes());
         }
 
-        for queued in results {
-            let atlas_result =
-                AtlasResult::from_measurement(queued.result.clone(), None).with_lts(queued.lts);
-            body.extend_from_slice(atlas_result.to_result_line().as_bytes());
-        }
+        append_result_lines(&mut body, results).await;
         if !results.is_empty() {
             body.extend_from_slice(system_status::results_marker().as_bytes());
         }
@@ -243,7 +265,7 @@ impl ResultUploader {
             results.len(),
             body.len(),
         );
-        trace!("Upload body:\n{}", String::from_utf8_lossy(&body));
+        trace!(target: UPLOAD_BODY_TARGET, "Upload body:\n{}", String::from_utf8_lossy(&body));
 
         let sent = self.post(target, &body, results.len(), start_time).await;
         if sent.is_err() {
@@ -295,11 +317,7 @@ impl ResultUploader {
             anyhow::bail!("No upload endpoint configured");
         }
         let mut body = b"P_TO_C_REPORT\n".to_vec();
-        for queued in results {
-            let atlas_result =
-                AtlasResult::from_measurement(queued.result.clone(), None).with_lts(queued.lts);
-            body.extend_from_slice(atlas_result.to_result_line().as_bytes());
-        }
+        append_result_lines(&mut body, results).await;
         if let Some(sid) = session_id {
             body.extend_from_slice(format!("\nSESSION_ID {sid}\n").as_bytes());
         }
@@ -630,6 +648,120 @@ mod tests {
     }
 
     const REPORT: &str = "RESULT { \"id\": \"9104\", \"time\": 1 }\n";
+
+    /// A batch after an outage can be thousands of results, each cloned and
+    /// serialised into the body on the background runtime: the body is
+    /// built 64 results at a time. On a current-thread runtime, another
+    /// task runs only when the building yields.
+    #[tokio::test]
+    async fn a_large_body_is_built_a_slice_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let results: Vec<QueuedResult> = (0..640).flat_map(|_| one_result()).collect();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let other = tokio::spawn({
+            let polls = polls.clone();
+            async move {
+                loop {
+                    polls.fetch_add(1, SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let before = polls.load(SeqCst);
+        let mut body = Vec::new();
+        append_result_lines(&mut body, &results).await;
+        let between = polls.load(SeqCst) - before;
+        other.abort();
+
+        assert_eq!(String::from_utf8(body).unwrap().lines().count(), 640);
+        assert!(between >= 640 / RESULTS_PER_YIELD - 1, "{between} slices");
+    }
+
+    /// Log output as the probe's stdout carries it.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What one upload logs with RUST_LOG set to `spec`.
+    ///
+    /// tracing caches whether a callsite is enabled, for the whole process.
+    /// While one dispatcher is registered, it fills the cache from the
+    /// default of the thread that hits the callsite: hit first by another
+    /// test's thread, which has no subscriber, a callsite stayed off on
+    /// this one too, and nothing was logged. A second dispatcher kept
+    /// registered, which takes nothing, leaves every callsite to ask the
+    /// subscriber of the thread it is hit on.
+    fn logged_by_an_upload(spec: &str) -> String {
+        use starla_common::logging::{fmt, EnvFilter};
+        static ASK_EACH_THREAD: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ASK_EACH_THREAD
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        let out = Captured::default();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(EnvFilter::new(spec))
+            .with_ansi(false)
+            .with_writer({
+                let out = out.clone();
+                move || out.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (u, _telemetry, _seen) = uploader("HTTP/1.1 200 \r\n\r\nOK\n");
+                u.upload_batch(&one_result(), None).await.unwrap();
+            });
+        });
+        let logged = out.0.lock().unwrap().clone();
+        String::from_utf8(logged).unwrap()
+    }
+
+    /// The whole body goes on a target of its own, under the uploader's. The
+    /// debug drop-in on enodia (90-debug.conf) still logs it: an EnvFilter
+    /// directive names a prefix of the target, and the longest one that
+    /// matches decides. A directive for the body's target alone leaves it
+    /// out and the uploader's other traces in.
+    #[test]
+    fn the_upload_body_has_a_target_of_its_own() {
+        const DROP_IN: &str =
+            "starla=debug,starla_results::uploader=trace,starla_controller::ssh=trace";
+        let body = "Upload body:\nP_TO_C_REPORT\nRESULT { ";
+        let response = "Upload response: \"HTTP/1.1 200";
+        let batch = "Uploading batch of 1 results";
+
+        let logged = logged_by_an_upload(DROP_IN);
+        for line in [body, response, batch] {
+            assert!(logged.contains(line), "{line:?} not in:\n{logged}");
+        }
+        assert!(logged.contains(UPLOAD_BODY_TARGET), "{logged}");
+
+        let logged = logged_by_an_upload(&format!("{DROP_IN},{UPLOAD_BODY_TARGET}=off"));
+        assert!(!logged.contains("Upload body:"), "{logged}");
+        for line in [response, batch] {
+            assert!(logged.contains(line), "{line:?} not in:\n{logged}");
+        }
+
+        // starla=debug alone takes the uploader's debug lines, not its traces
+        let logged = logged_by_an_upload("starla=debug");
+        assert!(logged.contains(batch), "{logged}");
+        assert!(!logged.contains("Upload body:"), "{logged}");
+        assert!(!logged.contains("Upload response:"), "{logged}");
+    }
 
     /// 2026-10-12: RIPE answered a probe's first-ever address report with 429,
     /// and the line was gone. A failed upload puts its telemetry back.

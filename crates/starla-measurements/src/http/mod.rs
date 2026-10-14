@@ -52,6 +52,11 @@ pub struct Http {
 /// told RIPE the probe's addresses.
 pub fn result_body(msm_id: u64, gstart: i64, out: &raw::RawHttpOutcome) -> String {
     let mut r = String::from("{ ");
+    if let Some(dnserr) = &out.dnserr {
+        // reporterr()'s TU_DNS_ERR: report() adds nothing to it
+        let _ = write!(r, "\"dnserr\":{} }}", raw::quoted(dnserr));
+        return envelope(msm_id, gstart, out, &r);
+    }
     if let Some(header) = &out.header {
         r.push_str("\"header\": [");
         for (i, line) in header.iter().enumerate() {
@@ -81,7 +86,11 @@ pub fn result_body(msm_id: u64, gstart: i64, out: &raw::RawHttpOutcome) -> Strin
         );
     }
     r.push_str(" }");
+    envelope(msm_id, gstart, out, &r)
+}
 
+/// report()'s line around the result object `r`.
+fn envelope(msm_id: u64, gstart: i64, out: &raw::RawHttpOutcome, r: &str) -> String {
     let mut body = format!(
         "\"id\":\"{}\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":{}, ",
         msm_id,
@@ -142,8 +151,10 @@ impl Measurement for Http {
 }
 
 impl Http {
-    /// An https:// fetch through reqwest. Header lines are rebuilt from the
-    /// parsed map (names lowercased), so stored headers are approximate here.
+    /// An https:// fetch through reqwest, its host name looked up by
+    /// Starla's evdns as an http:// one is (client::Evdns). Header lines
+    /// are rebuilt from the parsed map (names lowercased), so stored
+    /// headers are approximate here.
     ///
     /// dst_addr is the address the connection went to, as httpget reports
     /// the one it connected to (beforeconnect, httpget.c:1980-1989, 910-918).
@@ -173,6 +184,7 @@ impl Http {
                 self.config.store_headers,
             ),
             err: None,
+            dnserr: None,
             done: true,
         })
     }
@@ -202,6 +214,7 @@ mod tests {
             bsize: p.bsize,
             header: p.header,
             err: None,
+            dnserr: None,
             done: true,
         };
         let body = result_body(13027, 1791860335, &out);
