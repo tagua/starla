@@ -18,6 +18,9 @@ pub struct ProbeConfig {
     pub storage: StorageSettings,
 
     #[serde(default)]
+    pub measurements: MeasurementSettings,
+
+    #[serde(default)]
     pub metrics: MetricsSettings,
 
     #[serde(default)]
@@ -89,6 +92,16 @@ impl Default for StorageSettings {
             retention_days: default_retention_days(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeasurementSettings {
+    /// Time replies by the kernel's receive stamps (SO_TIMESTAMPNS), not
+    /// by a userspace clock read once they are read, as the reference
+    /// probe does. Linux only; off by default. See
+    /// starla_network::rxstamp.
+    #[serde(default)]
+    pub kernel_rx_timestamps: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +229,29 @@ mod tests {
         let config = ProbeConfig::default();
         assert_eq!(config.probe.log_level, "info");
         assert!(!config.network.rxtxrpt);
+    }
+
+    /// Off unless asked for: by default, and in a config without the
+    /// section or the key.
+    #[test]
+    fn kernel_rx_timestamps_are_off_by_default() {
+        assert!(!ProbeConfig::default().measurements.kernel_rx_timestamps);
+        let parsed: ProbeConfig = toml::from_str("[probe]\nlog_level = \"debug\"\n").unwrap();
+        assert!(!parsed.measurements.kernel_rx_timestamps);
+        let parsed: ProbeConfig = toml::from_str("[measurements]\n").unwrap();
+        assert!(!parsed.measurements.kernel_rx_timestamps);
+        let on = "[measurements]\nkernel_rx_timestamps = true\n";
+        let parsed: ProbeConfig = toml::from_str(on).unwrap();
+        assert!(parsed.measurements.kernel_rx_timestamps);
+    }
+
+    /// The example config parses, and leaves the option off.
+    #[test]
+    fn the_example_config_parses() {
+        let example = include_str!("../../../config.toml.example");
+        let parsed: ProbeConfig = toml::from_str(example).unwrap();
+        assert!(!parsed.measurements.kernel_rx_timestamps);
+        assert!(example.contains("\nkernel_rx_timestamps = false\n"));
     }
 
     #[test]

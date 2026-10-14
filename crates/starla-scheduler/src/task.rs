@@ -3,6 +3,8 @@
 use super::MeasurementJob;
 use rand::RngExt;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A recurring measurement on the reference probe's (eperd's) slots: cycle
@@ -31,6 +33,10 @@ pub struct ScheduledTask {
     pub cycle: i64,
     /// The cycle's slot moved by its offset (eperd's nexttime)
     pub next_run: i64,
+    /// The offset's microseconds, drawn with it (distr_offset.tv_usec,
+    /// eperd.c:507): where in its second the cycle's run starts
+    /// ([`Start`])
+    pub usec: u32,
     /// The timer is set (eperd's line->event pending). set_timeout sets it
     /// unless the line has expired (eperd.c:741-742); once it has fired,
     /// only set_timeout sets it again.
@@ -44,6 +50,35 @@ pub struct ScheduledTask {
     /// timeout libevent counts, event_add(&line->event, &tv)
     /// (eperd.c:756-776)
     deadline: Instant,
+    /// A push of its crontab is under way and has not repeated it yet
+    /// (eperd's needs_delete, eperd.c:528-529): if it ends so, the line goes
+    pub(crate) needs_delete: bool,
+    /// Set when the line goes, for its run taken and not yet started
+    /// ([`LineGone`])
+    pub(crate) gone: LineGone,
+}
+
+/// Whether a line has gone: a push left it out (DeleteFile) or a STOP took
+/// it. A cycle's run is taken at the tick and then sleeps to its offset's
+/// microseconds ([`Start`]); one whose line goes meanwhile does not start.
+/// In eperd the line's timer has not fired yet: DeleteFile deletes the line
+/// with its timer, or, while its last test is still running, keeps it with
+/// needs_delete, and RunJob then returns without running it
+/// (eperd.c:875-883, 1258-1262). A run already started finishes and
+/// reports, as before.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LineGone(Arc<AtomicBool>);
+
+impl LineGone {
+    /// The line has gone.
+    pub(crate) fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the line has gone.
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// A moment as eperd's loop sees one: the wall clock, which set_timeout and
@@ -132,10 +167,13 @@ impl ScheduledTask {
             job,
             cycle: 0,
             next_run: start_time,
+            usec: 0,
             armed: false,
             generated: 0,
             waittime: 0,
             deadline: now.mono,
+            needs_delete: false,
+            gone: LineGone::default(),
         };
         task.draw_cycle(now);
         task
@@ -206,10 +244,19 @@ impl ScheduledTask {
         if slot(self.start_time, self.interval, self.cycle) < now.wall {
             self.cycle = first_cycle_after(now.wall, self.start_time, self.interval);
         }
-        self.next_run =
-            slot(self.start_time, self.interval, self.cycle) + uniform_offset(self.spread);
+        self.do_distr();
         self.set_timeout(now);
         Fired::Run
+    }
+
+    /// When this cycle's run starts: the second its timer is set for and
+    /// the offset's microseconds in it. Read before [`fire`](Self::fire),
+    /// which draws the next cycle's.
+    pub(crate) fn start(&self) -> Start {
+        Start {
+            second: self.next_run,
+            usec: self.usec,
+        }
     }
 
     /// A crontab repeats this line, with `end_time`. Insert() takes the end
@@ -251,9 +298,18 @@ impl ScheduledTask {
             return;
         }
         self.cycle = first_cycle_after(now.wall, self.start_time, self.interval);
-        self.next_run =
-            slot(self.start_time, self.interval, self.cycle) + uniform_offset(self.spread);
+        self.do_distr();
         self.set_timeout(now);
+    }
+
+    /// eperd's do_distr (eperd.c:489-511) for the cycle: `next_run` its
+    /// slot moved by the offset's seconds, and `usec` the offset's
+    /// microseconds. A line without a spread has none: UNIFORM 0 is NONE
+    /// (eperd.c:597-603).
+    fn do_distr(&mut self) {
+        let (secs, usec) = distr_offset(self.spread);
+        self.next_run = slot(self.start_time, self.interval, self.cycle) + secs;
+        self.usec = usec;
     }
 
     /// eperd's set_timeout(line, 0) (eperd.c:736-776): unless the line has
@@ -261,10 +317,11 @@ impl ScheduledTask {
     /// are kept for RunJob's record. The wait is the timeval set_timeout
     /// arms, tv_sec: nexttime less now, less a second when the offset's
     /// microseconds are fewer than now's (:756-763), 0 if that is negative
-    /// (:764-765). Starla's offsets are whole seconds (do_distr adds
-    /// random() % 1000000 µs, :507; Starla's lines run on a 1 s tick) and
-    /// it reads the clock in whole seconds, the moment itself being some
-    /// way into that second: always the second less.
+    /// (:764-765). Starla's timer is the second's — its lines are taken on
+    /// a 1 s tick, and a run sleeps its offset's microseconds once it is
+    /// taken ([`Start`]) — and it reads the clock in whole seconds, the
+    /// moment itself being some way into that second: always the second
+    /// less.
     ///
     /// The timer's monotonic deadline is the wait event_add counts
     /// (:776): `next_run` less the second read, from the monotonic moment
@@ -367,13 +424,64 @@ fn slot(start_time: i64, interval: u64, cycle: i64) -> i64 {
     start_time.saturating_add(cycle.saturating_mul(interval as i64))
 }
 
-/// eperd's do_distr for UNIFORM: an integer in `[0, spread]`, less
-/// `spread / 2`.
-fn uniform_offset(spread: u64) -> i64 {
+/// eperd's do_distr for UNIFORM (eperd.c:495-508): whole seconds, an
+/// integer in `[0, spread]` less `spread / 2`, and microseconds,
+/// `random() % 1000000`. Without a spread, none.
+fn distr_offset(spread: u64) -> (i64, u32) {
     if spread == 0 {
-        return 0;
+        return (0, 0);
     }
-    rand::rng().random_range(0..=spread) as i64 - (spread / 2) as i64
+    let mut rng = rand::rng();
+    let secs = rng.random_range(0..=spread) as i64 - (spread / 2) as i64;
+    (secs, rng.random_range(0..1_000_000))
+}
+
+/// Where a cycle's run starts: in the second its line's timer was set for,
+/// at the offset's microseconds, as libevent fires eperd's timer
+/// (set_timeout's tv_usec, eperd.c:758-762). Starla takes the line at the
+/// tick that finds its second, which comes as that second begins
+/// (Scheduler::run), and the run sleeps the rest. Every line due in one
+/// second started in the same millisecond, the tick's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Start {
+    /// Unix seconds: the line's `next_run`
+    pub second: i64,
+    pub usec: u32,
+}
+
+impl Start {
+    /// How long a run taken at wall-clock `now` (since the epoch) sleeps
+    /// before it starts: until its microseconds, while `now` is still in
+    /// its second and short of them. Taken in another second — its tick
+    /// late, or its timer's monotonic wait run out under a clock stepped
+    /// back — or past them, it starts at once, as a timer set for a time
+    /// already past fires (:764-765). A run never moves to another second.
+    pub(crate) fn wait(&self, now: Duration) -> Duration {
+        if i64::try_from(now.as_secs()) != Ok(self.second) {
+            return Duration::ZERO;
+        }
+        Duration::from_micros(u64::from(self.usec))
+            .saturating_sub(Duration::from_nanos(u64::from(now.subsec_nanos())))
+    }
+}
+
+/// The wall clock, since the epoch, to the nanosecond.
+pub(crate) fn wall_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// How far after a second of the wall clock begins the scheduler's tick
+/// comes: past the timer's rounding to the millisecond and any difference
+/// between the monotonic clock it sleeps on and the wall clock, over the
+/// one second it sleeps, so that the tick finds the new second.
+const TICK_AFTER_SECOND: Duration = Duration::from_millis(2);
+
+/// The sleep from wall-clock `now` to the scheduler's next tick, just
+/// after the next second begins.
+pub(crate) fn until_next_tick(now: Duration) -> Duration {
+    Duration::from_secs(1) - Duration::from_nanos(u64::from(now.subsec_nanos())) + TICK_AFTER_SECOND
 }
 
 #[cfg(test)]
@@ -492,6 +600,105 @@ mod tests {
         for _ in 0..200 {
             let t = task(now, 900, 312, 20);
             assert!((t.next_run - 1_791_836_412).abs() <= 10, "{}", t.next_run);
+        }
+    }
+
+    /// do_distr draws the offset's microseconds with its seconds, every
+    /// cycle (`random() % 1000000`, eperd.c:507), and a line the next
+    /// crontab repeats keeps both (Insert, :815-824); a line without a
+    /// spread has none (UNIFORM 0 is NONE, :597-603). Starla's offsets
+    /// were whole seconds.
+    #[test]
+    fn each_cycle_draws_do_distrs_microseconds() {
+        let now = 1_791_836_000;
+        let usecs: std::collections::BTreeSet<u32> =
+            (0..200).map(|_| task(now, 900, 312, 20).usec).collect();
+        assert!(usecs.len() > 190, "{} distinct", usecs.len());
+        let (first, last) = (usecs.first().unwrap(), usecs.last().unwrap());
+        assert!(*first < 250_000 && *last > 750_000 && *last < 1_000_000);
+
+        // each cycle that runs draws the next one's afresh
+        let mut t = task(now, 900, 312, 20);
+        let mut drawn = std::collections::BTreeSet::new();
+        for _ in 0..50 {
+            let next = t.next_run;
+            assert_eq!(t.fire(at(next)), Fired::Run);
+            drawn.insert(t.usec);
+        }
+        assert!(drawn.len() > 45, "{} distinct", drawn.len());
+        // a push that repeats the line keeps them
+        let (next_run, usec) = (t.next_run, t.usec);
+        t.take_end_time(2_000_000_001, at(next_run - 100));
+        assert_eq!(
+            t.start(),
+            Start {
+                second: next_run,
+                usec
+            }
+        );
+
+        let mut t = task(now, 900, 312, 0);
+        for _ in 0..10 {
+            assert_eq!(t.usec, 0);
+            let next = t.next_run;
+            assert_eq!(t.fire(at(next)), Fired::Run);
+        }
+    }
+
+    /// A run waits for its microseconds while it is taken in its second,
+    /// short of them, as libevent fires the timer set_timeout set with
+    /// tv_usec (eperd.c:758-762); past them, or taken in another second, it
+    /// starts at once. It never moves to another second.
+    #[test]
+    fn a_run_waits_for_its_microseconds_within_its_second() {
+        let second = 1_791_836_412_u64;
+        let wall = |secs: u64, ms: u64| Duration::from_secs(secs) + Duration::from_millis(ms);
+        let start = Start {
+            second: second as i64,
+            usec: 400_000,
+        };
+        // taken as its second begins: the rest of the way
+        assert_eq!(start.wait(wall(second, 2)), Duration::from_millis(398));
+        assert_eq!(start.wait(wall(second, 100)), Duration::from_millis(300));
+        // past them, or in another second: at once
+        assert_eq!(start.wait(wall(second, 400)), Duration::ZERO);
+        assert_eq!(start.wait(wall(second, 999)), Duration::ZERO);
+        assert_eq!(
+            start.wait(wall(second + 1, 2)),
+            Duration::ZERO,
+            "a late tick"
+        );
+        assert_eq!(
+            start.wait(wall(second - 1, 900)),
+            Duration::ZERO,
+            "an early timer"
+        );
+        for usec in [0, 1, 400_000, 999_999] {
+            let start = Start {
+                second: second as i64,
+                usec,
+            };
+            for ms in [0, 2, 400, 999] {
+                let now = wall(second, ms);
+                let starts = now + start.wait(now);
+                assert_eq!(starts.as_secs(), second, "{usec} µs, taken at {ms} ms");
+                assert!(starts >= now.max(wall(second, 0) + Duration::from_micros(usec.into())));
+            }
+        }
+    }
+
+    /// The scheduler's tick comes 2 ms after each second of the wall clock
+    /// begins, wherever in the second it is asked from.
+    #[test]
+    fn the_tick_comes_as_each_second_begins() {
+        let second = 1_791_836_412_u64;
+        for ms in [0, 1, 2, 500, 998, 999] {
+            let now = Duration::from_secs(second) + Duration::from_millis(ms);
+            assert_eq!(
+                now + until_next_tick(now),
+                Duration::from_secs(second + 1) + Duration::from_millis(2),
+                "{ms}"
+            );
         }
     }
 

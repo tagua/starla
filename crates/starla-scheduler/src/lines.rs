@@ -25,9 +25,10 @@
 //! had run early in its cycle (a negative offset) and was re-sent before
 //! that cycle's slot ran in it again: two results for one slot.
 
-use crate::task::{Fired, Now, ScheduledTask};
+use crate::task::{Fired, LineGone, Now, ScheduledTask, Start};
 use crate::MeasurementJob;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// A crontab file's recurring measurement lines, as the controller last
@@ -65,7 +66,8 @@ pub struct CrontabLine {
 enum LineKey {
     /// A crontab's line, by eperd's identity within its file
     Crontab {
-        file: String,
+        /// Shared by every line of the file: a push of 800 lines makes one
+        file: Arc<str>,
         interval: u64,
         start_time: i64,
         command: String,
@@ -77,7 +79,7 @@ enum LineKey {
 
 impl LineKey {
     fn in_file(&self, name: &str) -> bool {
-        matches!(self, LineKey::Crontab { file, .. } if file == name)
+        matches!(self, LineKey::Crontab { file, .. } if &**file == name)
     }
 }
 
@@ -92,11 +94,25 @@ pub(crate) struct Synchronized {
     pub dropped: usize,
 }
 
+/// A crontab being taken, a line at a time: what SynchronizeFile has done
+/// so far ([`Lines::begin_sync`], [`Lines::insert`], [`Lines::end_sync`]).
+pub(crate) struct Synchronizing {
+    file: Arc<str>,
+    now: Now,
+    synced: Synchronized,
+}
+
 /// What the lines' timers did at a tick.
 #[derive(Debug, Default)]
 pub(crate) struct Due {
     /// The jobs to run
     pub jobs: Vec<MeasurementJob>,
+    /// Where each job's run starts, in the jobs' order: the second its
+    /// line's timer was set for, and the offset's microseconds in it
+    pub starts: Vec<Start>,
+    /// Each job's line, in the jobs' order: set if the line goes before
+    /// the run starts, which then does not ([`LineGone`])
+    pub gone: Vec<LineGone>,
     /// The records of the lines found more than 10 s from their time, in
     /// the order their timers were set to fire
     pub inconsistent: Vec<InconsistentRecord>,
@@ -121,6 +137,9 @@ const TIMER_PASSES: usize = 64;
 #[derive(Default)]
 pub(crate) struct Lines {
     lines: HashMap<LineKey, ScheduledTask>,
+    /// Lines were added or removed since the counts were last taken
+    /// ([`Lines::take_changed`])
+    changed: bool,
 }
 
 impl Lines {
@@ -128,74 +147,115 @@ impl Lines {
     /// starts afresh: the first slot after `now`.
     pub(crate) fn schedule(&mut self, job: MeasurementJob, now: Now) {
         self.lines.insert(LineKey::Own(job.msm_id), start(job, now));
+        self.changed = true;
     }
 
     /// The file's lines are now the crontab's, as SynchronizeFile then
     /// DeleteFile leave them (eperd.c:513-645, 856-895). The other files'
-    /// lines are untouched.
+    /// lines are untouched. All of it at once, for the tests; the scheduler
+    /// takes a crontab a slice at a time, between its own yields
+    /// (Scheduler::synchronize_at).
+    #[cfg(test)]
     pub(crate) fn synchronize(&mut self, crontab: Crontab, now: Now) -> Synchronized {
         let Crontab { file, lines } = crontab;
-        // Every line of the file needs delete (eperd.c:528-529)
-        let (mut old, others): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.lines)
-            .into_iter()
-            .partition(|(key, _)| key.in_file(&file));
-        self.lines = others;
+        let mut sync = self.begin_sync(&file, now);
+        for line in lines {
+            self.insert(&mut sync, line);
+        }
+        self.end_sync(sync)
+    }
 
-        let mut synchronized = Synchronized::default();
-        for CrontabLine { command, job } in lines {
-            // condmv is a line of eperd's crontab, crons/7, which eperd
-            // arms like any other (MeasurementSpec::Condmv). In crons/main
-            // it is perd's, which runs a late line without a record
-            // (perd.c:1226-1248); crons/2 no daemon reads.
-            if !job.spec.measures() && file != EPERD_CRONTAB {
-                continue;
-            }
-            let key = LineKey::Crontab {
-                file: file.clone(),
-                interval: job.interval,
-                start_time: job.start_time,
-                command,
-            };
-            // Insert(): a line the file had keeps its cycle, its offset and
-            // its job, whose test state (PingKept, TracerouteInstance) its
-            // runs share; only the end time is the new line's, and
-            // set_timeout(oldLine, 0) arms the timer it had
-            // (eperd.c:820-824) — unless the line had stopped at its old end
-            // time and its time has long passed (take_end_time). A line
-            // twice in one file is one line, the first, with the later end
-            // time: Insert() finds the first among the lines it has just
-            // inserted.
-            let had = old.remove(&key);
-            let kept = had.is_some();
-            match had.or_else(|| self.lines.remove(&key)) {
-                Some(mut task) => {
-                    task.take_end_time(job.end_time, now);
-                    synchronized.kept += usize::from(kept);
-                    self.lines.insert(key, task);
-                }
-                // Start(): a new line, on the first slot after now
-                // (set_timeout(line, 1), eperd.c:847)
-                None => {
-                    synchronized.added += 1;
-                    self.lines.insert(key, start(job, now));
-                }
+    /// SynchronizeFile's start: every line of the file needs delete
+    /// (eperd.c:528-529). A pass over the lines, hashing nothing.
+    pub(crate) fn begin_sync(&mut self, file: &str, now: Now) -> Synchronizing {
+        for (key, task) in &mut self.lines {
+            if key.in_file(file) {
+                task.needs_delete = true;
             }
         }
-        // DeleteFile(): the lines still marked go. One whose test is still
-        // running stays until it is done, but never starts again (RunJob
-        // returns on needs_delete, eperd.c:1258-1262; DeleteFile,
-        // :875-883): a run under way here has its own copy of the job, and
-        // finishes and reports whatever becomes of its line.
-        synchronized.dropped = old.len();
-        synchronized
+        Synchronizing {
+            file: file.into(),
+            now,
+            synced: Synchronized::default(),
+        }
+    }
+
+    /// Insert() for one line of the crontab: one lookup, and an insert for
+    /// a new line.
+    pub(crate) fn insert(&mut self, sync: &mut Synchronizing, line: CrontabLine) {
+        let CrontabLine { command, job } = line;
+        // condmv is a line of eperd's crontab, crons/7, which eperd arms
+        // like any other (MeasurementSpec::Condmv). In crons/main it is
+        // perd's, which runs a late line without a record
+        // (perd.c:1226-1248); crons/2 no daemon reads.
+        if !job.spec.measures() && &*sync.file != EPERD_CRONTAB {
+            return;
+        }
+        let key = LineKey::Crontab {
+            file: Arc::clone(&sync.file),
+            interval: job.interval,
+            start_time: job.start_time,
+            command,
+        };
+        // Insert(): a line the file had keeps its cycle, its offset and its
+        // job, whose test state (PingKept, TracerouteInstance) its runs
+        // share; only the end time is the new line's, and
+        // set_timeout(oldLine, 0) arms the timer it had (eperd.c:820-824) —
+        // unless the line had stopped at its old end time and its time has
+        // long passed (take_end_time). A line twice in one file is one
+        // line, the first, with the later end time: Insert() finds the
+        // first among the lines it has just inserted, which needs no
+        // delete and is not counted again.
+        match self.lines.get_mut(&key) {
+            Some(task) => {
+                sync.synced.kept += usize::from(std::mem::take(&mut task.needs_delete));
+                task.take_end_time(job.end_time, sync.now);
+            }
+            // Start(): a new line, on the first slot after now
+            // (set_timeout(line, 1), eperd.c:847)
+            None => {
+                sync.synced.added += 1;
+                self.lines.insert(key, start(job, sync.now));
+            }
+        }
+    }
+
+    /// DeleteFile(): the file's lines still marked go. One whose test is
+    /// still running stays until it is done, but never starts again (RunJob
+    /// returns on needs_delete, eperd.c:1258-1262; DeleteFile, :875-883): a
+    /// run under way here has its own copy of the job, and finishes and
+    /// reports whatever becomes of its line.
+    pub(crate) fn end_sync(&mut self, sync: Synchronizing) -> Synchronized {
+        let Synchronizing {
+            file, mut synced, ..
+        } = sync;
+        let before = self.lines.len();
+        self.lines.retain(|key, task| {
+            let goes = task.needs_delete && key.in_file(&file);
+            if goes {
+                task.gone.set();
+            }
+            !goes
+        });
+        synced.dropped = before - self.lines.len();
+        self.changed |= synced.added + synced.dropped > 0;
+        synced
     }
 
     /// STOP <msm_id>, Starla's own command: every line with that id, in
     /// any crontab. How many there were.
     pub(crate) fn stop(&mut self, msm_id: u64) -> usize {
         let before = self.lines.len();
-        self.lines.retain(|_, task| task.job.msm_id != msm_id);
-        before - self.lines.len()
+        self.lines.retain(|_, task| {
+            let goes = task.job.msm_id == msm_id;
+            if goes {
+                task.gone.set();
+            }
+            !goes
+        });
+        let stopped = before - self.lines.len();
+        self.changed |= stopped > 0;
+        stopped
     }
 
     /// The lines whose timers fire at `now`, each as RunJob takes it
@@ -241,6 +301,7 @@ impl Lines {
     fn fire_due(&mut self, now: Now, due: &mut Due) -> usize {
         let mut fired = 0;
         let mut inconsistent = Vec::new();
+        let changed = &mut self.changed;
         self.lines.retain(|key, task| {
             let own = matches!(key, LineKey::Own(_));
             // An Own line whose next slot is already past its end time will
@@ -251,8 +312,10 @@ impl Lines {
                     msm_id = task.job.msm_id,
                     "Measurement expired, removing from schedule"
                 );
+                *changed = true;
                 return false;
             }
+            let start = task.start();
             let fire = task.fire(now);
             if fire == Fired::NotYet {
                 return true;
@@ -262,7 +325,11 @@ impl Lines {
                 Fired::NotYet => {}
                 // condmv's run is the uploader's (MeasurementSpec::Condmv)
                 Fired::Run if !task.job.spec.measures() => {}
-                Fired::Run => due.jobs.push(task.job.clone()),
+                Fired::Run => {
+                    due.jobs.push(task.job.clone());
+                    due.starts.push(start);
+                    due.gone.push(task.gone.clone());
+                }
                 Fired::Expired => {}
                 Fired::Inconsistent(times) => match key {
                     LineKey::Crontab { command, .. } => {
@@ -292,6 +359,7 @@ impl Lines {
                     msm_id = task.job.msm_id,
                     "Measurement expired, removing from schedule"
                 );
+                *changed = true;
                 return false;
             }
             true
@@ -307,23 +375,40 @@ impl Lines {
         self.lines.len()
     }
 
+    /// Whether lines were added or removed since the last call: the counts
+    /// the status shows are stale.
+    pub(crate) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// The counts the status shows are still stale.
+    pub(crate) fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
     /// The lines by measurement type ("ping", "dns", ...): crons/7's
     /// condmv line, which measures nothing, is not one.
     pub(crate) fn counts(&self) -> HashMap<String, u64> {
-        let mut counts: HashMap<String, u64> = HashMap::new();
+        // A handful of types: a list beats hashing a name per line
+        let mut counts: Vec<(&'static str, u64)> = Vec::new();
         for task in self.lines.values().filter(|task| task.job.spec.measures()) {
-            *counts
-                .entry(task.job.spec.type_name().to_string())
-                .or_insert(0) += 1;
+            let name = task.job.spec.type_name();
+            match counts.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((name, 1)),
+            }
         }
         counts
+            .into_iter()
+            .map(|(name, n)| (name.to_string(), n))
+            .collect()
     }
 
     /// The task of a crontab's line, if the file has it.
     #[cfg(test)]
     fn line(&self, file: &str, line: &CrontabLine) -> Option<&ScheduledTask> {
         self.lines.get(&LineKey::Crontab {
-            file: file.to_string(),
+            file: file.into(),
             interval: line.job.interval,
             start_time: line.job.start_time,
             command: line.command.clone(),
@@ -333,7 +418,7 @@ impl Lines {
     #[cfg(test)]
     fn line_mut(&mut self, file: &str, line: &CrontabLine) -> Option<&mut ScheduledTask> {
         self.lines.get_mut(&LineKey::Crontab {
-            file: file.to_string(),
+            file: file.into(),
             interval: line.job.interval,
             start_time: line.job.start_time,
             command: line.command.clone(),
@@ -921,6 +1006,37 @@ mod tests {
         assert_eq!(lines.len(), 2);
     }
 
+    /// Every line due in one second runs in it, each at its own offset's
+    /// microseconds: with each job take_due hands over the second its
+    /// line's timer was set for and the microseconds drawn with it
+    /// (do_distr and set_timeout's tv_usec, eperd.c:507, 758-762), which
+    /// its run sleeps (Scheduler::spawn_run). Starla started every run a
+    /// tick took in that tick's millisecond.
+    #[test]
+    fn the_runs_due_in_one_second_start_at_their_lines_microseconds() {
+        let slot = 1_791_836_412; // 312 + k * 900
+        let pings: Vec<_> = (0..16)
+            .map(|i| ping_line(1000 + i, 900, 312, 2_000_000_000, 20, "193.0.14.129"))
+            .collect();
+        let mut lines = Lines::default();
+        lines.synchronize(crontab(CRONS_7, &pings), at(slot - 400));
+        // every line's time the slot itself, its microseconds as drawn
+        let mut drawn = HashMap::new();
+        for task in lines.lines.values_mut() {
+            task.set_next_run(slot, at(slot - 400));
+            drawn.insert(task.job.msm_id, task.usec);
+        }
+        assert!(lines.take_due(at(slot - 1)).jobs.is_empty());
+        let due = lines.take_due(at(slot));
+        assert_eq!((due.jobs.len(), due.starts.len()), (16, 16));
+        for (job, start) in due.jobs.iter().zip(&due.starts) {
+            let usec = drawn[&job.msm_id];
+            assert_eq!(*start, Start { second: slot, usec }, "{}", job.msm_id);
+        }
+        let usecs: std::collections::BTreeSet<_> = due.starts.iter().map(|s| s.usec).collect();
+        assert!(usecs.len() > 14, "{usecs:?}");
+    }
+
     #[test]
     fn stop_takes_every_line_with_the_id() {
         let now = 1_791_836_000;
@@ -948,6 +1064,49 @@ mod tests {
         // and no crontab touches it
         lines.synchronize(crontab(CRONS_7, &[]), at(now));
         assert_eq!(lines.len(), 1);
+    }
+
+    /// A run taken at a tick carries its line's LineGone: set once a push
+    /// of the line's file leaves it out, or a STOP takes it; not by a push
+    /// that repeats it, nor by another file's push.
+    #[test]
+    fn a_taken_run_learns_when_its_line_goes() {
+        let slot = 1_791_836_412;
+        let line = ping_line(1001, 900, 312, 2_000_000_000, 0, "193.0.14.129");
+        let other = ping_line(1002, 900, 312, 2_000_000_000, 0, "193.0.14.130");
+        let taken = || {
+            let mut lines = Lines::default();
+            lines.synchronize(
+                crontab(CRONS_7, std::slice::from_ref(&line)),
+                at(slot - 400),
+            );
+            lines.synchronize(
+                crontab(CRONS_MAIN, std::slice::from_ref(&other)),
+                at(slot - 400),
+            );
+            let due = lines.take_due(at(slot));
+            assert_eq!(due.jobs.len(), 2);
+            assert_eq!(due.gone.len(), 2);
+            let at_7 = due.jobs.iter().position(|j| j.msm_id == 1001).unwrap();
+            let gone = due.gone[at_7].clone();
+            assert!(!gone.is_set());
+            (lines, gone)
+        };
+
+        // Repeated, and another file's push: the line stays
+        let (mut lines, gone) = taken();
+        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&line)), at(slot));
+        lines.synchronize(crontab(CRONS_MAIN, &[]), at(slot));
+        assert!(!gone.is_set());
+
+        // Left out by its file's push
+        lines.synchronize(crontab(CRONS_7, &[]), at(slot));
+        assert!(gone.is_set());
+
+        // Taken by a STOP
+        let (mut lines, gone) = taken();
+        assert_eq!(lines.stop(1001), 1);
+        assert!(gone.is_set());
     }
 
     /// RunJob runs a line whose timer fires within 10 s of its time; from

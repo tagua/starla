@@ -8,6 +8,12 @@
 //! - Telnet server for receiving measurement commands
 //! - Scheduler for running measurements
 //! - Results uploader for reporting back
+//!
+//! The scheduler and the measurements run on a runtime of their own, and
+//! everything else on a background runtime at a lower priority
+//! (runtimes.rs).
+
+mod runtimes;
 
 use anyhow::Result;
 use clap::Parser;
@@ -16,14 +22,14 @@ use starla_controller::{
     registration::DEFAULT_WAIT_SECS, ConKeep, InitResponse, KnownHosts, ProbeInitInfo, RegState,
     RegStep, SshConfig, SshConnection, TelnetCommand,
 };
-#[cfg(feature = "metrics-export")]
 use starla_metrics::MetricsRegistry;
 use starla_results::{
-    ResultHandler, ResultHandlerConfig, UploadStream, UploadTransport, UploaderConfig,
+    HostTelemetry, ResultHandler, ResultHandlerConfig, UploadStream, UploadTransport,
+    UploaderConfig,
 };
 use starla_scheduler::{
-    DnsJobSpec, HttpJobSpec, MeasurementJob, MeasurementSpec, NtpJobSpec, PingJobSpec,
-    SchedulerCommand, TlsJobSpec, TracerouteJobSpec,
+    DnsJobSpec, HttpJobSpec, MeasurementJob, MeasurementSpec, NtpJobSpec, PauseSwitch, PingJobSpec,
+    SchedulerCommand, SchedulerStatus, TlsJobSpec, TracerouteJobSpec,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -224,8 +230,11 @@ impl RegistrationNotice {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Starla's threads (runtimes.rs): this one reads the config and starts
+/// logging, builds the measurement runtime and starts the scheduler on it,
+/// then waits for the background thread, which runs everything else, to
+/// end.
+fn main() -> Result<()> {
     let args = Args::parse();
 
     // Apply CLI overrides before any path resolution
@@ -301,13 +310,20 @@ async fn main() -> Result<()> {
         json_format: cfg!(feature = "structured-logging") && config.logging.format != "text",
     };
 
-    init_logging(log_config)?;
+    // Held to the end of main: the log is written only while it lives.
+    let _log_guard = init_logging(log_config)?;
 
     info!(
         "Starla v{} (fw {})",
         starla_common::VERSION,
         starla_common::FIRMWARE_VERSION
     );
+    // Before any measurement runs; off unless the config asks.
+    starla_network::rxstamp::set_enabled(config.measurements.kernel_rx_timestamps);
+    // resolv.conf and the hosts file, for the measurements' lookups, before
+    // any measurement runs; then every minute from the background runtime
+    let _ = starla_measurements::target::Resolver::read_system();
+    let _ = starla_measurements::dns::resolver::refresh_local_resolvers();
 
     debug!("Config file: {}", config_path.display());
     if !config_found {
@@ -343,11 +359,112 @@ async fn main() -> Result<()> {
     debug!("Runtime directory: {}", runtime_dir.display());
 
     // Probe ID is received from the registration server during INIT
-    let mut probe_id = starla_common::ProbeId(0);
+    let probe_id = starla_common::ProbeId(0);
 
-    // Initialize Metrics (only when feature is enabled)
-    #[cfg(feature = "metrics-export")]
+    // The measurement runtime: the scheduler and the measurements, and
+    // nothing else. Built first, from this thread, so that its workers keep
+    // the unit's priority (runtimes.rs).
+    let measurement = runtimes::measurement()?;
+
+    // Initialize Metrics (a no-op registry without the metrics-export
+    // feature)
     let metrics = MetricsRegistry::new()?;
+
+    // Initialize Results Handler with in-memory queue
+    let ssh_for_upload: Arc<tokio::sync::Mutex<Option<Arc<SshConnection>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let transport = Box::new(SshUploadTransport {
+        ssh: ssh_for_upload.clone(),
+    });
+
+    let result_handler = Arc::new(ResultHandler::new(
+        transport,
+        UploaderConfig::default(),
+        ResultHandlerConfig {
+            max_queue_size: config.storage.max_queue_size,
+            // [network] rxtxrpt: the reference only sends the 9002 interface
+            // counters when RXTXRPT=yes. This was always left at the default.
+            rxtxrpt: config.network.rxtxrpt,
+            // Persist the last clock sync so lts survives a restart.
+            timesync_path: Some(state_dir.join("timesync")),
+            ..ResultHandlerConfig::default()
+        },
+        metrics.clone(),
+    ));
+
+    // Initialize Scheduler: its runs hand their results to the handler's
+    // sink, and it reads the tray's pause from a switch the background
+    // keeps set
+    let mut scheduler = starla_scheduler::Scheduler::new(probe_id, metrics.clone());
+    scheduler.set_result_handler(result_handler.clone());
+    let pause = scheduler.pause_switch();
+
+    let scheduler_tx = scheduler.command_sender();
+    let scheduler_cancel = scheduler.cancel_token();
+    let scheduler_status = scheduler.status_handle();
+
+    // Start Scheduler Loop, on the measurement runtime
+    let scheduler_task = measurement.spawn(async move {
+        scheduler.run().await;
+    });
+
+    // Everything else, on the background runtime, until the probe shuts
+    // down
+    let background = Background {
+        config,
+        runtime_dir,
+        probe_id,
+        metrics,
+        result_handler,
+        ssh_for_upload,
+        scheduler_tx,
+        scheduler_cancel,
+        scheduler_status,
+        scheduler_task,
+        pause,
+    };
+    let ended = runtimes::spawn_background(move || run_background(background))?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // The measurements under way end with their runtime
+    drop(measurement);
+    ended
+}
+
+/// What the background runtime takes over from [`main`].
+struct Background {
+    config: starla_common::ProbeConfig,
+    runtime_dir: PathBuf,
+    probe_id: starla_common::ProbeId,
+    metrics: MetricsRegistry,
+    result_handler: Arc<ResultHandler>,
+    ssh_for_upload: Arc<tokio::sync::Mutex<Option<Arc<SshConnection>>>>,
+    scheduler_tx: mpsc::Sender<SchedulerCommand>,
+    scheduler_cancel: CancellationToken,
+    scheduler_status: SchedulerStatus,
+    scheduler_task: tokio::task::JoinHandle<()>,
+    pause: PauseSwitch,
+}
+
+/// Everything but the measurements, on the background runtime
+/// (runtimes.rs): the metrics server, the tray's pause, the controller's
+/// commands, host telemetry, the status socket, registration and the
+/// controller connection, and the result handler's uploads. Returns when the
+/// probe shuts down.
+async fn run_background(background: Background) -> Result<()> {
+    let Background {
+        config,
+        runtime_dir,
+        mut probe_id,
+        metrics,
+        result_handler,
+        ssh_for_upload,
+        scheduler_tx,
+        scheduler_cancel,
+        scheduler_status,
+        mut scheduler_task,
+        pause,
+    } = background;
 
     // Start Metrics Server if enabled
     #[allow(unused_variables)]
@@ -378,50 +495,34 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize Results Handler with in-memory queue
-    let ssh_for_upload: Arc<tokio::sync::Mutex<Option<Arc<SshConnection>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let transport = Box::new(SshUploadTransport {
-        ssh: ssh_for_upload.clone(),
-    });
-
-    #[cfg(feature = "metrics-export")]
-    let metrics_for_results = metrics.clone();
-    #[cfg(not(feature = "metrics-export"))]
-    let metrics_for_results = starla_metrics::MetricsRegistry;
-
-    let result_handler = Arc::new(ResultHandler::new(
-        transport,
-        UploaderConfig::default(),
-        ResultHandlerConfig {
-            max_queue_size: config.storage.max_queue_size,
-            // [network] rxtxrpt: the reference only sends the 9002 interface
-            // counters when RXTXRPT=yes. This was always left at the default.
-            rxtxrpt: config.network.rxtxrpt,
-            // Persist the last clock sync so lts survives a restart.
-            timesync_path: Some(state_dir.join("timesync")),
-            ..ResultHandlerConfig::default()
-        },
-        metrics_for_results,
-    ));
-
-    // Initialize Scheduler
-    #[cfg(feature = "metrics-export")]
-    let metrics_for_scheduler = metrics.clone();
-    #[cfg(not(feature = "metrics-export"))]
-    let metrics_for_scheduler = starla_metrics::MetricsRegistry;
-
-    let mut scheduler = starla_scheduler::Scheduler::new(probe_id, metrics_for_scheduler);
-    scheduler.set_result_handler(result_handler.clone());
-
-    let scheduler_tx = scheduler.command_sender();
-    let scheduler_cancel = scheduler.cancel_token();
-    let scheduler_status = scheduler.status_handle();
-
     let result_cancel_token = CancellationToken::new();
 
+    // The tray's pause file, read here once a second for the scheduler,
+    // whose tick used to read it on a measurement worker
+    tokio::spawn(pause.follow_tray(scheduler_cancel.clone()));
+
+    // resolv.conf and the hosts file, read here every minute for the
+    // measurements' lookups, as eperd checks resolv.conf every minute
+    // (CheckUpdates); a lookup used to read both on a measurement worker.
+    // main read them at start-up.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(RESOLV_CONF_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let read = tokio::task::spawn_blocking(|| {
+                starla_measurements::target::Resolver::read_system();
+                starla_measurements::dns::resolver::refresh_local_resolvers();
+            });
+            if let Err(e) = read.await {
+                warn!("Reading resolv.conf and the hosts file failed: {}", e);
+            }
+        }
+    });
+
     // Create channel for receiving telnet commands
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<TelnetCommand>(100);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<TelnetCommand>(100);
 
     // Telnet state: passed to SSH connections so forwarded connections
     // are handled directly without a local TCP listener
@@ -432,13 +533,6 @@ async fn main() -> Result<()> {
         session_id: telnet_session_id.clone(),
     };
 
-    // Command handler task - converts telnet commands to scheduler jobs
-    #[cfg(feature = "metrics-export")]
-    let metrics_cmd = metrics.clone();
-    let scheduler_tx_cmd = scheduler_tx.clone();
-    let scheduler_cancel_cmd = scheduler_cancel.clone();
-    let host_telemetry_cmd = result_handler.host_telemetry();
-    let result_handler_cmd = result_handler.clone();
     // THE ADDRESS REPORT IS THE PROBE'S OWN JOB, NOT THE CONTROLLER'S. The
     // reference probe runs `rptaddrs -A 9104` in its main loop, every pass
     // (`bin/ripe-atlas.in`: `rptaddrs …`, then `sleepkick 180`), and RIPE's
@@ -451,389 +545,20 @@ async fn main() -> Result<()> {
     // worked. The reporter's cache keeps this to one line per change, or one
     // an hour, as the C applet's `-c` file does. A controller CRONLINE for
     // rptaddrs still replaces this schedule (`HostTelemetry::schedule`).
-    host_telemetry_cmd
+    let host_telemetry = result_handler.host_telemetry();
+    host_telemetry
         .schedule_rptaddrs(RPTADDRS_INTERVAL_SECS, RPTADDRS_MSM_ID)
         .await;
-    tokio::spawn(async move {
-        // Track scheduled measurements for batched logging
-        let mut scheduled_counts: std::collections::HashMap<&'static str, u32> =
-            std::collections::HashMap::new();
-        let mut last_log_time = std::time::Instant::now();
-        const LOG_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-        // Helper to log and reset counts
-        let log_scheduled_summary = |counts: &mut std::collections::HashMap<&'static str, u32>| {
-            if counts.is_empty() {
-                return;
-            }
-            let summary: Vec<String> = counts
-                .iter()
-                .map(|(typ, count)| format!("{}: {}", typ, count))
-                .collect();
-            info!("Scheduled measurements: {}", summary.join(", "));
-            counts.clear();
-        };
-
-        // A crontab comes whole, once the controller has ended it
-        // (CrontabSpec). Its lines are taken one by one, each as any command,
-        // and its recurring measurements gathered: once its last line is
-        // taken, they are its file's line set, which the scheduler takes as
-        // one (SchedulerCommand::Crontab), as eperd reads a crontab anew
-        // (eperd.c:513-645). Each keeps its command text (cl_Shell), which
-        // with its interval and start time makes it the same line in the
-        // controller's next push.
-        let mut crontab_lines = std::collections::VecDeque::new();
-        let mut crontab: Option<starla_scheduler::Crontab> = None;
-
-        loop {
-            let (cmd, shell) = if let Some((cmd, shell)) = crontab_lines.pop_front() {
-                (cmd, Some(shell))
-            } else {
-                if let Some(crontab) = crontab.take() {
-                    let send = scheduler_tx_cmd.send(SchedulerCommand::Crontab(crontab));
-                    if let Err(e) = send.await {
-                        scheduler_send_failed(&scheduler_cancel_cmd, e);
-                        break;
-                    }
-                }
-
-                // Use timeout to batch log messages
-                let cmd = tokio::select! {
-                    cmd = cmd_rx.recv() => cmd,
-                    _ = tokio::time::sleep(LOG_BATCH_INTERVAL) => {
-                        // Timeout - log any accumulated counts
-                        log_scheduled_summary(&mut scheduled_counts);
-                        last_log_time = std::time::Instant::now();
-                        continue;
-                    }
-                };
-
-                let Some(cmd) = cmd else {
-                    // Channel closed - log final counts
-                    log_scheduled_summary(&mut scheduled_counts);
-                    break;
-                };
-
-                if let TelnetCommand::Crontab(spec) = cmd {
-                    debug!("Crontab {}: {} CRONLINEs", spec.dir, spec.lines.len());
-                    crontab_lines.extend(spec.lines.into_iter().map(|line| {
-                        let shell = line.shell().to_string();
-                        (line.command, shell)
-                    }));
-                    crontab = Some(starla_scheduler::Crontab {
-                        file: spec.dir,
-                        lines: Vec::new(),
-                    });
-                    continue;
-                }
-                (cmd, None)
-            };
-
-            // Check if scheduler has been cancelled
-            if scheduler_cancel_cmd.is_cancelled() {
-                debug!("Scheduler cancelled, stopping command handler");
-                break;
-            }
-
-            // Log accumulated counts if enough time has passed
-            if last_log_time.elapsed() >= LOG_BATCH_INTERVAL && !scheduled_counts.is_empty() {
-                log_scheduled_summary(&mut scheduled_counts);
-                last_log_time = std::time::Instant::now();
-            }
-
-            debug!("Processing command: {:?}", cmd);
-
-            // A ONEOFF's result is eooqd's: posted on its own, at once, with
-            // `&SRC=oneoff` (eooqd.c:792-820), not in the next main upload.
-            let cmd = match cmd {
-                TelnetCommand::Oneoff(inner) => {
-                    if let Some(msm_id) = oneoff_msm_id(&inner) {
-                        result_handler_cmd.expect_oneoff(msm_id).await;
-                    }
-                    *inner
-                }
-                cmd => cmd,
-            };
-
-            // Helper macro to schedule/execute a measurement job.
-            // Handles logging, metrics, and recurring vs one-shot dispatch.
-            macro_rules! dispatch_measurement {
-                ($msm_id:expr, $schedule:expr, $spread:expr,
-                 $type_name:expr, $metric_name:expr, $measurement_spec:expr) => {{
-                    let is_recurring = $schedule.interval > 0;
-                    if is_recurring {
-                        debug!(
-                            msm_id = $msm_id,
-                            interval = $schedule.interval,
-                            "Scheduled {} measurement",
-                            $type_name
-                        );
-                        *scheduled_counts.entry($type_name).or_insert(0) += 1;
-                    } else {
-                        debug!(msm_id = $msm_id, "One-shot {}", $type_name);
-                    }
-                    #[cfg(feature = "metrics-export")]
-                    metrics_cmd.record_measurement_started($metric_name);
-                    let job = MeasurementJob {
-                        msm_id: $msm_id,
-                        interval: $schedule.interval,
-                        start_time: $schedule.start_time,
-                        end_time: $schedule.stop_time,
-                        spread: $spread.unwrap_or(0) as u64,
-                        spec: $measurement_spec,
-                    };
-                    if is_recurring {
-                        match (&mut crontab, &shell) {
-                            // A crontab's line: one of its file's line set
-                            (Some(crontab), Some(shell)) => {
-                                crontab.lines.push(starla_scheduler::CrontabLine {
-                                    command: shell.clone(),
-                                    job,
-                                });
-                                Ok(())
-                            }
-                            _ => scheduler_tx_cmd.send(SchedulerCommand::Schedule(job)).await,
-                        }
-                    } else {
-                        scheduler_tx_cmd
-                            .send(SchedulerCommand::ExecuteNow(job))
-                            .await
-                    }
-                }};
-            }
-
-            let result = match cmd {
-                TelnetCommand::Ping(spec) => dispatch_measurement!(
-                    spec.msm_id,
-                    spec.schedule,
-                    spec.spread,
-                    "ping",
-                    "ping",
-                    MeasurementSpec::Ping(PingJobSpec {
-                        // A redelivered line keeps what its runs left.
-                        kept: starla_scheduler::job::PingKept::for_line(
-                            starla_scheduler::job::PingLine {
-                                msm_id: spec.msm_id,
-                                target: spec.target.clone(),
-                                af: spec.af,
-                                packets: spec.packets,
-                                packet_interval: spec.packet_interval,
-                                size: spec.size,
-                                interval: spec.schedule.interval,
-                                start_time: spec.schedule.start_time,
-                            }
-                        ),
-                        target: spec.target,
-                        af: spec.af,
-                        packets: spec.packets,
-                        packet_interval: spec.packet_interval,
-                        size: spec.size,
-                    })
-                ),
-                TelnetCommand::Traceroute(spec) => dispatch_measurement!(
-                    spec.msm_id,
-                    spec.schedule,
-                    spec.spread,
-                    "traceroute",
-                    "traceroute",
-                    MeasurementSpec::Traceroute(TracerouteJobSpec {
-                        // A redelivered line keeps its slot and Paris id.
-                        instance: starla_scheduler::job::TracerouteInstance::for_line(
-                            spec.msm_id,
-                            &spec.target,
-                            spec.af,
-                            &spec.opts,
-                            spec.schedule.interval,
-                            spec.schedule.start_time,
-                        ),
-                        target: spec.target,
-                        af: spec.af,
-                        opts: spec.opts,
-                    })
-                ),
-                TelnetCommand::Dns(spec) => dispatch_measurement!(
-                    spec.msm_id,
-                    spec.schedule,
-                    spec.spread,
-                    "dns",
-                    "dns",
-                    MeasurementSpec::Dns(DnsJobSpec {
-                        server: spec.target,
-                        af: spec.af,
-                        tcp: spec.protocol == "TCP",
-                        port: spec.port,
-                        qtype: spec.qtype,
-                        qclass: spec.qclass,
-                        query: spec.query_argument,
-                        resolv: spec.resolv,
-                        interface: spec.interface,
-                        rd: spec.rd,
-                        ad: spec.ad,
-                        cd: spec.cd,
-                        dnssec: spec.dnssec,
-                        nsid: spec.nsid,
-                        client_subnet: spec.client_subnet,
-                        cookies: spec.cookies,
-                        edns0: spec.edns0,
-                        edns_version: spec.edns_version,
-                        edns_flags: spec.edns_flags,
-                        edns_option: spec.edns_option,
-                        qbuf: spec.qbuf,
-                        abuf: spec.abuf,
-                        prepend_probe_id: spec.prepend_probe_id,
-                        timeout_ms: spec.timeout_ms,
-                        retry: spec.retry,
-                        bundle: spec.bundle,
-                        ttl: spec.ttl,
-                        // ATLAS_DISABLE_CHECK_ADDR is read from the
-                        // environment; nothing is left over yet
-                        ..Default::default()
-                    })
-                ),
-                TelnetCommand::Http(spec) => dispatch_measurement!(
-                    spec.msm_id,
-                    spec.schedule,
-                    spec.spread,
-                    "http",
-                    "http",
-                    MeasurementSpec::Http(HttpJobSpec {
-                        url: spec.url,
-                        method: spec.method,
-                        af: spec.af,
-                        headers: spec.headers,
-                        body: spec.body,
-                        max_body_size: spec.max_body_size,
-                        store_headers: spec.store_headers,
-                        http10: spec.http10,
-                        timeout_ms: spec.timeout_ms,
-                    })
-                ),
-                TelnetCommand::Tls(spec) => dispatch_measurement!(
-                    spec.msm_id,
-                    spec.schedule,
-                    spec.spread,
-                    "tls",
-                    "sslcert",
-                    MeasurementSpec::Tls(TlsJobSpec {
-                        target: spec.target,
-                        port: spec.port,
-                        af: spec.af,
-                        hostname: spec.hostname,
-                    })
-                ),
-                TelnetCommand::Ntp(spec) => dispatch_measurement!(
-                    spec.msm_id,
-                    spec.schedule,
-                    spec.spread,
-                    "ntp",
-                    "ntp",
-                    MeasurementSpec::Ntp(NtpJobSpec {
-                        target: spec.target,
-                        af: spec.af,
-                        packets: spec.packets,
-                        timeout_ms: spec.timeout_ms,
-                        gap_ms: spec.gap_ms,
-                    })
-                ),
-                TelnetCommand::HostTelemetry(spec) => {
-                    debug!(?spec.kind, interval = spec.interval, "Scheduling host telemetry");
-                    match spec.kind {
-                        starla_controller::HostTelemetryKind::Buddyinfo => {
-                            host_telemetry_cmd
-                                .schedule_buddyinfo(spec.interval, spec.lowmem, spec.msm_id)
-                                .await;
-                        }
-                        starla_controller::HostTelemetryKind::Rptaddrs => {
-                            let msm_id = spec.msm_id.unwrap_or(RPTADDRS_MSM_ID);
-                            host_telemetry_cmd
-                                .schedule_rptaddrs(spec.interval, msm_id)
-                                .await;
-                        }
-                    }
-                    Ok(())
-                }
-                TelnetCommand::Httppost(spec) => {
-                    // The controller's upload line: its URL, on perd's slots.
-                    let line = starla_results::HttppostLine {
-                        schedule: starla_results::PostSchedule {
-                            interval: spec.interval,
-                            start_time: spec.start_time,
-                            end_time: spec.end_time,
-                            spread: spec.spread as u64,
-                        },
-                        url: spec.url,
-                        post_dir: spec.post_dir,
-                        set_time: spec.set_time,
-                        local_time: spec.local_time,
-                    };
-                    if let Err(e) = result_handler_cmd.set_httppost_line(line).await {
-                        warn!("Ignoring httppost line: {}", e);
-                    }
-                    Ok(())
-                }
-                TelnetCommand::Oneoff(_) => {
-                    // A ONEOFF inside a ONEOFF: the parser makes none.
-                    Ok(())
-                }
-                TelnetCommand::Crontab(_) => {
-                    // A crontab inside a crontab: its lines are CRONLINEs.
-                    Ok(())
-                }
-                TelnetCommand::Status => {
-                    debug!("Status request received");
-                    Ok(())
-                }
-                TelnetCommand::Stop(msm_id) => {
-                    debug!(msm_id, "Stop measurement request");
-                    scheduler_tx_cmd.send(SchedulerCommand::Stop(msm_id)).await
-                }
-                TelnetCommand::Condmv(spec) => {
-                    // A crontab's condmv line keeps its timer, for eperd's
-                    // record of it when the time is off; the scheduler
-                    // takes it in eperd's crontab, crons/7, only
-                    // (MeasurementSpec::Condmv). Outside a crontab, or as a
-                    // one-off, it is the uploader's, and nothing here.
-                    match (&mut crontab, &shell) {
-                        (Some(crontab), Some(shell)) if spec.schedule.interval > 0 => {
-                            crontab.lines.push(starla_scheduler::CrontabLine {
-                                command: shell.clone(),
-                                job: MeasurementJob {
-                                    msm_id: 0,
-                                    interval: spec.schedule.interval,
-                                    start_time: spec.schedule.start_time,
-                                    end_time: spec.schedule.stop_time,
-                                    spread: spec.spread.unwrap_or(0) as u64,
-                                    spec: MeasurementSpec::Condmv,
-                                },
-                            });
-                        }
-                        _ => debug!("condmv line outside a crontab: the uploader's"),
-                    }
-                    Ok(())
-                }
-                TelnetCommand::Ignored(_) => {
-                    // Known commands that we don't need to handle (dfrm,
-                    // internal Atlas commands)
-                    Ok(())
-                }
-                TelnetCommand::Unknown(s) => {
-                    warn!("Unknown command: {}", s);
-                    Ok(())
-                }
-            };
-
-            if let Err(e) = result {
-                scheduler_send_failed(&scheduler_cancel_cmd, e);
-                break;
-            }
-        }
-        debug!("Command handler task ended");
-    });
-
-    // Start Scheduler Loop
-    let mut scheduler_task = tokio::spawn(async move {
-        scheduler.run().await;
-    });
+    // Command handler task - converts telnet commands to scheduler jobs
+    tokio::spawn(run_commands(
+        cmd_rx,
+        scheduler_tx,
+        scheduler_cancel.clone(),
+        host_telemetry,
+        result_handler.clone(),
+        metrics.clone(),
+    ));
 
     debug!("Probe initialization complete");
 
@@ -1090,7 +815,6 @@ async fn main() -> Result<()> {
             let probe_info = ProbeInitInfo::reregister(starla_common::FIRMWARE_VERSION, reason);
 
             // Connect to registration server
-            #[cfg(feature = "metrics-export")]
             metrics.record_connection_attempt();
             let reg_ssh = match starla_controller::SshConnection::connect_to_servers(
                 &servers,
@@ -1479,7 +1203,6 @@ async fn main() -> Result<()> {
                     info!("Controller connection established successfully");
                     let session_started_at = std::time::Instant::now();
                     probe_status.lock().await.connected = true;
-                    #[cfg(feature = "metrics-export")]
                     metrics.set_connected(true);
 
                     // Start the result upload loop once (on first successful connection)
@@ -1526,7 +1249,6 @@ async fn main() -> Result<()> {
                                 _ => warn!("KEEP session ended"),
                             }
                             probe_status.lock().await.connected = false;
-                            #[cfg(feature = "metrics-export")]
                             metrics.set_connected(false);
                             // Clear SSH connection so uploads fail fast
                             *ssh_for_upload.lock().await = None;
@@ -1604,6 +1326,407 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/// The controller's commands, as telnet hands them over: each made a
+/// scheduler job, a result-handler or a telemetry setting. Runs on the
+/// background runtime; nothing here waits on the measurement runtime but a
+/// full scheduler command channel.
+async fn run_commands(
+    mut cmd_rx: mpsc::Receiver<TelnetCommand>,
+    scheduler_tx: mpsc::Sender<SchedulerCommand>,
+    scheduler_cancel: CancellationToken,
+    host_telemetry: Arc<HostTelemetry>,
+    result_handler: Arc<ResultHandler>,
+    metrics: MetricsRegistry,
+) {
+    // Track scheduled measurements for batched logging
+    let mut scheduled_counts: std::collections::HashMap<&'static str, u32> =
+        std::collections::HashMap::new();
+    let mut last_log_time = std::time::Instant::now();
+    const LOG_BATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    // Helper to log and reset counts
+    let log_scheduled_summary = |counts: &mut std::collections::HashMap<&'static str, u32>| {
+        if counts.is_empty() {
+            return;
+        }
+        let summary: Vec<String> = counts
+            .iter()
+            .map(|(typ, count)| format!("{}: {}", typ, count))
+            .collect();
+        info!("Scheduled measurements: {}", summary.join(", "));
+        counts.clear();
+    };
+
+    // A crontab comes whole, once the controller has ended it
+    // (CrontabSpec). Its lines are taken one by one, each as any command,
+    // and its recurring measurements gathered: once its last line is
+    // taken, they are its file's line set, which the scheduler takes as
+    // one (SchedulerCommand::Crontab), as eperd reads a crontab anew
+    // (eperd.c:513-645). Each keeps its command text (cl_Shell), which
+    // with its interval and start time makes it the same line in the
+    // controller's next push.
+    let mut crontab_lines = std::collections::VecDeque::new();
+    let mut crontab: Option<starla_scheduler::Crontab> = None;
+    // A crontab's lines are turned into jobs here with no await between
+    // them: ~800 lines, on the runtime that also runs the SSH session,
+    // telnet and the uploads. It yields every LINES_PER_YIELD lines.
+    let mut lines_taken = 0usize;
+
+    loop {
+        let (cmd, shell) = if let Some((cmd, shell)) = crontab_lines.pop_front() {
+            lines_taken += 1;
+            if lines_taken.is_multiple_of(LINES_PER_YIELD) {
+                tokio::task::yield_now().await;
+            }
+            (cmd, Some(shell))
+        } else {
+            if let Some(crontab) = crontab.take() {
+                let send = scheduler_tx.send(SchedulerCommand::Crontab(crontab));
+                if let Err(e) = send.await {
+                    scheduler_send_failed(&scheduler_cancel, e);
+                    break;
+                }
+            }
+
+            // Use timeout to batch log messages
+            let cmd = tokio::select! {
+                cmd = cmd_rx.recv() => cmd,
+                _ = tokio::time::sleep(LOG_BATCH_INTERVAL) => {
+                    // Timeout - log any accumulated counts
+                    log_scheduled_summary(&mut scheduled_counts);
+                    last_log_time = std::time::Instant::now();
+                    continue;
+                }
+            };
+
+            let Some(cmd) = cmd else {
+                // Channel closed - log final counts
+                log_scheduled_summary(&mut scheduled_counts);
+                break;
+            };
+
+            if let TelnetCommand::Crontab(spec) = cmd {
+                debug!("Crontab {}: {} CRONLINEs", spec.dir, spec.lines.len());
+                crontab_lines.extend(spec.lines.into_iter().map(|line| {
+                    let shell = line.shell().to_string();
+                    (line.command, shell)
+                }));
+                crontab = Some(starla_scheduler::Crontab {
+                    file: spec.dir,
+                    lines: Vec::new(),
+                });
+                continue;
+            }
+            (cmd, None)
+        };
+
+        // Check if scheduler has been cancelled
+        if scheduler_cancel.is_cancelled() {
+            debug!("Scheduler cancelled, stopping command handler");
+            break;
+        }
+
+        // Log accumulated counts if enough time has passed
+        if last_log_time.elapsed() >= LOG_BATCH_INTERVAL && !scheduled_counts.is_empty() {
+            log_scheduled_summary(&mut scheduled_counts);
+            last_log_time = std::time::Instant::now();
+        }
+
+        debug!("Processing command: {:?}", cmd);
+
+        // A ONEOFF's result is eooqd's: posted on its own, at once, with
+        // `&SRC=oneoff` (eooqd.c:792-820), not in the next main upload.
+        let cmd = match cmd {
+            TelnetCommand::Oneoff(inner) => {
+                if let Some(msm_id) = oneoff_msm_id(&inner) {
+                    result_handler.expect_oneoff(msm_id).await;
+                }
+                *inner
+            }
+            cmd => cmd,
+        };
+
+        // Helper macro to schedule/execute a measurement job.
+        // Handles logging, metrics, and recurring vs one-shot dispatch.
+        macro_rules! dispatch_measurement {
+            ($msm_id:expr, $schedule:expr, $spread:expr,
+             $type_name:expr, $metric_name:expr, $measurement_spec:expr) => {{
+                let is_recurring = $schedule.interval > 0;
+                if is_recurring {
+                    debug!(
+                        msm_id = $msm_id,
+                        interval = $schedule.interval,
+                        "Scheduled {} measurement",
+                        $type_name
+                    );
+                    *scheduled_counts.entry($type_name).or_insert(0) += 1;
+                } else {
+                    debug!(msm_id = $msm_id, "One-shot {}", $type_name);
+                }
+                metrics.record_measurement_started($metric_name);
+                let job = MeasurementJob {
+                    msm_id: $msm_id,
+                    interval: $schedule.interval,
+                    start_time: $schedule.start_time,
+                    end_time: $schedule.stop_time,
+                    spread: $spread.unwrap_or(0) as u64,
+                    spec: $measurement_spec,
+                };
+                if is_recurring {
+                    match (&mut crontab, &shell) {
+                        // A crontab's line: one of its file's line set
+                        (Some(crontab), Some(shell)) => {
+                            crontab.lines.push(starla_scheduler::CrontabLine {
+                                command: shell.clone(),
+                                job,
+                            });
+                            Ok(())
+                        }
+                        _ => scheduler_tx.send(SchedulerCommand::Schedule(job)).await,
+                    }
+                } else {
+                    scheduler_tx.send(SchedulerCommand::ExecuteNow(job)).await
+                }
+            }};
+        }
+
+        let result = match cmd {
+            TelnetCommand::Ping(spec) => dispatch_measurement!(
+                spec.msm_id,
+                spec.schedule,
+                spec.spread,
+                "ping",
+                "ping",
+                MeasurementSpec::Ping(PingJobSpec {
+                    // A redelivered line keeps what its runs left.
+                    kept: starla_scheduler::job::PingKept::for_line(
+                        starla_scheduler::job::PingLine {
+                            msm_id: spec.msm_id,
+                            target: spec.target.clone(),
+                            af: spec.af,
+                            packets: spec.packets,
+                            packet_interval: spec.packet_interval,
+                            size: spec.size,
+                            interval: spec.schedule.interval,
+                            start_time: spec.schedule.start_time,
+                        }
+                    ),
+                    target: spec.target,
+                    af: spec.af,
+                    packets: spec.packets,
+                    packet_interval: spec.packet_interval,
+                    size: spec.size,
+                })
+            ),
+            TelnetCommand::Traceroute(spec) => dispatch_measurement!(
+                spec.msm_id,
+                spec.schedule,
+                spec.spread,
+                "traceroute",
+                "traceroute",
+                MeasurementSpec::Traceroute(TracerouteJobSpec {
+                    // A redelivered line keeps its slot and Paris id.
+                    instance: starla_scheduler::job::TracerouteInstance::for_line(
+                        spec.msm_id,
+                        &spec.target,
+                        spec.af,
+                        &spec.opts,
+                        spec.schedule.interval,
+                        spec.schedule.start_time,
+                    ),
+                    target: spec.target,
+                    af: spec.af,
+                    opts: spec.opts,
+                })
+            ),
+            TelnetCommand::Dns(spec) => dispatch_measurement!(
+                spec.msm_id,
+                spec.schedule,
+                spec.spread,
+                "dns",
+                "dns",
+                MeasurementSpec::Dns(DnsJobSpec {
+                    server: spec.target,
+                    af: spec.af,
+                    tcp: spec.protocol == "TCP",
+                    port: spec.port,
+                    qtype: spec.qtype,
+                    qclass: spec.qclass,
+                    query: spec.query_argument,
+                    resolv: spec.resolv,
+                    interface: spec.interface,
+                    rd: spec.rd,
+                    ad: spec.ad,
+                    cd: spec.cd,
+                    dnssec: spec.dnssec,
+                    nsid: spec.nsid,
+                    client_subnet: spec.client_subnet,
+                    cookies: spec.cookies,
+                    edns0: spec.edns0,
+                    edns_version: spec.edns_version,
+                    edns_flags: spec.edns_flags,
+                    edns_option: spec.edns_option,
+                    qbuf: spec.qbuf,
+                    abuf: spec.abuf,
+                    prepend_probe_id: spec.prepend_probe_id,
+                    timeout_ms: spec.timeout_ms,
+                    retry: spec.retry,
+                    bundle: spec.bundle,
+                    ttl: spec.ttl,
+                    // ATLAS_DISABLE_CHECK_ADDR is read from the
+                    // environment; nothing is left over yet
+                    ..Default::default()
+                })
+            ),
+            TelnetCommand::Http(spec) => dispatch_measurement!(
+                spec.msm_id,
+                spec.schedule,
+                spec.spread,
+                "http",
+                "http",
+                MeasurementSpec::Http(HttpJobSpec {
+                    url: spec.url,
+                    method: spec.method,
+                    af: spec.af,
+                    headers: spec.headers,
+                    body: spec.body,
+                    max_body_size: spec.max_body_size,
+                    store_headers: spec.store_headers,
+                    http10: spec.http10,
+                    timeout_ms: spec.timeout_ms,
+                })
+            ),
+            TelnetCommand::Tls(spec) => dispatch_measurement!(
+                spec.msm_id,
+                spec.schedule,
+                spec.spread,
+                "tls",
+                "sslcert",
+                MeasurementSpec::Tls(TlsJobSpec {
+                    target: spec.target,
+                    port: spec.port,
+                    af: spec.af,
+                    hostname: spec.hostname,
+                })
+            ),
+            TelnetCommand::Ntp(spec) => dispatch_measurement!(
+                spec.msm_id,
+                spec.schedule,
+                spec.spread,
+                "ntp",
+                "ntp",
+                MeasurementSpec::Ntp(NtpJobSpec {
+                    target: spec.target,
+                    af: spec.af,
+                    packets: spec.packets,
+                    timeout_ms: spec.timeout_ms,
+                    gap_ms: spec.gap_ms,
+                })
+            ),
+            TelnetCommand::HostTelemetry(spec) => {
+                debug!(?spec.kind, interval = spec.interval, "Scheduling host telemetry");
+                match spec.kind {
+                    starla_controller::HostTelemetryKind::Buddyinfo => {
+                        host_telemetry
+                            .schedule_buddyinfo(spec.interval, spec.lowmem, spec.msm_id)
+                            .await;
+                    }
+                    starla_controller::HostTelemetryKind::Rptaddrs => {
+                        let msm_id = spec.msm_id.unwrap_or(RPTADDRS_MSM_ID);
+                        host_telemetry
+                            .schedule_rptaddrs(spec.interval, msm_id)
+                            .await;
+                    }
+                }
+                Ok(())
+            }
+            TelnetCommand::Httppost(spec) => {
+                // The controller's upload line: its URL, on perd's slots.
+                let line = starla_results::HttppostLine {
+                    schedule: starla_results::PostSchedule {
+                        interval: spec.interval,
+                        start_time: spec.start_time,
+                        end_time: spec.end_time,
+                        spread: spec.spread as u64,
+                    },
+                    url: spec.url,
+                    post_dir: spec.post_dir,
+                    set_time: spec.set_time,
+                    local_time: spec.local_time,
+                };
+                if let Err(e) = result_handler.set_httppost_line(line).await {
+                    warn!("Ignoring httppost line: {}", e);
+                }
+                Ok(())
+            }
+            TelnetCommand::Oneoff(_) => {
+                // A ONEOFF inside a ONEOFF: the parser makes none.
+                Ok(())
+            }
+            TelnetCommand::Crontab(_) => {
+                // A crontab inside a crontab: its lines are CRONLINEs.
+                Ok(())
+            }
+            TelnetCommand::Status => {
+                debug!("Status request received");
+                Ok(())
+            }
+            TelnetCommand::Stop(msm_id) => {
+                debug!(msm_id, "Stop measurement request");
+                scheduler_tx.send(SchedulerCommand::Stop(msm_id)).await
+            }
+            TelnetCommand::Condmv(spec) => {
+                // A crontab's condmv line keeps its timer, for eperd's
+                // record of it when the time is off; the scheduler
+                // takes it in eperd's crontab, crons/7, only
+                // (MeasurementSpec::Condmv). Outside a crontab, or as a
+                // one-off, it is the uploader's, and nothing here.
+                match (&mut crontab, &shell) {
+                    (Some(crontab), Some(shell)) if spec.schedule.interval > 0 => {
+                        crontab.lines.push(starla_scheduler::CrontabLine {
+                            command: shell.clone(),
+                            job: MeasurementJob {
+                                msm_id: 0,
+                                interval: spec.schedule.interval,
+                                start_time: spec.schedule.start_time,
+                                end_time: spec.schedule.stop_time,
+                                spread: spec.spread.unwrap_or(0) as u64,
+                                spec: MeasurementSpec::Condmv,
+                            },
+                        });
+                    }
+                    _ => debug!("condmv line outside a crontab: the uploader's"),
+                }
+                Ok(())
+            }
+            TelnetCommand::Ignored(_) => {
+                // Known commands that we don't need to handle (dfrm,
+                // internal Atlas commands)
+                Ok(())
+            }
+            TelnetCommand::Unknown(s) => {
+                warn!("Unknown command: {}", s);
+                Ok(())
+            }
+        };
+
+        if let Err(e) = result {
+            scheduler_send_failed(&scheduler_cancel, e);
+            break;
+        }
+    }
+    debug!("Command handler task ended");
+}
+
+/// How many of a crontab's lines the command handler turns into jobs
+/// between yields.
+const LINES_PER_YIELD: usize = 64;
+
+/// How often the background runtime reads resolv.conf and the hosts file
+/// for the measurements' lookups: eperd's CheckUpdates, every 60 s
+/// (eperd.c:386-392), which checks resolv.conf (check_resolv_conf).
+const RESOLV_CONF_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A command the scheduler did not take: its channel is closed, which likely
 /// means shutdown is in progress.
@@ -1699,6 +1822,198 @@ mod tests {
     #[test]
     fn banner_carries_the_registration_url() {
         assert!(registration_banner(KEY).contains("https://atlas.ripe.net/register/swprobe/"));
+    }
+
+    /// A crontab's ~800 lines become jobs on the background runtime, which
+    /// also runs the SSH session, telnet and the uploads. Each line is
+    /// parsed, looked up and logged with no await between them; the handler
+    /// yields every 64 lines, and the crontab still reaches the scheduler
+    /// as one command. On a current-thread runtime, as the background's,
+    /// another task runs only when the handler yields.
+    #[tokio::test]
+    async fn a_crontab_is_made_jobs_a_slice_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(4);
+        let handler = Arc::new(ResultHandler::new(
+            Box::new(SshUploadTransport {
+                ssh: Arc::new(tokio::sync::Mutex::new(None)),
+            }),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            MetricsRegistry::new().unwrap(),
+        ));
+        let commands = tokio::spawn(run_commands(
+            cmd_rx,
+            scheduler_tx,
+            CancellationToken::new(),
+            handler.host_telemetry(),
+            handler,
+            MetricsRegistry::new().unwrap(),
+        ));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let other = tokio::spawn({
+            let polls = polls.clone();
+            async move {
+                loop {
+                    polls.fetch_add(1, SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let lines = (0..800u64)
+            .map(|i| {
+                let line = format!(
+                    "240 {} 2000000000 UNIFORM 120 evping -4 -c 3 -A \"{}\" \
+                     -O /home/atlas/data/new/7 192.0.2.{}",
+                    1 + i,
+                    3_000_000 + i,
+                    i % 250
+                );
+                starla_controller::CrontabLine {
+                    command: starla_controller::telnet::parse_command(&format!("CRONLINE {line}")),
+                    line,
+                }
+            })
+            .collect();
+        cmd_tx
+            .send(TelnetCommand::Crontab(starla_controller::CrontabSpec {
+                dir: "/var/spool/ripe-atlas/crons/7".into(),
+                lines,
+            }))
+            .await
+            .unwrap();
+        let before = polls.load(SeqCst);
+        let Some(SchedulerCommand::Crontab(crontab)) = scheduler_rx.recv().await else {
+            panic!("no crontab");
+        };
+        let between = polls.load(SeqCst) - before;
+        other.abort();
+
+        assert_eq!(crontab.lines.len(), 800);
+        assert!(between >= 800 / LINES_PER_YIELD - 1, "{between} slices");
+        drop(cmd_tx);
+        commands.await.unwrap();
+    }
+
+    /// The debug drop-in's RUST_LOG on enodia, as far as it reaches the
+    /// command handler.
+    const DEBUG_DROP_IN: &str =
+        "info,starla=debug,starla_results::uploader=trace,starla_controller::ssh=trace";
+
+    /// Under the debug drop-in a crontab push logs what 0026 logged: its
+    /// receipt ("Crontab <file>: N CRONLINEs", which the runbook quotes),
+    /// then each line's "Processing command" and "Scheduled <type>
+    /// measurement", all at debug.
+    #[tokio::test]
+    async fn a_crontab_push_logs_its_lines_under_the_debug_drop_in() {
+        use starla_common::logging::{fmt, EnvFilter};
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // tracing caches whether a callsite is enabled, process-wide. With
+        // one dispatcher registered it asks the default of the thread that
+        // hits the callsite first: another test running run_commands with
+        // no subscriber would turn these callsites off for this one too. A
+        // second dispatcher kept registered, which takes nothing, makes
+        // every callsite ask the subscriber of the thread it is hit on (as
+        // starla-results' logged_by_an_upload).
+        static ASK_EACH_THREAD: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ASK_EACH_THREAD
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let capture = Capture::default();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(EnvFilter::new(DEBUG_DROP_IN))
+            .with_ansi(false)
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .finish();
+        // The test's runtime is current-thread: run_commands runs here.
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(4);
+        let handler = Arc::new(ResultHandler::new(
+            Box::new(SshUploadTransport {
+                ssh: Arc::new(tokio::sync::Mutex::new(None)),
+            }),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            MetricsRegistry::new().unwrap(),
+        ));
+        let commands = tokio::spawn(run_commands(
+            cmd_rx,
+            scheduler_tx,
+            CancellationToken::new(),
+            handler.host_telemetry(),
+            handler,
+            MetricsRegistry::new().unwrap(),
+        ));
+
+        let lines = (0..3u64)
+            .map(|i| {
+                let line = format!(
+                    "240 {} 2000000000 UNIFORM 120 evping -4 -c 3 -A \"{}\" \
+                     -O /home/atlas/data/new/7 192.0.2.{}",
+                    1 + i,
+                    3_000_000 + i,
+                    i + 1
+                );
+                starla_controller::CrontabLine {
+                    command: starla_controller::telnet::parse_command(&format!("CRONLINE {line}")),
+                    line,
+                }
+            })
+            .collect();
+        cmd_tx
+            .send(TelnetCommand::Crontab(starla_controller::CrontabSpec {
+                dir: "/var/spool/ripe-atlas/crons/7".into(),
+                lines,
+            }))
+            .await
+            .unwrap();
+        let Some(SchedulerCommand::Crontab(crontab)) = scheduler_rx.recv().await else {
+            panic!("no crontab");
+        };
+        assert_eq!(crontab.lines.len(), 3);
+        drop(cmd_tx);
+        commands.await.unwrap();
+
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let debug_lines = |needle: &str| {
+            log.lines()
+                .filter(|l| l.contains(" DEBUG ") && l.contains(needle))
+                .count()
+        };
+        assert_eq!(
+            debug_lines("Crontab /var/spool/ripe-atlas/crons/7: 3 CRONLINEs"),
+            1,
+            "{log}"
+        );
+        assert_eq!(debug_lines("Processing command: Ping("), 3, "{log}");
+        assert_eq!(debug_lines("Scheduled ping measurement"), 3, "{log}");
+        for msm_id in 3_000_000..3_000_003 {
+            assert!(
+                log.lines().any(|l| l.contains("Scheduled ping measurement")
+                    && l.contains(&format!("msm_id={msm_id}"))),
+                "msm_id {msm_id}: {log}"
+            );
+        }
     }
 
     #[test]

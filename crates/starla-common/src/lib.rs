@@ -12,6 +12,7 @@ pub mod error;
 pub mod logging;
 pub mod paths;
 pub mod pause;
+pub mod priority;
 pub mod status;
 pub mod traceroute;
 pub mod types;

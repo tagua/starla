@@ -1,6 +1,7 @@
 //! ICMP Ping execution logic: ping.c's sockets, as Starla's own.
 
 use super::{data_len, PingConfig, PingOutcome, Session};
+use starla_network::rxstamp::Arrival;
 use std::time::Duration;
 
 /// What every echo request carries at the start of its data, as ping.c's
@@ -100,17 +101,19 @@ struct Echo {
 /// The datagram as an echo reply to one of this run's requests: an echo
 /// reply with the run's identifier (a raw socket sees every process's) and
 /// cookie, at least as long as the stamp (ping.c:899-941, 1094-1118). `now`
-/// is when it came, from the start of the run.
+/// is when it came, from the start of the run: when it was read, and with
+/// `kernel_rx_timestamps` when the kernel had it ([`Arrival::after`]).
 fn echo_reply(
     v4: bool,
     identifier: Option<u16>,
     cookie: u64,
     datagram: &[u8],
     meta: starla_network::RecvMeta,
-    now: Duration,
+    now: impl Into<Arrival<Duration>>,
 ) -> Option<Echo> {
     use starla_network::{parse_icmpv4_echo_reply, parse_icmpv6_echo_reply};
 
+    let now = now.into();
     let (message, header) = strip_ipv4_header(v4, datagram);
     let (id, seq) = if v4 {
         parse_icmpv4_echo_reply(message)?
@@ -130,7 +133,11 @@ fn echo_reply(
     };
     Some(Echo {
         seq,
-        rtt: now.saturating_sub(stamp.sent).as_secs_f64() * 1e3,
+        rtt: now
+            .after(stamp.sent)
+            .saturating_sub(stamp.sent)
+            .as_secs_f64()
+            * 1e3,
         ttl: header.map(|h| h.ttl).or(meta.ttl),
         size,
         dst: header.map(|h| h.dst.into()).or(meta.dst),
@@ -141,8 +148,16 @@ fn echo_reply(
 /// 1462-1600): a socket connected to the target, then `count` requests
 /// one interval apart, each interval taking whatever replies of the run
 /// come, the run's sequence numbers and timeouts kept by [`Session`].
+/// With `kernel_rx_timestamps` on, a reply is timed by the kernel's stamp
+/// of its arrival ([`starla_network::rxstamp`]).
 #[cfg(unix)]
 pub async fn execute_ping(config: &PingConfig) -> anyhow::Result<PingOutcome> {
+    ping(config, starla_network::rxstamp::enabled()).await
+}
+
+/// [`execute_ping`], with the kernel's receive stamps or without.
+#[cfg(unix)]
+async fn ping(config: &PingConfig, kernel_rx: bool) -> anyhow::Result<PingOutcome> {
     use super::strerror;
     use starla_network::{new_icmpv4_socket, new_icmpv6_socket};
     use std::net::SocketAddr;
@@ -173,6 +188,11 @@ pub async fn execute_ping(config: &PingConfig) -> anyhow::Result<PingOutcome> {
     }
     if let Err(e) = socket.set_recv_pktinfo() {
         tracing::debug!("no destination of replies from the kernel: {}", e);
+    }
+    if kernel_rx {
+        if let Err(e) = socket.set_rx_timestamps() {
+            tracing::debug!("no receive stamps of replies from the kernel: {}", e);
+        }
     }
 
     let dest = SocketAddr::new(config.target, 0);
@@ -232,7 +252,12 @@ pub async fn execute_ping(config: &PingConfig) -> anyhow::Result<PingOutcome> {
         {
             match received {
                 Ok((len, meta)) => {
-                    let now = start.elapsed();
+                    let now = Arrival {
+                        user: start.elapsed(),
+                        kernel: meta.stamp.and_then(|stamp| {
+                            starla_network::rxstamp::monotonic(stamp, || start.elapsed())
+                        }),
+                    };
                     if let Some(echo) =
                         echo_reply(v4, check_identifier, cookie, &recv_buf[..len], meta, now)
                     {
@@ -510,6 +535,7 @@ mod tests {
         let meta = RecvMeta {
             ttl: Some(59),
             dst: Some("2001:db8::31".parse().unwrap()),
+            ..Default::default()
         };
         // IPv6, -s 48: 56 bytes of ICMPv6
         let v6 = reply_to(false, &echo_request(false, 9, 4, 48, STAMP).unwrap());
@@ -550,6 +576,7 @@ mod tests {
         let meta = RecvMeta {
             ttl: Some(54),
             dst: Some("192.0.2.34".parse().unwrap()),
+            ..Default::default()
         };
         let echo = echo_reply(true, None, STAMP.cookie, &v4, meta, now).unwrap();
         assert_eq!((echo.ttl, echo.size, echo.dst), (Some(54), 32, meta.dst));
@@ -703,17 +730,23 @@ mod tests {
 
     /// Over loopback the replies come back with the kernel's 64, from the
     /// IPv4 header or the IPv6 hop limit, to the address the socket has,
-    /// with the 32 data bytes sent, one interval apart. Starla's IPv4 pings
-    /// on macOS never matched their reply (it read the header as the
-    /// message). Skipped where no ICMP socket can be had.
+    /// with the 32 data bytes sent, one interval apart — with the kernel's
+    /// receive stamps (`kernel_rx_timestamps`) as without them. Starla's
+    /// IPv4 pings on macOS never matched their reply (it read the header as
+    /// the message). Skipped where no ICMP socket can be had.
     #[cfg(unix)]
     #[tokio::test]
     async fn loopback_replies_carry_their_ttl() {
         use crate::ping::PingEvent;
 
-        for target in ["127.0.0.1", "::1"] {
+        for (target, kernel_rx) in [
+            ("127.0.0.1", false),
+            ("::1", false),
+            ("127.0.0.1", true),
+            ("::1", true),
+        ] {
             let started = std::time::Instant::now();
-            let outcome = match execute_ping(&config(target)).await {
+            let outcome = match ping(&config(target), kernel_rx).await {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     eprintln!("skipping {target}: {e}");
@@ -744,6 +777,83 @@ mod tests {
                 .collect();
             let reply = (false, Some(64), 32, local);
             assert_eq!(replies, [reply, reply], "{target}: {events:?}");
+        }
+    }
+
+    /// With `kernel_rx_timestamps`, a reply that waited to be read — a
+    /// busy runtime, here 30 ms of a blocked thread — is timed by the
+    /// kernel's stamp of its arrival: loopback's rtt, the wait left out.
+    /// The userspace stamp, taken once it is read, has the wait in, and is
+    /// what the same reply gives without the option. Skipped where no ICMP
+    /// socket can be had.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn a_reply_that_waits_is_timed_by_the_kernels_stamp() {
+        use starla_network::rxstamp::{hold, monotonic, stamping_at_arrival};
+        use starla_network::{new_icmpv4_socket, new_icmpv6_socket};
+        use std::net::SocketAddr;
+        use std::time::Instant;
+
+        // as set_enabled holds it
+        hold().unwrap();
+        assert!(stamping_at_arrival(Duration::from_secs(2)));
+
+        for target in ["127.0.0.1", "::1"] {
+            let target: std::net::IpAddr = target.parse().unwrap();
+            let v4 = target.is_ipv4();
+            let socket = match if v4 {
+                new_icmpv4_socket()
+            } else {
+                new_icmpv6_socket()
+            } {
+                Ok(socket) => socket,
+                Err(e) => {
+                    eprintln!("skipping {target}: {e}");
+                    continue;
+                }
+            };
+            socket.set_rx_timestamps().unwrap();
+            if socket.connect(&SocketAddr::new(target, 0)).is_err() {
+                eprintln!("skipping {target}: no route");
+                continue;
+            }
+            let (identifier, cookie) = (rand::random::<u16>(), rand::random::<u64>());
+            let check_identifier = (!socket.is_dgram()).then_some(identifier);
+            let start = Instant::now();
+            let sent = socket
+                .send_with(|| {
+                    let sent = start.elapsed();
+                    echo_request(v4, identifier, 1, 0, Stamp { cookie, sent })
+                })
+                .await;
+            if let Err(e) = sent {
+                eprintln!("skipping {target}: {e}");
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            // A raw socket hears the request go by on loopback too.
+            let mut buf = vec![0u8; 65536];
+            let (kernel, user) = loop {
+                let (len, meta) = socket.recv_meta(&mut buf).await.unwrap();
+                let now = Arrival {
+                    user: start.elapsed(),
+                    kernel: meta
+                        .stamp
+                        .and_then(|stamp| monotonic(stamp, || start.elapsed())),
+                };
+                assert!(now.kernel.is_some(), "{target}: no SCM_TIMESTAMPNS");
+                let datagram = &buf[..len];
+                let Some(kernel) = echo_reply(v4, check_identifier, cookie, datagram, meta, now)
+                else {
+                    continue;
+                };
+                let user = echo_reply(v4, check_identifier, cookie, datagram, meta, now.user);
+                break (kernel.rtt, user.unwrap().rtt);
+            };
+            eprintln!("{target}: rtt {kernel} ms from the kernel's stamp, {user} ms read");
+            assert!(kernel <= user, "{target}");
+            assert!(kernel < 10.0, "{target}: the wait is in: {kernel} ms");
+            assert!(user >= 30.0, "{target}: {user} ms");
         }
     }
 }

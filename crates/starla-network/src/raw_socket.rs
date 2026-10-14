@@ -174,6 +174,14 @@ impl RawSocket {
         Ok(())
     }
 
+    /// Ask the kernel to stamp each packet's arrival and hand the stamp
+    /// over with it (SO_TIMESTAMPNS), for [`RawSocket::recv_meta`]'s
+    /// `stamp`: the `kernel_rx_timestamps` option ([`crate::rxstamp`]).
+    /// Linux only; Unsupported elsewhere.
+    pub fn set_rx_timestamps(&self) -> io::Result<()> {
+        crate::rxstamp::enable(self.inner.get_ref().as_raw_fd())
+    }
+
     fn set_int_option(&self, level: libc::c_int, name: libc::c_int) -> io::Result<()> {
         let on: libc::c_int = 1;
         // SAFETY: `on` is a c_int that outlives the call, and its size is
@@ -193,9 +201,11 @@ impl RawSocket {
         Ok(())
     }
 
-    /// Receive a packet, with the TTL or hop limit and the destination
-    /// address it arrived with when the kernel gives them as ancillary
-    /// data (see [`RawSocket::set_recv_ttl`], [`RawSocket::set_recv_pktinfo`]).
+    /// Receive a packet, with the TTL or hop limit, the destination
+    /// address it arrived with and the kernel's stamp of its arrival when
+    /// the kernel gives them as ancillary data (see
+    /// [`RawSocket::set_recv_ttl`], [`RawSocket::set_recv_pktinfo`],
+    /// [`RawSocket::set_rx_timestamps`]).
     pub async fn recv_meta(&self, buf: &mut [u8]) -> io::Result<(usize, RecvMeta)> {
         loop {
             let mut guard = self.inner.readable().await?;
@@ -280,10 +290,12 @@ impl RawSocket {
 
 /// recvmsg(2) into `buf`, and among the ancillary data the TTL or hop
 /// limit, IPV6_HOPLIMIT (an int), IP_TTL (an int, Linux) or IP_RECVTTL (a
-/// byte, the BSDs and macOS), and the destination address, IPV6_PKTINFO
+/// byte, the BSDs and macOS), the destination address, IPV6_PKTINFO
 /// (in6_pktinfo: the address first) or IP_PKTINFO (in_pktinfo: ifindex,
-/// spec_dst, then the header's destination).
-fn recvmsg_meta(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, RecvMeta)> {
+/// spec_dst, then the header's destination), and the kernel's receive
+/// stamp, SCM_TIMESTAMPNS ([`crate::rxstamp::from_cmsg`]). Any socket's
+/// descriptor will do: a UDP socket's too.
+pub fn recvmsg_meta(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, RecvMeta)> {
     // u64s, so the control buffer is aligned for cmsghdr
     let mut control = [0u64; 32];
     let mut iov = libc::iovec {
@@ -325,6 +337,8 @@ fn recvmsg_meta(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, RecvMeta)> {
             } else if level == libc::IPPROTO_IP && is_ip_pktinfo(kind) && len >= 12 {
                 let addr: [u8; 4] = bytes(8, 4).try_into().unwrap_or_default();
                 meta.dst = Some(std::net::Ipv4Addr::from(addr).into());
+            } else if level == libc::SOL_SOCKET {
+                meta.stamp = crate::rxstamp::from_cmsg(level, kind, bytes(0, len)).or(meta.stamp);
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
@@ -383,5 +397,87 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(peer.recv(&mut buf).await.unwrap(), 4);
         assert_eq!(buf[..4], [1; 4]);
+    }
+
+    /// A datagram over loopback from a peer at `to`, to a socket that asks
+    /// for receive stamps when `stamps` says so, and reads it 30 ms after
+    /// it came (a blocking sleep in between): what it came with, when it
+    /// went, and when it was read. None where `to` cannot be had.
+    async fn read_late(
+        to: &str,
+        stamps: bool,
+    ) -> Option<(RecvMeta, std::time::Instant, std::time::Instant)> {
+        let domain = if to.starts_with('[') {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
+        let Ok(peer) = std::net::UdpSocket::bind(to) else {
+            eprintln!("skipping {to}: no such address here");
+            return None;
+        };
+        let socket = RawSocket::new_with_type(Protocol::UDP, domain, Type::DGRAM).unwrap();
+        socket.connect(&peer.local_addr().unwrap()).unwrap();
+        if stamps {
+            socket.set_rx_timestamps().unwrap();
+        }
+        socket.send(b"bind").await.unwrap();
+        let (_, from) = peer.recv_from(&mut [0u8; 8]).unwrap();
+        let sent = std::time::Instant::now();
+        peer.send_to(b"reply", from).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut buf = [0u8; 16];
+        let (n, meta) = socket.recv_meta(&mut buf).await.unwrap();
+        let read = std::time::Instant::now();
+        assert_eq!(&buf[..n], b"reply");
+        Some((meta, sent, read))
+    }
+
+    /// With receive stamps asked for, a datagram that waited 30 ms to be
+    /// read carries the kernel's stamp of when it came: on the monotonic
+    /// clock, after it was sent and well before it was read — the rtt it
+    /// gives leaves the wait out, the userspace one has it in. Not asked
+    /// for, there is none: the packet is read as before.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn a_kernel_stamp_leaves_the_wait_to_read_out() {
+        use crate::rxstamp::{hold, monotonic, stamping_at_arrival, Arrival};
+        use std::time::{Duration, Instant};
+        // as set_enabled holds it
+        hold().unwrap();
+        assert!(stamping_at_arrival(Duration::from_secs(2)));
+        for to in ["127.0.0.1:0", "[::1]:0"] {
+            let Some((meta, sent, read)) = read_late(to, true).await else {
+                continue;
+            };
+            let user = Instant::now();
+            let stamp = meta.stamp.expect("SCM_TIMESTAMPNS");
+            let kernel = monotonic(stamp, Instant::now).unwrap();
+            let arrival = Arrival {
+                user,
+                kernel: Some(kernel),
+            };
+            let at = arrival.after(sent);
+            assert_eq!(at, kernel, "{to}");
+            let (rtt, user_rtt) = (at - sent, user - sent);
+            eprintln!("{to}: kernel rtt {rtt:?}, userspace {user_rtt:?}");
+            assert!(rtt <= user_rtt, "{to}");
+            assert!(rtt < Duration::from_millis(10), "{to}: {rtt:?}");
+            assert!(read - at >= Duration::from_millis(25), "{to}");
+
+            let (meta, ..) = read_late(to, false).await.unwrap();
+            assert_eq!(meta.stamp, None, "{to}: not asked for");
+        }
+    }
+
+    /// Elsewhere no socket can ask, and none come.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[tokio::test]
+    async fn no_kernel_stamps_elsewhere() {
+        let socket = RawSocket::new_with_type(Protocol::UDP, Domain::IPV4, Type::DGRAM).unwrap();
+        let e = socket.set_rx_timestamps().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        let (meta, ..) = read_late("127.0.0.1:0", false).await.unwrap();
+        assert_eq!(meta.stamp, None);
     }
 }

@@ -19,14 +19,30 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, trace, warn};
 
 /// SSH connection configuration
+///
+/// The session's liveness is the reference probe's ssh's: `ssh -o
+/// "ServerAliveInterval 60"` (bin/arch/linux/linux-functions.sh:151), with
+/// ServerAliveCountMax at its default of 3 and no inactivity timeout. A
+/// keepalive goes out after 60 s with nothing from the server; any answer,
+/// or anything else from the server, starts the count again; the fourth
+/// interval without one, 240 s of silence, drops the session.
 #[derive(Debug, Clone)]
 pub struct SshConfig {
     /// Connection timeout
     pub connect_timeout: Duration,
-    /// Inactivity timeout before disconnect
-    pub inactivity_timeout: Duration,
-    /// Keepalive interval
+    /// Drop the session after this long without anything from the server,
+    /// keepalive answers included. None, as the reference's ssh has no
+    /// such timeout: with one of 120 s, a probe stalled for two minutes (a
+    /// host suspended, the process stopped) found it expired before the
+    /// keepalive that would have been answered went out, and dropped a
+    /// healthy KEEP session (the twin's pause, 2026-10-13, W13).
+    pub inactivity_timeout: Option<Duration>,
+    /// Send a keepalive after this long without anything from the server
+    /// (ServerAliveInterval)
     pub keepalive_interval: Duration,
+    /// Keepalives sent without anything from the server before the session
+    /// is dropped (ServerAliveCountMax)
+    pub keepalive_max: usize,
     /// Reconnection delay (base)
     pub reconnect_delay: Duration,
     /// Maximum reconnection delay
@@ -39,8 +55,9 @@ impl Default for SshConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(30),
-            inactivity_timeout: Duration::from_secs(120),
-            keepalive_interval: Duration::from_secs(30),
+            inactivity_timeout: None,
+            keepalive_interval: Duration::from_secs(60),
+            keepalive_max: 3,
             reconnect_delay: Duration::from_secs(5),
             max_reconnect_delay: Duration::from_secs(300),
             max_reconnect_attempts: 0, // Infinite
@@ -345,6 +362,28 @@ struct AtlasClientHandler {
     session_id: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
+impl AtlasClientHandler {
+    fn new(
+        host: &str,
+        port: u16,
+        known_hosts: KnownHosts,
+        telnet_state: Option<TelnetState>,
+    ) -> Self {
+        let (command_tx, probe_id, session_id) = match telnet_state {
+            Some(ts) => (Some(ts.command_tx), ts.probe_id, ts.session_id),
+            None => (None, 0, Arc::new(tokio::sync::RwLock::new(None))),
+        };
+        Self {
+            known_hosts,
+            connect_host: host.to_string(),
+            connect_port: port,
+            command_tx,
+            probe_id,
+            session_id,
+        }
+    }
+}
+
 impl client::Handler for AtlasClientHandler {
     type Error = anyhow::Error;
 
@@ -409,10 +448,16 @@ pub struct TelnetState {
 /// never needed. Keep the default whole: a custom list also drops the
 /// ext-info-c and kex-strict-c markers, and with them the Terrapin
 /// (CVE-2023-48795) countermeasure.
+///
+/// russh counts keepalives as OpenSSH's server_alive_check does: each
+/// interval without data from the server adds one, any data clears the
+/// count, and the interval that takes it past `keepalive_max` drops the
+/// session (client/mod.rs run_inner).
 fn client_config(config: &SshConfig) -> client::Config {
     client::Config {
-        inactivity_timeout: Some(config.inactivity_timeout),
+        inactivity_timeout: config.inactivity_timeout,
         keepalive_interval: Some(config.keepalive_interval),
+        keepalive_max: config.keepalive_max,
         preferred: Preferred::DEFAULT,
         ..Default::default()
     }
@@ -440,20 +485,7 @@ impl SshConnection {
         telnet_state: Option<TelnetState>,
     ) -> anyhow::Result<Self> {
         let ssh_config = client_config(&config);
-
-        let (command_tx, probe_id, session_id) = match telnet_state {
-            Some(ts) => (Some(ts.command_tx), ts.probe_id, ts.session_id),
-            None => (None, 0, Arc::new(tokio::sync::RwLock::new(None))),
-        };
-
-        let handler = AtlasClientHandler {
-            known_hosts: known_hosts.clone(),
-            connect_host: host.to_string(),
-            connect_port: port,
-            command_tx,
-            probe_id,
-            session_id,
-        };
+        let handler = AtlasClientHandler::new(host, port, known_hosts, telnet_state);
 
         let addr = format!("{}:{}", host, port);
         debug!("Connecting to SSH controller at {}", addr);
@@ -465,8 +497,33 @@ impl SshConnection {
         .await
         .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
 
-        let mut session = session;
+        Self::authenticate(session, host, port, key).await
+    }
 
+    /// [`connect`](Self::connect) over a stream of the test's own, in place
+    /// of a TCP connection to `host:port`.
+    #[cfg(test)]
+    async fn connect_stream(
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        host: &str,
+        port: u16,
+        key: &PrivateKey,
+        config: SshConfig,
+        known_hosts: KnownHosts,
+    ) -> anyhow::Result<Self> {
+        let handler = AtlasClientHandler::new(host, port, known_hosts, None);
+        let session =
+            client::connect_stream(Arc::new(client_config(&config)), stream, handler).await?;
+        Self::authenticate(session, host, port, key).await
+    }
+
+    /// Log in as `atlas` with the probe's key, on a session just set up.
+    async fn authenticate(
+        mut session: Handle<AtlasClientHandler>,
+        host: &str,
+        port: u16,
+        key: &PrivateKey,
+    ) -> anyhow::Result<Self> {
         // Authenticate. Ed25519 keys don't need an RSA hash; pass None.
         let auth_res = session
             .authenticate_publickey(
@@ -1374,7 +1431,208 @@ mod tests {
     fn test_default_config() {
         let config = SshConfig::default();
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
-        assert_eq!(config.keepalive_interval, Duration::from_secs(30));
+        // ssh -o "ServerAliveInterval 60", ServerAliveCountMax 3, and no
+        // inactivity timeout (linux-functions.sh:151)
+        assert_eq!(config.keepalive_interval, Duration::from_secs(60));
+        assert_eq!(config.keepalive_max, 3);
+        assert_eq!(config.inactivity_timeout, None);
+        let russh = client_config(&config);
+        assert_eq!(russh.keepalive_interval, Some(Duration::from_secs(60)));
+        assert_eq!(russh.keepalive_max, 3);
+        assert_eq!(russh.inactivity_timeout, None);
+    }
+
+    /// A controller over an in-memory wire: it takes `atlas` with any key,
+    /// answers each exec with "pong\n", and sends nothing of its own — no
+    /// keepalives, no timeout — so the client's timers are all there is.
+    struct Controller {
+        channels: Vec<Channel<russh::server::Msg>>,
+    }
+
+    impl russh::server::Handler for Controller {
+        type Error = anyhow::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            _: &PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if user == "atlas" {
+                russh::server::Auth::Accept
+            } else {
+                russh::server::Auth::reject()
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<russh::server::Msg>,
+            _: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            self.channels.push(channel);
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, b"pong\n".to_vec())?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    /// The probe's end of the wire, which can go silent: from then on
+    /// nothing the controller sends arrives, and whatever the probe sends
+    /// is lost, as on a path that has died.
+    struct Wire {
+        inner: tokio::io::DuplexStream,
+        silent: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Wire {
+        fn is_silent(&self) -> bool {
+            self.silent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tokio::io::AsyncRead for Wire {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.is_silent() {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Wire {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.is_silent() {
+                return std::task::Poll::Ready(Ok(buf.len()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A session with the default configuration to a [`Controller`], and
+    /// the switch that silences its wire.
+    async fn keep_session() -> (
+        SshConnection,
+        Arc<std::sync::atomic::AtomicBool>,
+        tempfile::TempDir,
+    ) {
+        let (probe, controller) = tokio::io::duplex(1 << 16);
+        let server = russh::server::Config {
+            keys: vec![generate_key().unwrap()],
+            inactivity_timeout: None,
+            keepalive_interval: None,
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            let running = russh::server::run_stream(
+                Arc::new(server),
+                controller,
+                Controller {
+                    channels: Vec::new(),
+                },
+            )
+            .await;
+            if let Ok(running) = running {
+                let _ = running.await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wire = Wire {
+            inner: probe,
+            silent: silent.clone(),
+        };
+        let conn = SshConnection::connect_stream(
+            wire,
+            "ctr-test",
+            443,
+            &generate_key().unwrap(),
+            SshConfig::default(),
+            KnownHosts::load(&dir.path().join("known_hosts")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.execute("KEEP").await.unwrap(), "pong\n");
+        (conn, silent, dir)
+    }
+
+    /// W13: the twin paused both probes for more than two minutes
+    /// (2026-10-13). The reference's ssh, with ServerAliveInterval 60 and no
+    /// inactivity timeout, sent a keepalive when it woke, had it answered,
+    /// and kept its session. Starla's 120 s inactivity timeout had run out
+    /// during the pause, and fired before the answer could arrive: KEEP was
+    /// dropped and the probe reconnected.
+    #[tokio::test(start_paused = true)]
+    async fn a_two_minute_stall_keeps_a_session_whose_keepalives_are_answered() {
+        let (conn, _silent, _dir) = keep_session().await;
+
+        // Nothing runs for 130 s, then every timer due meanwhile fires at
+        // once, as when a stopped process or a suspended host resumes
+        tokio::time::advance(Duration::from_secs(130)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(conn.is_connected().await, "the stall dropped the session");
+        assert_eq!(conn.execute("KEEP").await.unwrap(), "pong\n");
+
+        // and so does a quiet hour, keepalives answered every minute
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(conn.is_connected().await);
+        assert_eq!(conn.execute("KEEP").await.unwrap(), "pong\n");
+    }
+
+    /// A controller that has gone (nothing arrives, nothing sent reaches
+    /// it) is given up on as the reference's ssh gives it up: a keepalive
+    /// each 60 s, and the fourth interval without an answer, 240 s on,
+    /// drops the session — not 120 s on, as the inactivity timeout did.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_controller_is_dropped_after_three_unanswered_keepalives() {
+        let (conn, silent, _dir) = keep_session().await;
+
+        silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        let gone = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_secs(239)).await;
+        assert!(conn.is_connected().await, "dropped before 240 s");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !conn.is_connected().await,
+            "still up {:?} after the controller went",
+            gone.elapsed()
+        );
     }
 
     #[test]
