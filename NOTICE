@@ -9,10 +9,10 @@ or (at your option) any later version; see LICENSE. These modifications
 are distributed under the same license.
 
   Modified by:  Andrii Tereshchenko
-  Dates:        2026-10-10 to 2026-10-13
+  Dates:        2026-10-10 to 2026-10-14
   Based on:     upstream Starla v0.8.0, commit a374686
   Changes:      the commits on this branch after a374686
-                (git log a374686..enodia-0024)
+                (git log a374686..enodia-0025)
 
 Where this code runs
 --------------------
@@ -21,13 +21,13 @@ It runs RIPE Atlas probe 1018212:
   https://atlas.ripe.net/probes/1018212/
 
 Each version deployed to that probe is tagged here (enodia-<NNNN>). The
-current one is enodia-0024 (602455e), running since 2026-10-13 22:35 UTC.
+current one is enodia-0025 (c9cb056), running since 2026-10-14 01:36 UTC.
 This branch and its tags are the Corresponding Source for anyone who
 interacts with the probe over the network (AGPL-3.0, section 13).
 
 What changed
 ------------
-0001-0005 make the probe fit to run as a system service. 0006-0024 bring
+0001-0005 make the probe fit to run as a system service. 0006-0025 bring
 its behaviour on the wire in line with RIPE NCC's reference software probe
 (ripe-atlas-software-probe, firmware 5130). Each commit message explains
 the difference and cites the reference source it follows.
@@ -60,6 +60,8 @@ the difference and cites the reference source it follows.
         traces end at the target
   0024  ping: -s is the data after the ICMP header (32 bytes by
         default); target names, ttr and the replies' ttl
+  0025  scheduler: crontab lines as eperd keeps them, one per line,
+        not one per measurement id; a re-sent line keeps its slot
 
 Upstream
 --------
