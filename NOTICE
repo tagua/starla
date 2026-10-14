@@ -1,0 +1,67 @@
+NOTICE — the "enodia" branch of Starla
+
+This branch is a MODIFIED version of Starla
+(https://github.com/ananthb/starla), the RIPE Atlas software probe written
+in Rust by Ananth Bhaskararaman and the Starla contributors.
+
+Starla is licensed under the GNU Affero General Public License, version 3
+or (at your option) any later version; see LICENSE. These modifications
+are distributed under the same license.
+
+  Modified by:  Andrii Tereshchenko
+  Dates:        2026-10-10 to 2026-10-13
+  Based on:     upstream Starla v0.8.0, commit a374686
+  Changes:      the commits on this branch after a374686
+                (git log a374686..enodia-0024)
+
+Where this code runs
+--------------------
+It runs RIPE Atlas probe 1018212:
+
+  https://atlas.ripe.net/probes/1018212/
+
+Each version deployed to that probe is tagged here (enodia-<NNNN>). The
+current one is enodia-0024 (602455e), running since 2026-10-13 22:35 UTC.
+This branch and its tags are the Corresponding Source for anyone who
+interacts with the probe over the network (AGPL-3.0, section 13).
+
+What changed
+------------
+0001-0005 make the probe fit to run as a system service. 0006-0024 bring
+its behaviour on the wire in line with RIPE NCC's reference software probe
+(ripe-atlas-software-probe, firmware 5130). Each commit message explains
+the difference and cites the reference source it follows.
+
+  0001  deps: refresh Cargo.lock and drop the unused hickory-client
+  0002  controller: use russh's default key exchange (no group1-sha1)
+  0003  registration: RIPE's reg-05/reg-06.prod servers
+  0004  probe key: never replace an unreadable key; write it 0600
+  0005  unit: a syscall filter systemd honours; a readable config
+  0006  probe: send the address report (msm 9104) itself every 180 s
+  0007  results: a failed upload keeps its telemetry lines
+  0008  results: back off after an HTTP 429
+  0009  results: a 429 is not a failed attempt; only age drops results
+  0010  scheduler: run each measurement on its CRONLINE slot
+  0011  controller: keep the registration across restarts; obey
+        REREGISTER, WAIT and REFUSED
+  0012  results: lts as the reference keeps it
+  0013  results: status lines on the reference's cadence
+  0014  results: traceroute, TLS and NTP results carry their real lts
+  0015  ntp: evntp as of firmware 5130; report fw 5130
+  0016  http: report like evhttpget, with the stored headers
+  0017  controller: start registration at a random server
+  0018  telnet: one OK per request, as the reference's telnetd answers
+  0019  rptaddrs: the 9104 report byte for byte as rptaddrs.c writes it
+  0020  uploads: post on the controller's httppost slots; one-offs on
+        their own (&SRC=oneoff); httppost's header order
+  0021  dns: evtdig as firmware 5130 asks and reports
+  0022  tls: evsslgetcert as sslgetcert.c, recording any certificate
+  0023  traceroute: evtraceroute's probes and reply matching; IPv6 UDP
+        traces end at the target
+  0024  ping: -s is the data after the ICMP header (32 bytes by
+        default); target names, ttr and the replies' ttl
+
+Upstream
+--------
+These changes are being offered to upstream as small pull requests, one
+per bug. Until they are merged, this branch is the version that runs.
