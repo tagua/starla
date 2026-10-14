@@ -1,7 +1,7 @@
 //! Ping measurement implementation
 
 pub mod icmp;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "scamper"))]
 pub mod scamper;
 
 use crate::target::{DstName, LookupError};
@@ -21,8 +21,9 @@ use std::time::Duration;
 ///
 /// `Native` is the in-process ICMP socket implementation and is always
 /// available. `Scamper` delegates to a running scamper daemon via the
-/// rscamper bindings; it is compiled in on Linux only, so selecting it on
-/// any other platform is a runtime error.
+/// rscamper bindings; it is compiled in on Linux with the crate's `scamper`
+/// feature (on by default) only, so selecting it on any other platform, or
+/// in a build without the feature, is a runtime error.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PingBackend {
@@ -375,7 +376,7 @@ pub(crate) struct ProbeReply {
 /// interval is over when the next goes out, a reply counts as the
 /// sequence number its request was sent with, and replies after the last
 /// interval are not seen (the run is reported then).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(all(target_os = "linux", feature = "scamper")), allow(dead_code))]
 pub(crate) fn replay(v6: bool, interval: Duration, probes: &[Probe]) -> Vec<PingEvent> {
     // (when, what): 0 the interval of request i is over, 1 request i went
     // out, 2 reply j of request i came; at the same instant ping.c's timer
@@ -723,12 +724,10 @@ impl Measurement for Ping {
     async fn execute(&self) -> anyhow::Result<MeasurementResult> {
         let outcome = match self.config.backend {
             PingBackend::Native => icmp::execute_ping(&self.config).await?,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "scamper"))]
             PingBackend::Scamper => scamper::execute_ping(&self.config).await?,
-            #[cfg(not(target_os = "linux"))]
-            PingBackend::Scamper => {
-                anyhow::bail!("scamper backend is only available on Linux")
-            }
+            #[cfg(not(all(target_os = "linux", feature = "scamper")))]
+            PingBackend::Scamper => return Err(crate::scamper_unavailable()),
         };
         Ok(self.outcome_result(&outcome))
     }
@@ -808,6 +807,20 @@ mod tests {
             msm_id: MeasurementId(2001),
             dst_name,
         }
+    }
+
+    /// A build without the scamper backend (off Linux, or on Linux without
+    /// the `scamper` feature) refuses it when the ping runs, before anything
+    /// is sent.
+    #[cfg(not(all(target_os = "linux", feature = "scamper")))]
+    #[tokio::test]
+    async fn the_scamper_backend_is_a_runtime_error_when_not_built_in() {
+        let mut p = ping("192.0.2.1", 1, 0, literal("192.0.2.1"));
+        p.config.backend = PingBackend::Scamper;
+        let Err(e) = p.execute().await else {
+            panic!("a scamper ping ran without the scamper backend")
+        };
+        assert!(e.to_string().starts_with("scamper backend is "), "{e}");
     }
 
     fn body(result: &MeasurementResult) -> &str {

@@ -10,6 +10,8 @@ readme = "README.md"
 
 [dependencies]
 starla-common = { workspace = true }
+# Default features: the probe gets the scamper backend (starla-measurements'
+# `scamper` feature) through this dependency.
 starla-measurements = { workspace = true }
 starla-results = { workspace = true }
 starla-metrics = { workspace = true }

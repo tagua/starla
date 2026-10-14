@@ -38,9 +38,19 @@ base64 = { workspace = true }
 # limit and traffic class, CLOCK_MONOTONIC). Every use is cfg(unix)/cfg(linux).
 libc = { workspace = true }
 
+[features]
+default = ["scamper"]
+# The scamper backend for ping and traceroute (PingBackend::Scamper,
+# TracerouteBackend::Scamper). On Linux it links rscamper, and through it
+# CAIDA's libscamperfile/libscamperctrl as static libraries; elsewhere it
+# adds nothing. Without it the crate builds from Rust and crates.io alone
+# on every platform, and selecting the scamper backend is a runtime error,
+# as it always is off Linux.
+scamper = ["dep:rscamper"]
+
 # Scamper-backed measurement backends. The rscamper crate FFI-links against
 # CAIDA's libscamperfile/libscamperctrl, which are only built on Linux —
-# the source modules are gated on `cfg(target_os = "linux")` to match.
-# Selecting the scamper backend on non-Linux is a runtime error.
+# the source modules are gated on `cfg(all(target_os = "linux", feature =
+# "scamper"))` to match.
 [target.'cfg(target_os = "linux")'.dependencies]
-rscamper = "0.2"
+rscamper = { version = "0.2", optional = true }

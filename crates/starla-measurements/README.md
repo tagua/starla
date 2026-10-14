@@ -42,3 +42,21 @@ let result = ping.execute().await?;
 ## Result Format
 
 Results are formatted to match the RIPE Atlas JSON schema, ensuring compatibility with existing analysis tools and the RIPE Atlas API.
+
+## Features
+
+| Feature | Default | What it adds |
+|---------|---------|--------------|
+| `scamper` | yes | The scamper backend for ping and traceroute (`PingBackend::Scamper`, `TracerouteBackend::Scamper`). On Linux it links [rscamper](https://crates.io/crates/rscamper), and through it CAIDA's libscamperfile and libscamperctrl as static libraries (`SCAMPER_LIB_DIR`); on other platforms it adds nothing. |
+
+The Starla probe keeps the default. A library that only uses the native
+backends can leave scamper out, and with it the C libraries, the
+`-Wl,--allow-multiple-definition` link argument (Starla's
+`.cargo/config.toml`) and the GPL-2.0-only scamper code:
+
+```toml
+starla-measurements = { version = "1", default-features = false }
+```
+
+Selecting the scamper backend in such a build is an error when the
+measurement runs, as it is on any platform other than Linux.

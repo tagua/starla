@@ -5,7 +5,8 @@
 //! - `engine`: hops, timeouts, the end of the trace and the result text;
 //! - `net` (unix): the sockets;
 //! - `icmp` (Windows): ICMP echo through the ICMP helper API;
-//! - `scamper`: the optional scamper-daemon backend (Linux).
+//! - `scamper`: the optional scamper-daemon backend (Linux, with the crate's
+//!   `scamper` feature).
 
 pub mod engine;
 #[cfg(windows)]
@@ -249,14 +250,12 @@ impl Traceroute {
     /// The hops of one run.
     async fn trace(&self, paris: Option<u16>) -> anyhow::Result<Vec<Hop>> {
         match self.config.backend {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "scamper"))]
             TracerouteBackend::Scamper => {
                 scamper::execute_traceroute(&self.config, paris, self.config.instance.index()).await
             }
-            #[cfg(not(target_os = "linux"))]
-            TracerouteBackend::Scamper => {
-                anyhow::bail!("scamper backend is only available on Linux")
-            }
+            #[cfg(not(all(target_os = "linux", feature = "scamper")))]
+            TracerouteBackend::Scamper => Err(crate::scamper_unavailable()),
             #[cfg(unix)]
             TracerouteBackend::Native => Ok(net::run(&net::RunSpec {
                 target: self.config.target,
@@ -660,6 +659,20 @@ mod tests {
         drop(inst.start().unwrap());
         assert_eq!(inst.runs(), 2);
         assert_eq!(inst.start().unwrap().underway(), 3);
+    }
+
+    /// A build without the scamper backend (off Linux, or on Linux without
+    /// the `scamper` feature) refuses it when the trace runs, before any
+    /// socket is opened.
+    #[cfg(not(all(target_os = "linux", feature = "scamper")))]
+    #[tokio::test]
+    async fn the_scamper_backend_is_a_runtime_error_when_not_built_in() {
+        let mut t = traceroute("192.0.2.1", TracerouteOptions::default(), 6001);
+        t.config.backend = TracerouteBackend::Scamper;
+        let Err(e) = t.trace(None).await else {
+            panic!("a scamper trace ran without the scamper backend")
+        };
+        assert!(e.to_string().starts_with("scamper backend is "), "{e}");
     }
 
     /// The measurement says so and sends nothing: no result, as eperd

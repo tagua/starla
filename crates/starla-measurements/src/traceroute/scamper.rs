@@ -8,7 +8,8 @@
 //! (33434 + 3·(ttl-1) + n, empty payload), not scamper's.
 //!
 //! The conversion is plain data in, reference text out ([`hops`]), so
-//! every platform tests it; only the daemon session is Linux-only.
+//! every platform tests it; only the daemon session is Linux-only, and
+//! needs the crate's `scamper` feature (a default one).
 
 use super::engine::{self, Hop};
 use super::wire::{Answer, Branch, Outcome};
@@ -142,10 +143,10 @@ pub fn hops(
     out
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "scamper"))]
 pub use daemon::execute_traceroute;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "scamper"))]
 mod daemon {
     use super::super::wire::{BASE_PORT, SRC_BASE_PORT};
     use super::super::TracerouteConfig;

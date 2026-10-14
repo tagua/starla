@@ -6,9 +6,9 @@
 //! downstream result formatting stays identical.
 //!
 //! The socket path is read from the `STARLA_SCAMPER_SOCKET` environment
-//! variable, falling back to `/var/run/scamper/scamperd.sock`. Build with
-//! `--features scamper` and ensure libscamperfile / libscamperctrl are
-//! available at link time.
+//! variable, falling back to `/var/run/scamper/scamperd.sock`. Compiled in
+//! on Linux with the crate's `scamper` feature (a default one), where
+//! libscamperfile / libscamperctrl must be available at link time.
 
 use super::{data_len, replay, PingConfig, PingOutcome, Probe, ProbeReply, ICMP_HEADER_LEN};
 use anyhow::{anyhow, Context};
