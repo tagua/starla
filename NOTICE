@@ -12,7 +12,7 @@ are distributed under the same license.
   Dates:        2026-10-10 to 2026-10-14
   Based on:     upstream Starla v0.8.0, commit a374686
   Changes:      the commits on this branch after a374686
-                (git log a374686..enodia-0027)
+                (git log a374686..enodia-0028)
 
 Where this code runs
 --------------------
@@ -21,13 +21,13 @@ It runs RIPE Atlas probe 1018212:
   https://atlas.ripe.net/probes/1018212/
 
 Each version deployed to that probe is tagged here (enodia-<NNNN>). The
-current one is enodia-0027 (3ec874a), running since 2026-10-14 07:03 UTC.
+current one is enodia-0028 (c8fbb6a), running since 2026-10-14 16:21 UTC.
 This branch and its tags are the Corresponding Source for anyone who
 interacts with the probe over the network (AGPL-3.0, section 13).
 
 What changed
 ------------
-0001-0005 make the probe fit to run as a system service. 0006-0027 bring
+0001-0005 make the probe fit to run as a system service. 0006-0028 bring
 its behaviour on the wire in line with RIPE NCC's reference software probe
 (ripe-atlas-software-probe, firmware 5130). Each commit message explains
 the difference and cites the reference source it follows.
@@ -71,6 +71,14 @@ the difference and cites the reference source it follows.
         logging never blocks; SSH keepalive as the reference's ssh;
         start times spread within the second as eperd does; kernel
         receive timestamps as an option, off by default
+  0028  the review lows and CON_KEEP_BROKEN: a KEEP the controller
+        answers sends the probe back to register, as the reference
+        does; the SSH login is time-bounded; https fetched as
+        httpget fetches it, with its one timer, --timeout and --sni;
+        NTP's busy check; perd's rules for crons/main; eperd's 9807
+        waittime; SCHED_IDLE for background threads as an option,
+        off by default (an earlier build of 0028, 56cd774, ran
+        14:52-14:56 UTC on 2026-10-14 and was rolled back)
 
 Upstream
 --------
