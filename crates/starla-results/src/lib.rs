@@ -29,6 +29,7 @@ use post_schedule::Slots;
 use spool::Spool;
 use starla_common::MeasurementResult;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -174,6 +175,15 @@ struct Submitted {
     lts: i64,
 }
 
+/// What the measurement side hands over, in the order it does.
+enum Handed {
+    Result(Submitted),
+    /// A run of crons/7's condmv line: its marker, with `-A`, appended to
+    /// data/new/7, and everything in it moved to data/out for the next post
+    /// ([`ResultSink::condmv`])
+    Condmv(Option<Submitted>),
+}
+
 /// The measurement side of the result hand-off: where a measurement task
 /// puts its result, from the measurement runtime, for the result handler on
 /// the background runtime to take.
@@ -192,33 +202,78 @@ struct Submitted {
 /// result is dropped (and counted as a queue drop) rather than held.
 #[derive(Clone)]
 pub struct ResultSink {
-    tx: mpsc::Sender<Submitted>,
+    tx: mpsc::Sender<Handed>,
     time_sync: Arc<TimeSyncTracker>,
+    /// crons/7 has a condmv line ([`set_condmv_line`](Self::set_condmv_line))
+    condmv_line: Arc<AtomicBool>,
     metrics: starla_metrics::MetricsRegistry,
 }
 
 impl ResultSink {
-    /// Hand a result over for upload. Returns at once.
+    /// Hand a result over for upload. Returns at once. A result of eperd's
+    /// spool waits in data/new/7 for crons/7's next condmv run, if crons/7
+    /// has a condmv line.
     pub fn submit(&self, result: MeasurementResult) {
         let submitted = Submitted {
             lts: self.time_sync.lts(),
             result,
         };
-        match self.tx.try_send(submitted) {
+        self.hand_over(Handed::Result(submitted));
+    }
+
+    /// A run of crons/7's condmv line, eperd's built-in (condmv_start,
+    /// eperd/condmv.c:115-136): `marker`, its `-A` line, goes after the
+    /// results handed over before it, and then the results handed over so
+    /// far, the marker last, go with the next main post. Those handed over
+    /// after it wait for its next run. Returns at once.
+    pub fn condmv(&self, marker: Option<MeasurementResult>) {
+        let lts = self.time_sync.lts();
+        let marker = marker.map(|result| Submitted { result, lts });
+        self.hand_over(Handed::Condmv(marker));
+    }
+
+    /// Whether crons/7 has a condmv line, as the controller last sent it.
+    /// While it has, eperd's results go with a post only once a run of it
+    /// has moved them ([`condmv`](Self::condmv)), as httppost posts
+    /// data/out and only condmv moves data/new/7 there; without one, each
+    /// post takes all there is. The reference then posts none of eperd's
+    /// results, ever, and nothing tells a crontab that has no condmv line
+    /// from one whose condmv line Starla refused.
+    pub fn set_condmv_line(&self, present: bool) {
+        self.condmv_line.store(present, Ordering::Relaxed);
+    }
+
+    fn hand_over(&self, handed: Handed) {
+        match self.tx.try_send(handed) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(dropped)) => {
-                self.metrics.record_queue_drop();
-                warn!(
-                    msm_id = dropped.result.msm_id.0,
-                    "Result hand-off full ({}), dropping result",
-                    self.tx.max_capacity()
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(dropped)) => {
+            Err(mpsc::error::TrySendError::Full(dropped)) => match dropped {
+                Handed::Result(dropped) => {
+                    self.metrics.record_queue_drop();
+                    warn!(
+                        msm_id = dropped.result.msm_id.0,
+                        "Result hand-off full ({}), dropping result",
+                        self.tx.max_capacity()
+                    );
+                }
+                // The next run moves what this one would have
+                Handed::Condmv(marker) => {
+                    if marker.is_some() {
+                        self.metrics.record_queue_drop();
+                    }
+                    warn!(
+                        "Result hand-off full ({}), dropping a condmv run",
+                        self.tx.max_capacity()
+                    );
+                }
+            },
+            Err(mpsc::error::TrySendError::Closed(Handed::Result(dropped))) => {
                 debug!(
                     msm_id = dropped.result.msm_id.0,
                     "Result handler gone, dropping result"
                 );
+            }
+            Err(mpsc::error::TrySendError::Closed(Handed::Condmv(_))) => {
+                debug!("Result handler gone, dropping a condmv run");
             }
         }
     }
@@ -229,7 +284,7 @@ pub struct ResultHandler {
     /// Results handed over by the measurements ([`ResultSink`]) and not yet
     /// queued. Only the background side takes the lock, and never across
     /// an await.
-    inbox: std::sync::Mutex<mpsc::Receiver<Submitted>>,
+    inbox: std::sync::Mutex<mpsc::Receiver<Handed>>,
     /// The sending side, handed to the measurements; kept here so the
     /// channel never closes while the handler lives
     sink: ResultSink,
@@ -282,6 +337,7 @@ impl ResultHandler {
         let sink = ResultSink {
             tx,
             time_sync: Arc::clone(&time_sync),
+            condmv_line: Arc::new(AtomicBool::new(false)),
             metrics: metrics.clone(),
         };
         let uploader = ResultUploader::new(
@@ -502,7 +558,7 @@ impl ResultHandler {
     }
 
     /// The results handed over and not yet taken, all of them.
-    fn drain_inbox(&self) -> Vec<Submitted> {
+    fn drain_inbox(&self) -> Vec<Handed> {
         let mut inbox = self
             .inbox
             .lock()
@@ -515,7 +571,7 @@ impl ResultHandler {
     }
 
     /// Wait until a result is handed over, then take all that are waiting.
-    async fn next_submitted(&self) -> Vec<Submitted> {
+    async fn next_submitted(&self) -> Vec<Handed> {
         std::future::poll_fn(|cx| {
             let mut inbox = self
                 .inbox
@@ -542,22 +598,30 @@ impl ResultHandler {
 
     /// Queue a batch of handed-over results, in the order they came: a
     /// ONEOFF's into eooqd's spool, at once with `&SRC=oneoff`, every other
-    /// into the main queue.
-    async fn enqueue(&self, batch: Vec<Submitted>) {
+    /// into the main queue, where a condmv run moves out what came before
+    /// it.
+    async fn enqueue(&self, batch: Vec<Handed>) {
         if batch.is_empty() {
             return;
         }
         let (mut oneoffs, mut main) = (Vec::new(), Vec::new());
         {
             let mut pending = self.oneoff_pending.lock().await;
-            for submitted in batch {
+            for handed in batch {
+                let submitted = match handed {
+                    Handed::Result(submitted) => submitted,
+                    condmv @ Handed::Condmv(_) => {
+                        main.push(condmv);
+                        continue;
+                    }
+                };
                 let at = pending
                     .iter()
                     .position(|&id| id == submitted.result.msm_id.0);
                 if at.and_then(|i| pending.remove(i)).is_some() {
                     oneoffs.push(submitted);
                 } else {
-                    main.push(submitted);
+                    main.push(Handed::Result(submitted));
                 }
             }
         }
@@ -576,14 +640,24 @@ impl ResultHandler {
 
         if !main.is_empty() {
             let mut queue = self.queue.lock().await;
-            for Submitted { result, lts } in main {
-                let before = queue.stats().count;
-                queue.enqueue_measured(result, lts);
-                let after = queue.stats().count;
-                if after <= before && before > 0 {
-                    self.metrics.record_queue_drop();
+            for handed in main {
+                let (submitted, condmv) = match handed {
+                    Handed::Result(submitted) => (Some(submitted), false),
+                    Handed::Condmv(marker) => (marker, true),
+                };
+                if let Some(Submitted { result, lts }) = submitted {
+                    let before = queue.stats().count;
+                    queue.enqueue_measured(result, lts);
+                    let after = queue.stats().count;
+                    if after <= before && before > 0 {
+                        self.metrics.record_queue_drop();
+                    }
+                    debug!("Result enqueued, queue: {}", after);
                 }
-                debug!("Result enqueued, queue: {}", after);
+                if condmv {
+                    queue.move_out();
+                    debug!("condmv: {} results for the next post", queue.stats().count);
+                }
             }
             self.metrics.update_queue_depth(queue.stats().count as i64);
         }
@@ -618,12 +692,17 @@ impl ResultHandler {
         }
         self.take_submitted().await;
 
-        // Drain all available results: upload everything each cycle,
-        // matching the official probe's httppost behavior
+        // What data/out holds: the results crons/7's condmv has moved there,
+        // or, with no condmv line, all of them. Those since its last run
+        // wait in data/new/7 for its next: a post carries eperd's results up
+        // to a 9907 marker, never past it.
         let uploadable = {
             let mut queue = self.queue.lock().await;
-            let res = queue.drain_all();
-            self.metrics.update_queue_depth(0);
+            if !self.sink.condmv_line.load(Ordering::Relaxed) {
+                queue.move_out();
+            }
+            let res = queue.drain_moved();
+            self.metrics.update_queue_depth(queue.stats().count as i64);
             res
         };
 
@@ -1347,6 +1426,69 @@ mod tests {
             posts += 1;
         }
         assert_eq!(posts, tries, "every try still posted the result");
+    }
+
+    /// While crons/7 has a condmv line, a post carries what its runs moved
+    /// to data/out, up to the last marker; a result handed over after the
+    /// run waits in data/new/7. A refused post keeps the two apart: what it
+    /// carried goes with the next post, and the rest still waits for the
+    /// next run, with or without `-A`.
+    #[tokio::test]
+    async fn a_post_carries_eperds_results_up_to_condmvs_last_run() {
+        let (handler, mut seen) = handler_against_429();
+        handler
+            .set_endpoint_path("/?PROBE_ID=1".into())
+            .await
+            .unwrap();
+        let sink = handler.sink();
+        sink.set_condmv_line(true);
+        let marker = MeasurementResult {
+            data: MeasurementData::Line(
+                "RESULT 9907 ongoing 1791836401 /var/spool/ripe-atlas/data/new/7".into(),
+            ),
+            ..make_result(0)
+        };
+        sink.submit(make_result(1001));
+        sink.condmv(Some(marker));
+        sink.submit(make_result(1002));
+        let mut post = || {
+            let (_, req) = seen.try_recv().unwrap();
+            let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
+            body.lines()
+                .filter_map(|line| {
+                    if line.starts_with("RESULT 9907 ") {
+                        Some("9907")
+                    } else if line.contains("\"id\":\"1001\"") {
+                        Some("1001")
+                    } else if line.contains("\"id\":\"1002\"") {
+                        Some("1002")
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(handler.upload_pending().await.is_err());
+        assert_eq!(post(), ["1001", "9907"]);
+        let stats = handler.queue_stats().await;
+        assert_eq!((stats.count, stats.held), (3, 1));
+
+        assert!(handler.upload_pending().await.is_err());
+        assert_eq!(post(), ["1001", "9907"], "1002 still waits");
+
+        // A run without -A moves the file and appends nothing
+        sink.condmv(None);
+        assert!(handler.upload_pending().await.is_err());
+        assert_eq!(post(), ["1001", "9907", "1002"]);
+        assert_eq!(handler.queue_stats().await.held, 0);
+
+        // Without a condmv line, nothing waits
+        sink.submit(make_result(1001));
+        assert_eq!(handler.queue_stats().await.held, 1);
+        sink.set_condmv_line(false);
+        assert!(handler.upload_pending().await.is_err());
+        assert_eq!(post(), ["1001", "9907", "1002", "1001"]);
     }
 
     /// 2026-10-12: RIPE refused every upload from probe 1018212 for hours and

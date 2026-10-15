@@ -310,6 +310,7 @@ impl Scheduler {
         } else {
             debug!("Crontab {}: {} lines, all kept", file, count);
         }
+        self.publish_condmv_line().await;
         self.run_due(now).await
     }
 
@@ -319,9 +320,20 @@ impl Scheduler {
         let stopped = lines.stop(msm_id);
         self.publish_counts(&mut lines);
         drop(lines);
+        self.publish_condmv_line().await;
         match stopped {
             0 => warn!(msm_id, "Measurement not found"),
             lines => info!(msm_id, lines, "Stopped measurement"),
+        }
+    }
+
+    /// Tell the results whether crons/7 has a condmv line: with one, they
+    /// hold eperd's results until its runs move them, as the reference's
+    /// httppost posts only data/out; without one, each post takes all
+    /// (ResultSink::set_condmv_line).
+    async fn publish_condmv_line(&self) {
+        if let Some(results) = &self.results {
+            results.set_condmv_line(self.lines.lock().await.has_eperd_condmv());
         }
     }
 
@@ -486,9 +498,9 @@ impl Scheduler {
     /// Start the runs due at `now`, each on a task of its own (spawn_run),
     /// and queue the records of the lines found more than 10 s off their
     /// time. RunJob appends those to eperd's out file, data/new/7
-    /// (eperd.c:1270-1303), the spool of the lines' own results, so they go
-    /// with the next main upload; a condmv line's run queues its 9907
-    /// marker after them.
+    /// (eperd.c:1270-1303), the spool of the lines' own results; a condmv
+    /// line's run appends its 9907 marker after them and moves the file
+    /// out, for the next main upload.
     ///
     /// While the tray pauses the probe, nothing runs and nothing is
     /// recorded, whatever comes due: a tick, a crontab's push, a job of
@@ -526,13 +538,14 @@ impl Scheduler {
             }
         }
         // eperd's condmv: its marker goes to data/new/7 after the results
-        // taken before it, at time(NULL) of its run (condmv_start,
-        // eperd/condmv.c:115-136). The reference then moves the file to
-        // data/out/7.<minute>, for the next post; Starla keeps its results
-        // in one queue, and the next post takes them all.
+        // taken before it, at time(NULL) of its run, and the file moves to
+        // data/out/7.<minute> for the next post (condmv_start,
+        // eperd/condmv.c:115-136). Results taken after it wait for its next
+        // run.
         if let Some(results) = &self.results {
-            for marker in condmvs.iter().filter_map(|c| c.marker(now.wall)) {
-                results.submit(self.spool_line(now.wall, marker));
+            for condmv in &condmvs {
+                let marker = condmv.marker(now.wall);
+                results.condmv(marker.map(|m| self.spool_line(now.wall, m)));
             }
         }
         jobs.into_iter()
@@ -1181,7 +1194,8 @@ mod tests {
     /// A line found more than 10 s late runs nothing, and its record is
     /// queued as eperd appends it to data/new/7: it goes with the next main
     /// upload, among the lines' results. With no condmv line in crons/7, as
-    /// here, nothing writes a 9907 marker: only that line's runs do.
+    /// here, nothing holds it back, and nothing writes a 9907 marker: only
+    /// that line's runs do.
     #[tokio::test]
     async fn a_late_lines_record_goes_with_the_next_upload() {
         let (bodies, mut posted) = tokio::sync::mpsc::unbounded_channel();
@@ -1257,23 +1271,6 @@ mod tests {
         handler.set_session_id("s".into()).await;
         let (scheduler, _) = scheduler_for(&handler, metrics);
 
-        let condmv = |append: Option<&str>| CrontabLine {
-            command: format!(
-                "condmv {}/home/atlas/data/new/7 /home/atlas/data/out/7",
-                append.map_or(String::new(), |a| format!("-A \"{a}\" "))
-            ),
-            job: MeasurementJob {
-                msm_id: 0,
-                interval: 60,
-                start_time: 1,
-                end_time: 2_000_000_000,
-                spread: 0,
-                spec: MeasurementSpec::Condmv(CondmvJobSpec {
-                    append: append.map(str::to_string),
-                    from: "/var/spool/ripe-atlas/data/new/7".into(),
-                }),
-            },
-        };
         let crons_7 = |lines| Crontab {
             file: "/var/spool/ripe-atlas/crons/7".into(),
             lines,
@@ -1281,7 +1278,7 @@ mod tests {
         let slot = 1_791_836_401; // 1 + 29863940 * 60
         scheduler
             .synchronize_at(
-                crons_7(vec![condmv(Some("RESULT 9907 ongoing"))]),
+                crons_7(vec![condmv_line(Some("RESULT 9907 ongoing"))]),
                 at(slot - 30),
             )
             .await;
@@ -1303,9 +1300,143 @@ mod tests {
 
         // Without -A, condmv moves the file and appends nothing
         scheduler
-            .synchronize_at(crons_7(vec![condmv(None)]), at(slot + 90))
+            .synchronize_at(crons_7(vec![condmv_line(None)]), at(slot + 90))
             .await;
         assert!(scheduler.run_due(at(slot + 120)).await.is_empty());
+        assert_eq!(handler.queue_stats().await.count, 0);
+    }
+
+    /// crons/7's condmv line as ctr-dub-sw02 sent it on 2026-10-13, with
+    /// spread 0: it runs at second 1 of each minute.
+    fn condmv_line(append: Option<&str>) -> CrontabLine {
+        CrontabLine {
+            command: format!(
+                "condmv {}/home/atlas/data/new/7 /home/atlas/data/out/7",
+                append.map_or(String::new(), |a| format!("-A \"{a}\" "))
+            ),
+            job: MeasurementJob {
+                msm_id: 0,
+                interval: 60,
+                start_time: 1,
+                end_time: 2_000_000_000,
+                spread: 0,
+                spec: MeasurementSpec::Condmv(CondmvJobSpec {
+                    append: append.map(str::to_string),
+                    from: "/var/spool/ripe-atlas/data/new/7".into(),
+                }),
+            },
+        }
+    }
+
+    /// A post's lines between header and footer, each as what it is: a
+    /// 9807 record, or a 9907 marker with its time after `base`.
+    fn post_lines(body: &str, base: i64) -> Vec<String> {
+        let lines = body
+            .strip_prefix("P_TO_C_REPORT\n")
+            .and_then(|b| b.strip_suffix("\nSESSION_ID s\n"))
+            .unwrap_or_else(|| panic!("framing: {body}"));
+        lines
+            .lines()
+            .map(|line| {
+                if line.contains("\"id\":\"9807\"") {
+                    "9807".to_string()
+                } else if let Some(rest) = line.strip_prefix("RESULT 9907 ongoing ") {
+                    let (time, from) = rest.split_once(' ').unwrap();
+                    assert_eq!(from, "/var/spool/ripe-atlas/data/new/7");
+                    format!("9907 +{}", time.parse::<i64>().unwrap() - base)
+                } else {
+                    panic!("unexpected line: {line}")
+                }
+            })
+            .collect()
+    }
+
+    /// eperd appends its results to data/new/7, and only crons/7's condmv
+    /// moves that file to data/out, the marker last; httppost posts
+    /// data/out. So a post carries eperd's results up to a 9907 marker and
+    /// never past it: one appended after condmv's last run waits for its
+    /// next. In the twin of 2026-10-15 Starla posted results past the last
+    /// 9907 in 7 of its 10 main posts, and the reference in none. With no
+    /// condmv line in crons/7 nothing holds them: the reference would never
+    /// post them, and a line Starla refused would look the same.
+    #[tokio::test]
+    async fn eperds_results_wait_for_crons_7s_next_condmv_run() {
+        let (bodies, mut posted) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = starla_metrics::MetricsRegistry::new().unwrap();
+        let handler = Arc::new(ResultHandler::new(
+            Box::new(Controller(bodies)),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            metrics.clone(),
+        ));
+        handler
+            .set_endpoint_path("/?PROBE_ID=1018212&SESSION_ID=s".into())
+            .await
+            .unwrap();
+        handler.set_session_id("s".into()).await;
+        let (scheduler, _) = scheduler_for(&handler, metrics);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let crons_7 = |lines| Crontab {
+            file: "/var/spool/ripe-atlas/crons/7".into(),
+            lines,
+        };
+        // condmv at second 1 of each minute, the DNS line at second 7
+        let base = 1_791_836_400; // 29863940 * 60
+        let dns = slow_dns_line(&server).await;
+        let ripe_7 = vec![dns.clone(), condmv_line(Some("RESULT 9907 ongoing"))];
+        scheduler
+            .synchronize_at(crons_7(ripe_7.clone()), at(base - 30))
+            .await;
+
+        assert!(scheduler.run_due(at(base + 1)).await.is_empty());
+        // 11 s late: its record goes to data/new/7, after condmv's run
+        assert!(scheduler.run_due(at(base + 18)).await.is_empty());
+        let stats = handler.queue_stats().await;
+        assert_eq!((stats.count, stats.held), (2, 1));
+        handler.upload_pending().await.unwrap();
+        assert_eq!(
+            post_lines(&posted.recv().await.unwrap(), base),
+            ["9907 +1"],
+            "the record waits for the next condmv run"
+        );
+        assert_eq!(handler.queue_stats().await.held, 1);
+
+        // A post with nothing moved out is the header and footer
+        handler.upload_pending().await.unwrap();
+        assert!(post_lines(&posted.recv().await.unwrap(), base).is_empty());
+
+        // condmv's next run moves the record, its marker after it
+        scheduler
+            .synchronize_at(crons_7(ripe_7), at(base + 40))
+            .await;
+        assert!(scheduler.run_due(at(base + 61)).await.is_empty());
+        handler.upload_pending().await.unwrap();
+        assert_eq!(
+            post_lines(&posted.recv().await.unwrap(), base),
+            ["9807", "9907 +61"]
+        );
+
+        // Two more minutes: condmv's run moves the first's record, and the
+        // second's is still in data/new/7
+        assert!(scheduler.run_due(at(base + 78)).await.is_empty());
+        assert!(scheduler.run_due(at(base + 121)).await.is_empty());
+        assert!(scheduler.run_due(at(base + 138)).await.is_empty());
+        let stats = handler.queue_stats().await;
+        assert_eq!((stats.count, stats.held), (3, 1));
+
+        // Without the condmv line, nothing holds eperd's results: the next
+        // post takes all there is, and no marker follows
+        scheduler
+            .synchronize_at(crons_7(vec![dns]), at(base + 140))
+            .await;
+        handler.upload_pending().await.unwrap();
+        assert_eq!(
+            post_lines(&posted.recv().await.unwrap(), base),
+            ["9807", "9907 +121", "9807"]
+        );
+        assert!(scheduler.run_due(at(base + 198)).await.is_empty());
+        handler.upload_pending().await.unwrap();
+        assert_eq!(post_lines(&posted.recv().await.unwrap(), base), ["9807"]);
         assert_eq!(handler.queue_stats().await.count, 0);
     }
 }

@@ -403,6 +403,14 @@ impl Lines {
         self.changed = true;
     }
 
+    /// Whether crons/7 has a condmv line: eperd's results then wait in
+    /// data/new/7 until one of its runs moves them.
+    pub(crate) fn has_eperd_condmv(&self) -> bool {
+        self.lines.iter().any(|(key, task)| {
+            key.in_file(EPERD_CRONTAB) && matches!(task.job.spec, MeasurementSpec::Condmv(_))
+        })
+    }
+
     /// The lines by measurement type ("ping", "dns", ...): crons/7's
     /// condmv line, which measures nothing, is not one.
     pub(crate) fn counts(&self) -> HashMap<String, u64> {

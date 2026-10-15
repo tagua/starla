@@ -2,6 +2,11 @@
 //!
 //! A simple VecDeque-based queue that holds measurement results
 //! until they are uploaded. Drops oldest results when at capacity.
+//!
+//! The main queue is eperd's two spool places at once: the results a post
+//! may take, which crons/7's condmv has moved to data/out, at the front,
+//! and behind them those still in data/new/7, which wait for its next run
+//! ([`ResultQueue::move_out`]).
 
 use starla_common::MeasurementResult;
 use std::collections::VecDeque;
@@ -29,6 +34,8 @@ pub struct QueuedResult {
 pub struct QueueStats {
     /// Number of items in the queue
     pub count: usize,
+    /// Of them, those not yet moved out for a post: still in data/new/7
+    pub held: usize,
     /// Maximum capacity
     pub capacity: usize,
 }
@@ -37,6 +44,10 @@ pub struct QueueStats {
 /// When full, oldest results are dropped to make room.
 pub struct ResultQueue {
     items: VecDeque<QueuedResult>,
+    /// How many items, from the front, are moved out: a post may take them
+    /// ([`drain_moved`](Self::drain_moved)). The rest were queued since the
+    /// last [`move_out`](Self::move_out).
+    moved: usize,
     max_capacity: usize,
 }
 
@@ -45,6 +56,7 @@ impl ResultQueue {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             items: VecDeque::with_capacity(max_capacity.min(1024)),
+            moved: 0,
             max_capacity,
         }
     }
@@ -54,10 +66,12 @@ impl ResultQueue {
         self.enqueue_measured(result, -1);
     }
 
-    /// Add a result with the `lts` it was measured at.
+    /// Add a result with the `lts` it was measured at, behind those moved
+    /// out: it waits for the next [`move_out`](Self::move_out).
     pub fn enqueue_measured(&mut self, result: MeasurementResult, lts: i64) {
         if self.items.len() >= self.max_capacity {
             if let Some(d) = self.items.pop_front() {
+                self.moved = self.moved.saturating_sub(1);
                 warn!(
                     msm_id = d.result.msm_id.0,
                     "Queue full ({}), dropping oldest result", self.max_capacity
@@ -79,15 +93,33 @@ impl ResultQueue {
         });
     }
 
-    /// Take up to `n` results from the front of the queue
+    /// Take up to `n` results from the front of the queue, moved out or not
     pub fn drain_batch(&mut self, n: usize) -> Vec<QueuedResult> {
         let count = n.min(self.items.len());
+        self.moved = self.moved.saturating_sub(count);
         self.items.drain(..count).collect()
     }
 
-    /// Take all results from the queue
+    /// Take all results from the queue, moved out or not
     pub fn drain_all(&mut self) -> Vec<QueuedResult> {
+        self.moved = 0;
         self.items.drain(..).collect()
+    }
+
+    /// Everything queued so far may go with the next post: crons/7's condmv
+    /// renames data/new/7, the results eperd has appended to it and its
+    /// marker last, into data/out (condmv_start, eperd/condmv.c:115-136).
+    /// Results queued after it wait for its next run.
+    pub fn move_out(&mut self) {
+        self.moved = self.items.len();
+    }
+
+    /// Take the results moved out, in their order: what a post finds in
+    /// data/out. Those queued since the last [`move_out`](Self::move_out)
+    /// stay.
+    pub fn drain_moved(&mut self) -> Vec<QueuedResult> {
+        let moved = std::mem::take(&mut self.moved);
+        self.items.drain(..moved).collect()
     }
 
     /// Put results a post did not deliver back at the front, in their order,
@@ -107,13 +139,7 @@ impl ResultQueue {
             r.last_attempt_at = Some(now);
         }
 
-        for r in results.into_iter().rev() {
-            self.items.push_front(r);
-        }
-
-        while self.items.len() > self.max_capacity {
-            self.items.pop_back();
-        }
+        self.push_front_moved(results);
     }
 
     /// Put results a post left out back at the front, in their order, no
@@ -121,6 +147,14 @@ impl ResultQueue {
     /// not posted, as do_dir leaves a file that does not fit for the next
     /// post (httppost.c:1118-1131).
     pub fn put_back(&mut self, results: Vec<QueuedResult>) {
+        self.push_front_moved(results);
+    }
+
+    /// Results a post took, back at the front in their order: still moved
+    /// out, as a spool file httppost did not delete stays in data/out.
+    /// Over the capacity, the newest go.
+    fn push_front_moved(&mut self, results: Vec<QueuedResult>) {
+        self.moved += results.len();
         for r in results.into_iter().rev() {
             self.items.push_front(r);
         }
@@ -128,6 +162,7 @@ impl ResultQueue {
         while self.items.len() > self.max_capacity {
             self.items.pop_back();
         }
+        self.moved = self.moved.min(self.items.len());
     }
 
     /// Remove results older than `max_age_secs`. Returns number of items
@@ -139,7 +174,17 @@ impl ResultQueue {
             .as_secs() as i64;
 
         let before = self.items.len();
-        self.items.retain(|r| now - r.queued_at < max_age_secs);
+        let (mut at, mut moved_removed) = (0, 0);
+        let moved = self.moved;
+        self.items.retain(|r| {
+            let keep = now - r.queued_at < max_age_secs;
+            if !keep && at < moved {
+                moved_removed += 1;
+            }
+            at += 1;
+            keep
+        });
+        self.moved -= moved_removed;
         let removed = before - self.items.len();
         if removed > 0 {
             debug!("Cleaned up {} expired results", removed);
@@ -151,6 +196,7 @@ impl ResultQueue {
     pub fn stats(&self) -> QueueStats {
         QueueStats {
             count: self.items.len(),
+            held: self.items.len() - self.moved,
             capacity: self.max_capacity,
         }
     }
@@ -243,5 +289,74 @@ mod tests {
         assert!(back[..2]
             .iter()
             .all(|r| r.attempts == 100 && r.last_attempt_at.is_some()));
+    }
+
+    fn ids(results: &[QueuedResult]) -> Vec<u64> {
+        results.iter().map(|r| r.result.msm_id.0).collect()
+    }
+
+    /// A post takes what crons/7's condmv has moved to data/out; what
+    /// eperd appended to data/new/7 since waits for its next run.
+    #[test]
+    fn a_post_takes_only_what_condmv_moved_out() {
+        let mut q = ResultQueue::new(100);
+        q.enqueue(make_result(1));
+        q.enqueue(make_result(2));
+        q.move_out();
+        q.enqueue(make_result(3));
+        assert_eq!((q.stats().count, q.stats().held), (3, 1));
+
+        assert_eq!(ids(&q.drain_moved()), [1, 2]);
+        assert!(q.drain_moved().is_empty(), "3 is not moved out");
+        q.move_out();
+        assert_eq!(ids(&q.drain_moved()), [3]);
+        assert_eq!(q.stats().count, 0);
+    }
+
+    /// What a post took and did not deliver, or left out for its
+    /// --maxpostsize, goes back moved out, ahead of what was moved since:
+    /// httppost leaves the spool file in data/out. What is in data/new/7
+    /// still waits.
+    #[test]
+    fn what_a_post_took_goes_back_moved_out() {
+        let mut q = ResultQueue::new(100);
+        for id in 1..=4 {
+            q.enqueue(make_result(id));
+        }
+        q.move_out();
+        q.enqueue(make_result(5));
+        let mut taken = q.drain_moved();
+        let left_out = taken.split_off(2);
+        q.put_back(left_out);
+        q.requeue(taken);
+        assert_eq!((q.stats().count, q.stats().held), (5, 1));
+        let again = q.drain_moved();
+        assert_eq!(ids(&again), [1, 2, 3, 4]);
+        assert_eq!(again[0].attempts, 1, "posted once");
+        assert_eq!(again[2].attempts, 0, "never posted");
+        assert_eq!(ids(&q.drain_all()), [5]);
+    }
+
+    /// The capacity and the age drop moved-out results and held ones
+    /// alike, and what is left keeps its place.
+    #[test]
+    fn dropped_results_leave_the_rest_where_they_were() {
+        let mut q = ResultQueue::new(3);
+        q.enqueue(make_result(1));
+        q.enqueue(make_result(2));
+        q.move_out();
+        q.enqueue(make_result(3));
+        q.enqueue(make_result(4)); // drops 1, moved out
+        assert_eq!((q.stats().count, q.stats().held), (3, 2));
+
+        q.items[0].queued_at -= 7200; // 2, moved out
+        q.items[1].queued_at -= 7200; // 3, held
+        assert_eq!(q.cleanup_expired(3600), 2);
+        assert_eq!((q.stats().count, q.stats().held), (1, 1));
+        assert!(q.drain_moved().is_empty());
+
+        // Over the capacity, requeued results push out the newest
+        q.requeue(vec![q.items[0].clone(); 3]);
+        assert_eq!((q.stats().count, q.stats().held), (3, 0));
     }
 }
