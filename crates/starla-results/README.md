@@ -5,7 +5,7 @@ Result management and upload for Starla.
 ## Features
 
 - **Bounded in-memory queue**: configurable capacity; the oldest results are dropped when the buffer is full
-- **Batch upload**: the queue is drained and posted in one request, on the controller's own `httppost` slots
+- **Batch upload**: the queue is drained and posted on the controller's own `httppost` slots, as much as one request may hold under `--maxpostsize` (httppost's 1,000,000 bytes unless the line names another, and for one-off posts too); what does not fit waits for the next post
 - **Retry and backoff**: a failed upload is re-queued until a post delivers it or it is older than `max_result_age_secs`, never dropped for its failed attempts; a `429` holds uploads with an increasing backoff
 - **RIPE Atlas format**: results are formatted to match the official C probe exactly — field order, spacing, numeric precision
 - **Clock sync (`lts`)**: tracks the last agreement with the controller, persisted across restarts

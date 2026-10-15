@@ -28,20 +28,10 @@ pub const UPLOAD_BODY_TARGET: &str = "starla_results::uploader::body";
 /// runs the controller's SSH session and telnet.
 const RESULTS_PER_YIELD: usize = 64;
 
-/// Append each result's RESULT line to an upload body, yielding every
-/// [`RESULTS_PER_YIELD`].
-async fn append_result_lines(body: &mut Vec<u8>, results: &[QueuedResult]) {
-    for (i, queued) in results.iter().enumerate() {
-        if i > 0 && i.is_multiple_of(RESULTS_PER_YIELD) {
-            tokio::task::yield_now().await;
-        }
-        body.extend_from_slice(result_line(queued).as_bytes());
-    }
-}
-
-/// [`append_result_lines`] under a post's [`Budget`]: each result's line
-/// that fits is appended. The results whose lines went in, those left for
-/// the next post, and how many were dropped as too big ever to fit.
+/// Append each result's RESULT line that fits a post's [`Budget`] to its
+/// body, yielding every [`RESULTS_PER_YIELD`]. The results whose lines went
+/// in, those left for the next post, and how many were dropped as too big
+/// ever to fit.
 async fn append_fitting_result_lines(
     body: &mut Vec<u8>,
     results: Vec<QueuedResult>,
@@ -65,6 +55,16 @@ async fn append_fitting_result_lines(
     (sent, deferred, dropped)
 }
 
+/// Say what a post under `--maxpostsize` left out of its results.
+fn log_left_out(max_post_size: u64, deferred: usize, dropped: usize) {
+    if dropped > 0 {
+        warn!("Dropping {dropped} results: each more than half of --maxpostsize {max_post_size}");
+    }
+    if deferred > 0 {
+        debug!("{deferred} results wait for the next post: --maxpostsize {max_post_size}");
+    }
+}
+
 /// A queued result's RESULT line, with the lts it was measured at.
 fn result_line(queued: &QueuedResult) -> String {
     AtlasResult::from_measurement(queued.result.clone(), None)
@@ -72,7 +72,8 @@ fn result_line(queued: &QueuedResult) -> String {
         .to_result_line()
 }
 
-/// The main post's header, httppost's `--post-header` file.
+/// A post's header, httppost's `--post-header` file: the main post's and
+/// eooqd's.
 const POST_HEADER: &[u8] = b"P_TO_C_REPORT\n";
 
 /// httppost's `--maxpostsize` without the option (httppost.c:129); the same
@@ -126,8 +127,9 @@ impl Budget {
     }
 }
 
-/// What a main post did with the results it was handed.
-pub(crate) struct MainPost {
+/// What a post did with the results it was handed: the main post, or
+/// eooqd's of one-offs.
+pub(crate) struct ResultsPost {
     /// The results the body carried: posted on an OK, for the caller to
     /// requeue otherwise
     pub(crate) sent: Vec<QueuedResult>,
@@ -368,11 +370,11 @@ impl ResultUploader {
         target: &PostTarget,
         results: Vec<QueuedResult>,
         session_id: Option<&str>,
-    ) -> MainPost {
+    ) -> ResultsPost {
         // An empty batch is still posted (header, telemetry, footer), as the
         // reference probe's minutely httppost is with an empty data/out.
         if !self.has_endpoint() {
-            return MainPost {
+            return ResultsPost {
                 sent: results,
                 deferred: Vec::new(),
                 dropped: 0,
@@ -434,19 +436,7 @@ impl ResultUploader {
 
         let (sent, deferred, dropped) =
             append_fitting_result_lines(&mut body, results, &mut budget).await;
-        if dropped > 0 {
-            warn!(
-                "Dropping {dropped} results: each more than half of --maxpostsize {}",
-                target.max_post_size
-            );
-        }
-        if !deferred.is_empty() {
-            debug!(
-                "{} results wait for the next post: --maxpostsize {}",
-                deferred.len(),
-                target.max_post_size
-            );
-        }
+        log_left_out(target.max_post_size, deferred.len(), dropped);
 
         body.extend_from_slice(footer.as_bytes());
 
@@ -470,7 +460,7 @@ impl ResultUploader {
         if ok {
             self.spool.delete(&posted_files).await;
         }
-        MainPost {
+        ResultsPost {
             sent,
             deferred,
             dropped,
@@ -509,26 +499,46 @@ impl ResultUploader {
     /// is built from the probe id and the session, not taken from a
     /// CRONLINE; the body is header, the one-offs' RESULT lines, footer (no
     /// telemetry, no condmv marker: eooqd's spool is its own); and with no
-    /// `--set-time` the answer's Date is not judged.
-    pub async fn post_oneoff(
+    /// `--set-time` the answer's Date is not judged. The line names no
+    /// `--maxpostsize`, so httppost's own 1000000 holds the body as it holds
+    /// the main post's ([`Budget`]): a result that does not fit waits for
+    /// the next post, one more than half of it is dropped. The results are
+    /// the caller's to requeue or put back.
+    pub(crate) async fn post_oneoff(
         &self,
-        results: &[QueuedResult],
+        results: Vec<QueuedResult>,
         session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> ResultsPost {
         if !self.has_endpoint() {
-            anyhow::bail!("No upload endpoint configured");
-        }
-        let mut body = b"P_TO_C_REPORT\n".to_vec();
-        append_result_lines(&mut body, results).await;
-        if let Some(sid) = session_id {
-            body.extend_from_slice(format!("\nSESSION_ID {sid}\n").as_bytes());
+            return ResultsPost {
+                sent: results,
+                deferred: Vec::new(),
+                dropped: 0,
+                outcome: Err(anyhow::anyhow!("No upload endpoint configured")),
+            };
         }
         let target = PostTarget {
             set_time: None,
             ..self.default_target(Some("oneoff"))
         };
-        self.post(&target, &body, results.len(), std::time::Instant::now())
-            .await
+        let footer = session_id
+            .map(|sid| format!("\nSESSION_ID {sid}\n"))
+            .unwrap_or_default();
+        let mut budget = Budget::new(target.max_post_size, POST_HEADER.len() + footer.len());
+        let mut body = POST_HEADER.to_vec();
+        let (sent, deferred, dropped) =
+            append_fitting_result_lines(&mut body, results, &mut budget).await;
+        log_left_out(target.max_post_size, deferred.len(), dropped);
+        body.extend_from_slice(footer.as_bytes());
+        let outcome = self
+            .post(&target, &body, sent.len(), std::time::Instant::now())
+            .await;
+        ResultsPost {
+            sent,
+            deferred,
+            dropped,
+            outcome,
+        }
     }
 
     /// httppost --set-time N: compare the answer's Date with our clock. In
@@ -881,7 +891,8 @@ mod tests {
 
         let before = polls.load(SeqCst);
         let mut body = Vec::new();
-        append_result_lines(&mut body, &results).await;
+        let mut room = Budget::new(u64::MAX, 0);
+        append_fitting_result_lines(&mut body, results, &mut room).await;
         let between = polls.load(SeqCst) - before;
         other.abort();
 
@@ -1253,6 +1264,43 @@ mod tests {
         assert!(req.ends_with("\r\n\r\nP_TO_C_REPORT\n"), "{req}");
     }
 
+    /// eooqd's post names no --maxpostsize: httppost's 1000000 holds it as
+    /// it holds the main post. Two 400 kB results fit, a third waits for
+    /// the next post, and one of 600 kB, more than half, is dropped.
+    #[tokio::test]
+    async fn a_one_off_post_keeps_to_httpposts_default_maxpostsize() {
+        let (u, _telemetry, mut seen) = uploader("HTTP/1.1 200 \r\n\r\nOK\n");
+        let big = |msm_id, bytes: usize| {
+            let mut queued = one_result().remove(0);
+            queued.result.msm_id = MeasurementId(msm_id);
+            queued.result.data =
+                MeasurementData::Generic(serde_json::json!([{ "x": "y".repeat(bytes) }]));
+            queued
+        };
+        let results = vec![
+            big(1, 400_000),
+            big(2, 600_000),
+            big(3, 400_000),
+            big(4, 400_000),
+        ];
+        let post = u.post_oneoff(results, Some("s")).await;
+        post.outcome.unwrap();
+        let ids = |rs: &[QueuedResult]| rs.iter().map(|r| r.result.msm_id.0).collect::<Vec<_>>();
+        assert_eq!(ids(&post.sent), [1, 3]);
+        assert_eq!(ids(&post.deferred), [4]);
+        assert_eq!(post.dropped, 1);
+        let req = seen.recv().await.unwrap();
+        let (head, body) = req.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.starts_with("POST /?PROBE_ID=1&SRC=oneoff HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(body.len() as u64 <= DEFAULT_MAX_POST_SIZE, "{}", body.len());
+        assert!(body.starts_with("P_TO_C_REPORT\nRESULT "));
+        assert!(body.ends_with(" }\n\nSESSION_ID s\n"));
+        assert_eq!(body.lines().filter(|l| l.starts_with("RESULT ")).count(), 2);
+    }
+
     /// The twin's reference probe, 2026-10-13 (wire-ctrl.jsonl): its
     /// timesync post, head and body byte for byte.
     const REF_SESSION: &str = "b6c053a85ee60b777fa64503f459764141780eea4c80d096c75cb2300531a15d";
@@ -1362,7 +1410,10 @@ mod tests {
             .unwrap();
         telemetry.push(REPORT.into()).await;
         let results = one_result();
-        u.post_oneoff(&results, Some(REF_SESSION)).await.unwrap();
+        u.post_oneoff(results.clone(), Some(REF_SESSION))
+            .await
+            .outcome
+            .unwrap();
 
         let req = seen.recv().await.unwrap();
         let (head, body) = req.split_once("\r\n\r\n").unwrap();

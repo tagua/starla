@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use uploader::MainPost;
+use uploader::ResultsPost;
 
 /// Configuration for the result handler
 #[derive(Debug, Clone)]
@@ -638,7 +638,7 @@ impl ResultHandler {
         }
 
         let session_id = self.session_id.lock().await.clone();
-        let MainPost {
+        let ResultsPost {
             sent,
             deferred,
             dropped,
@@ -690,34 +690,54 @@ impl ResultHandler {
     /// 712-719, 821-829). 2026-10-14 17:25-18:23 UTC, probe 1018212's KEEP
     /// disconnects: five one-offs were dropped after five failed posts,
     /// each newly queued one-off's post at once counting one more.
+    ///
+    /// A post holds at most httppost's default --maxpostsize: what does not
+    /// fit waits in out/ooq, and post_results posts again at once while
+    /// anything waits, up to [`ONEOFF_POSTS_PER_CALL`] posts, stopping at
+    /// the first that fails (eooqd.c:721-829); re_post takes what is left.
+    /// How many results were posted.
     pub async fn upload_oneoffs(&self) -> anyhow::Result<usize> {
         if !self.has_endpoint().await {
             return Ok(0);
         }
         self.take_submitted().await;
-        let uploadable = self.oneoff_queue.lock().await.drain_all();
-        if uploadable.is_empty() {
-            return Ok(0);
-        }
-        let count = uploadable.len();
-        let session_id = self.session_id.lock().await.clone();
-        let sent = self
-            .uploader
-            .lock()
-            .await
-            .post_oneoff(&uploadable, session_id.as_deref())
-            .await;
-        match sent {
-            Ok(()) => {
-                info!("Posted {} one-off results", count);
-                Ok(count)
+        let mut posted = 0;
+        for _ in 0..ONEOFF_POSTS_PER_CALL {
+            let uploadable = self.oneoff_queue.lock().await.drain_all();
+            if uploadable.is_empty() {
+                break;
             }
-            Err(e) => {
-                warn!("One-off post failed: {}", e);
-                self.oneoff_queue.lock().await.requeue(uploadable);
-                Err(e)
+            let session_id = self.session_id.lock().await.clone();
+            let ResultsPost {
+                sent,
+                deferred,
+                dropped,
+                outcome,
+            } = self
+                .uploader
+                .lock()
+                .await
+                .post_oneoff(uploadable, session_id.as_deref())
+                .await;
+            for _ in 0..dropped {
+                self.metrics.record_queue_drop();
+            }
+            let mut queue = self.oneoff_queue.lock().await;
+            // Not posted: no attempt counted
+            queue.put_back(deferred);
+            match outcome {
+                Ok(()) => {
+                    info!("Posted {} one-off results", sent.len());
+                    posted += sent.len();
+                }
+                Err(e) => {
+                    warn!("One-off post failed: {}", e);
+                    queue.requeue(sent);
+                    return Err(e);
+                }
             }
         }
+        Ok(posted)
     }
 
     /// The 900 s clock-check post (`httppost … &SRC=timesync`): the
@@ -1070,6 +1090,10 @@ const TIMESYNC_INTERVAL: Duration = Duration::from_secs(900);
 
 /// eooqd's re-post timer (eooqd.c:271).
 const ONEOFF_REPOST: Duration = Duration::from_secs(60);
+
+/// The most posts one post_results makes while out/ooq still holds results
+/// (`for (j= 0; j<5; j++)`, eooqd.c:732).
+const ONEOFF_POSTS_PER_CALL: usize = 5;
 
 const RATE_LIMIT_FIRST_HOLD: Duration = Duration::from_secs(60);
 const RATE_LIMIT_MAX_HOLD: Duration = Duration::from_secs(30 * 60);
@@ -1750,6 +1774,95 @@ mod tests {
         assert_eq!(*target, main_path());
         assert!(body.contains("\"1001\""), "{body}");
         assert!(!body.contains("222024177"), "{body}");
+    }
+
+    /// A handler on the twin's session whose controller answers each post
+    /// with the next of `answers`, and `n` one-offs of 400 kB queued, the
+    /// third of them 600 kB: more than half of httppost's 1000000.
+    async fn big_one_offs(
+        answers: &[&'static str],
+        n: u64,
+    ) -> (
+        Arc<ResultHandler>,
+        tokio::sync::mpsc::UnboundedReceiver<(tokio::time::Instant, String)>,
+        Vec<u64>,
+    ) {
+        let (transport, seen) = answering(answers);
+        let (handler, _) = twin_handler(transport).await;
+        let ids: Vec<u64> = (1..=n).map(|i| 222_000_000 + i).collect();
+        for &id in &ids {
+            handler.expect_oneoff(id).await;
+        }
+        for (i, &id) in ids.iter().enumerate() {
+            let bytes = if i == 2 { 600_000 } else { 400_000 };
+            handler.submit(MeasurementResult {
+                data: MeasurementData::Generic(serde_json::json!([{ "x": "y".repeat(bytes) }])),
+                ..make_result(id)
+            });
+        }
+        (handler, seen, ids)
+    }
+
+    /// The one-offs each post carried, by msm id, in order.
+    fn one_off_posts(
+        seen: &mut tokio::sync::mpsc::UnboundedReceiver<(tokio::time::Instant, String)>,
+        ids: &[u64],
+    ) -> Vec<Vec<u64>> {
+        let mut posts = Vec::new();
+        while let Ok((_, req)) = seen.try_recv() {
+            assert!(req.contains("&SRC=oneoff HTTP/1.1"), "{}", &req[..80]);
+            let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
+            assert!(body.len() as u64 <= DEFAULT_MAX_POST_SIZE, "{}", body.len());
+            posts.push(
+                ids.iter()
+                    .copied()
+                    .filter(|id| body.contains(&format!("\"{id}\"")))
+                    .collect(),
+            );
+        }
+        posts
+    }
+
+    /// One-offs past httppost's default --maxpostsize go in posts one after
+    /// another, as eooqd's post_results posts again while out/ooq holds
+    /// results (eooqd.c:732-829), not a minute apart; the one of more than
+    /// half a post is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn one_offs_past_the_maxpostsize_go_in_posts_one_after_another() {
+        let (handler, mut seen, ids) = big_one_offs(&[OK], 6).await;
+        assert_eq!(handler.upload_oneoffs().await.unwrap(), 5);
+        assert_eq!(
+            one_off_posts(&mut seen, &ids),
+            [vec![ids[0], ids[1]], vec![ids[3], ids[4]], vec![ids[5]]]
+        );
+        assert_eq!(handler.oneoff_queue.lock().await.stats().count, 0);
+    }
+
+    /// A failed post ends the run, as httppost's failure returns from
+    /// post_results: what it carried is requeued, what waited is put back
+    /// with no attempt counted, and the next run posts both.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_one_off_post_ends_the_run_and_keeps_the_rest() {
+        let (handler, mut seen, ids) = big_one_offs(&[OK, "HTTP/1.1 500 \r\n\r\n", OK], 6).await;
+        assert!(handler.upload_oneoffs().await.is_err());
+        let waiting = handler.oneoff_queue.lock().await.drain_all();
+        let attempts: Vec<(u64, u32)> = waiting
+            .iter()
+            .map(|r| (r.result.msm_id.0, r.attempts))
+            .collect();
+        assert_eq!(attempts, [(ids[3], 1), (ids[4], 1), (ids[5], 0)]);
+        handler.oneoff_queue.lock().await.put_back(waiting);
+
+        assert_eq!(handler.upload_oneoffs().await.unwrap(), 3);
+        assert_eq!(
+            one_off_posts(&mut seen, &ids),
+            [
+                vec![ids[0], ids[1]],
+                vec![ids[3], ids[4]],
+                vec![ids[3], ids[4]],
+                vec![ids[5]]
+            ]
+        );
     }
 
     /// A failed one-off post leaves the result for eooqd's minutely re-post.
