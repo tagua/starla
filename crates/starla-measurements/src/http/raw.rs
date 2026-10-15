@@ -1,4 +1,4 @@
-//! HTTP GET as the reference probe's evhttpget does it
+//! HTTP GET, HEAD and POST as the reference probe's evhttpget does them
 //! (probe-busybox/eperd/httpget.c), for `http://` and `https://` URLs.
 //!
 //! RIPE learns a probe's public addresses from its hourly built-ins to
@@ -102,15 +102,91 @@ pub fn parse_http_url(url: &str) -> anyhow::Result<HttpUrl> {
     })
 }
 
-/// The request httpget writes for a GET.
-pub fn request(url: &HttpUrl, http10: bool) -> String {
-    format!(
-        "GET {} HTTP/1.{}\r\nHost: {}\r\nConnection: close\r\nUser-Agent: {}\r\n\r\n",
+/// The method httpget sends: `--get` (the default), `--head` or `--post`,
+/// whichever the line names last (httpget.c:514-546).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Method {
+    #[default]
+    Get,
+    Head,
+    Post,
+}
+
+impl Method {
+    /// HttpConfig's method, in any case: anything but HEAD and POST is GET.
+    pub fn from_name(name: &str) -> Self {
+        if name.eq_ignore_ascii_case("HEAD") {
+            Method::Head
+        } else if name.eq_ignore_ascii_case("POST") {
+            Method::Post
+        } else {
+            Method::Get
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Head => "HEAD",
+            Method::Post => "POST",
+        }
+    }
+}
+
+/// The request httpget writes (writecb, httpget.c:1826-1866). A POST says
+/// its body's type and length; its body is the --post-header,
+/// --post-file and --post-footer files, which must be under data/out.
+/// Starla keeps no files there, and httpget posts nothing for a file it
+/// cannot stat or open (:1849-1863, 1767-1772), so the length is 0.
+pub fn request(url: &HttpUrl, method: Method, http10: bool) -> String {
+    let mut request = format!(
+        "{} {} HTTP/1.{}\r\nHost: {}\r\nConnection: close\r\nUser-Agent: {}\r\n",
+        method.as_str(),
         url.path,
         if http10 { '0' } else { '1' },
         url.hostport,
         USER_AGENT
-    )
+    );
+    if method == Method::Post {
+        request
+            .push_str("Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n");
+    }
+    request.push_str("\r\n");
+    request
+}
+
+/// What evhttpget's line asks of a fetch beyond its URL.
+#[derive(Debug, Clone)]
+pub struct FetchOptions {
+    /// `-4` / `-6`: 4, 6, or 0 for either
+    pub af: u8,
+    /// `-0`: HTTP/1.0
+    pub http10: bool,
+    /// `--store-headers`
+    pub store_headers: usize,
+    /// `--timeout`: the timer each connect arms
+    pub timeout: Duration,
+    /// `--sni`: the server name an https fetch sends in place of the host
+    pub sni: Option<String>,
+    /// `--get`, `--head`, `--post`
+    pub method: Method,
+    /// `--all`: fetch from every address the lookup gave, each fetch
+    /// reported
+    pub all: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            af: 0,
+            http10: false,
+            store_headers: 0,
+            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            sni: None,
+            method: Method::Get,
+            all: false,
+        }
+    }
 }
 
 /// What httpget reports for one fetch.
@@ -145,29 +221,43 @@ pub struct RawHttpOutcome {
     pub refused: bool,
     /// The response was read to the end (httpget's READ_DONE)
     pub done: bool,
+    /// The method sent
+    pub method: Method,
+    /// The fetch's address among the lookup's, from 1, and their count:
+    /// `--all`'s "subid" and "submax" (dnscount, report();
+    /// httpget.c:1969-1978, 838, 891-896)
+    pub subid: usize,
+    pub submax: usize,
+    /// gettime_mono's seconds when the connect started: `--all
+    /// --combine`'s "time", which is CLOCK_MONOTONIC's, not the Unix time
+    /// the result format describes (state->start, httpget.c:886-890,
+    /// 2021)
+    pub started: u64,
+    /// ms from the fetch's start to its first connect: `--etim`'s "ttr" in
+    /// the result, the lookup's time and a little more (beforeconnect,
+    /// httpget.c:2014-2020, 2152)
+    pub connect_ttr: f64,
+    /// ms from the connect's start to connected, the TLS handshake
+    /// included: "ttc" (writecb's WRITE_FIRST, httpget.c:1817-1822)
+    pub ttc: f64,
+    /// Each read that brought data: the bytes read before it and ms from
+    /// the connect's start. `--eetim`'s "readtiming" (get_input,
+    /// httpget.c:1063-1075); the first is "ttfb" (readcb's READ_FIRST,
+    /// :1234-1243)
+    pub reads: Vec<(usize, f64)>,
 }
 
-/// Fetch `url` as evhttpget does. `af` is 4, 6, or 0 for either; `sni`,
-/// `--sni`, the server name an https fetch sends in place of the host.
-pub async fn fetch(
-    url: &HttpUrl,
-    af: u8,
-    http10: bool,
-    store_headers: usize,
-    timeout: Duration,
-    sni: Option<&str>,
-) -> anyhow::Result<RawHttpOutcome> {
-    fetch_via(
-        None,
-        target::address_allowed,
-        url,
-        af,
-        http10,
-        store_headers,
-        timeout,
-        sni,
-    )
-    .await
+impl RawHttpOutcome {
+    /// ms from the connect's start to the first byte read: "ttfb"
+    pub fn ttfb(&self) -> f64 {
+        self.reads.first().map_or(0.0, |&(_, t)| t)
+    }
+}
+
+/// Fetch `url` as evhttpget does, with the line's options: one outcome, or
+/// with `--all` one for each address.
+pub async fn fetch(url: &HttpUrl, opts: &FetchOptions) -> anyhow::Result<Vec<RawHttpOutcome>> {
+    fetch_via(None, target::address_allowed, url, opts).await
 }
 
 /// [`fetch`], a host name looked up with `dns`, the probe's resolver when
@@ -185,16 +275,27 @@ pub async fn fetch(
 /// with getaddrinfo() on the blocking pool, cut off at the fetch's
 /// timeout, and reported nothing when it failed.
 ///
-/// An address atlas_check_addr refuses (`allowed`, the probe's
-/// [`target::address_allowed`]) is reported, not connected to
-/// (tcputil.c:262-266). Starla fetched from 10/8, 127/8 and the like.
+/// The addresses are tried in the lookup's order, as tu_connect_to_name
+/// tries them (tcputil.c:81-147, 250-337): a connect that fails or times
+/// out goes on to the next, and only the last one's is reported, as
+/// beforeconnect clears the result for each (httpget.c:353-358,
+/// 2008-2010, 2055-2066); a fetch that connected is reported whatever it
+/// comes to. With `--all` each address is fetched from and each fetch
+/// reported (report() connects again, httpget.c:999-1003). Starla tried
+/// the first address alone.
 ///
-/// One timer, `timeout` long, runs from the connect to the end of the
-/// response, as tu_connect_to_name arms it before each connect and nothing
-/// arms it again for the read (tcputil.c:260); Starla gave the read a
-/// timeout of its own on top. A failed connect is `"err":"connect: <why>"`
-/// with strerror's words (tcputil.c:525-529), not Rust's, which add
-/// " (os error N)".
+/// An address atlas_check_addr refuses (`allowed`, the probe's
+/// [`target::address_allowed`]) is reported, not connected to, and ends
+/// the fetch (tcputil.c:95-100, 262-266). Starla fetched from 10/8, 127/8
+/// and the like. (The reference's `--all` goes on past one, with its
+/// dnserr flag left set, into lines that are not JSON.)
+///
+/// Each connect arms one timer, `timeout` long, that runs to the end of
+/// the response, as tu_connect_to_name arms it before each connect and
+/// nothing arms it again for the read (tcputil.c:93, 260); Starla gave the
+/// read a timeout of its own on top. A failed connect is
+/// `"err":"connect: <why>"` with strerror's words (tcputil.c:525-529), not
+/// Rust's, which add " (os error N)".
 ///
 /// Over TLS the handshake is part of the connect, as the openssl
 /// bufferevent's CONNECTED event comes after it: its time is in rt, its
@@ -202,57 +303,89 @@ pub async fn fetch(
 /// rustls's words for why, where the reference has OpenSSL's — and a
 /// handshake that outlasts the timeout is "connect: timeout"
 /// (timeout_callback while connecting, httpget.c:347-362).
-#[allow(clippy::too_many_arguments)]
 async fn fetch_via(
     dns: Option<&Resolver>,
     allowed: fn(IpAddr) -> bool,
     url: &HttpUrl,
-    af: u8,
-    http10: bool,
-    store_headers: usize,
-    timeout: Duration,
-    sni: Option<&str>,
-) -> anyhow::Result<RawHttpOutcome> {
-    let (dst, ttr) = match target::literal(&url.host, url.port, af) {
-        Some(dst) => (dst, None),
+    opts: &FetchOptions,
+) -> anyhow::Result<Vec<RawHttpOutcome>> {
+    // httpget_start's start, from which the first connect's "ttr" runs
+    let began = Instant::now();
+    let (addrs, ttr) = match target::literal(&url.host, url.port, opts.af) {
+        Some(dst) => (vec![dst], None),
         None => {
-            let lookup = match dns {
-                Some(dns) => dns.lookup(&url.host, af).await,
-                None => target::lookup(&url.host, af).await,
+            let start = Instant::now();
+            let found = match dns {
+                Some(dns) => dns.addresses(&url.host, opts.af).await,
+                None => Resolver::system().addresses(&url.host, opts.af).await,
             };
-            let ttr = lookup.dst_name.ttr;
-            match lookup.addr {
-                Ok(ip) => (SocketAddr::new(ip, url.port), ttr),
+            let ttr = Some(start.elapsed().as_secs_f64() * 1e3);
+            match found {
+                Ok(ips) => (
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, url.port))
+                        .collect(),
+                    ttr,
+                ),
                 Err(e) => {
-                    return Ok(RawHttpOutcome {
+                    return Ok(vec![RawHttpOutcome {
                         ttr,
-                        af: if af == 6 { 6 } else { 4 },
+                        af: if opts.af == 6 { 6 } else { 4 },
                         dnserr: Some(e.to_string()),
+                        method: opts.method,
                         ..Default::default()
-                    })
+                    }])
                 }
             }
         }
     };
 
-    let mut out = RawHttpOutcome {
-        ttr,
-        af: if dst.is_ipv4() { 4 } else { 6 },
-        dst_addr: Some(dst.ip()),
-        ..Default::default()
-    };
-    if !allowed(dst.ip()) {
-        out.refused = true;
-        return Ok(out);
+    let submax = addrs.len();
+    let mut connect_ttr = None;
+    let mut outcomes = Vec::new();
+    for (i, &dst) in addrs.iter().enumerate() {
+        let mut out = RawHttpOutcome {
+            ttr,
+            af: if dst.is_ipv4() { 4 } else { 6 },
+            dst_addr: Some(dst.ip()),
+            method: opts.method,
+            subid: i + 1,
+            submax,
+            ..Default::default()
+        };
+        if !allowed(dst.ip()) {
+            out.refused = true;
+            outcomes.push(out);
+            break;
+        }
+        out.connect_ttr = *connect_ttr.get_or_insert_with(|| began.elapsed().as_secs_f64() * 1e3);
+        let connected = attempt(&mut out, dst, url, opts).await;
+        if opts.all || connected || i + 1 == addrs.len() {
+            outcomes.push(out);
+            if !opts.all {
+                break;
+            }
+        }
     }
+    Ok(outcomes)
+}
 
+/// One connect to `dst` and the exchange after it, into `out`: false when
+/// the connect failed or timed out, and the next address may be tried.
+async fn attempt(
+    out: &mut RawHttpOutcome,
+    dst: SocketAddr,
+    url: &HttpUrl,
+    opts: &FetchOptions,
+) -> bool {
+    out.started = mono_secs();
     let start = Instant::now();
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + opts.timeout;
     let connect = async {
         let stream = TcpStream::connect(dst).await?;
         let src = stream.local_addr().ok().map(|a| a.ip());
         let stream = if url.tls {
-            let name = sni.unwrap_or(&url.host);
+            let name = opts.sni.as_deref().unwrap_or(&url.host);
             Conn::Tls(Box::new(tls_connect(name, stream).await?))
         } else {
             Conn::Plain(stream)
@@ -261,51 +394,74 @@ async fn fetch_via(
     };
     let mut stream = match tokio::time::timeout_at(deadline, connect).await {
         Ok(Ok((stream, src))) => {
+            out.ttc = start.elapsed().as_secs_f64() * 1000.0;
             out.src_addr = src;
             stream
         }
         Ok(Err(e)) => {
             out.err = Some(format!("connect: {}", crate::tls::strerror(&e)));
-            return Ok(out);
+            return false;
         }
         Err(_) => {
             out.err = Some("connect: timeout".into());
-            return Ok(out);
+            return false;
         }
     };
 
-    let request = request(url, http10);
+    let head = opts.method == Method::Head;
+    let request = request(url, opts.method, opts.http10);
+    let mut raw = Vec::with_capacity(4096);
+    let reads = &mut out.reads;
     let read = async {
         match &mut stream {
-            Conn::Plain(s) => exchange(s, request.as_bytes()).await,
-            Conn::Tls(s) => exchange(s.as_mut(), request.as_bytes()).await,
+            Conn::Plain(s) => exchange(s, request.as_bytes(), head, start, &mut raw, reads).await,
+            Conn::Tls(s) => {
+                exchange(s.as_mut(), request.as_bytes(), head, start, &mut raw, reads).await
+            }
         }
     };
-    let raw = match tokio::time::timeout_at(deadline, read).await {
-        Ok(Ok(raw)) => raw,
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(Ok(())) => {}
         Ok(Err(e)) => {
             out.err = Some(format!("error reading response: {e}"));
-            return Ok(out);
+            return true;
         }
         Err(_) => {
             out.err = Some("timeout reading status".into());
-            return Ok(out);
+            return true;
         }
-    };
+    }
     out.rt = start.elapsed().as_secs_f64() * 1000.0;
 
-    match parse_response(&raw, store_headers) {
+    match parse_response(&raw, opts.store_headers) {
         Ok(p) => {
             out.res = p.res;
             out.ver = p.ver;
             out.hsize = p.hsize;
-            out.bsize = p.bsize;
+            // a HEAD's answer has no body, whatever its header says
+            // (httpget.c:1505-1514)
+            out.bsize = if head { 0 } else { p.bsize };
             out.header = p.header;
             out.done = true;
         }
         Err(e) => out.err = Some(e),
     }
-    Ok(out)
+    true
+}
+
+/// gettime_mono's whole seconds (libbb/atlas_gettime_mono.c): the
+/// CLOCK_MONOTONIC reading httpget's state->start holds.
+#[cfg(unix)]
+fn mono_secs() -> u64 {
+    crate::traceroute::net::mono().as_secs()
+}
+
+/// gettime_mono's whole seconds where there is no CLOCK_MONOTONIC: the
+/// seconds since the process first asked.
+#[cfg(not(unix))]
+fn mono_secs() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 /// A fetch's connection: TCP, or TLS over it.
@@ -314,14 +470,20 @@ enum Conn {
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
-/// Write the request, then read the response to its end, at most
-/// [`MAX_RESPONSE_BYTES`].
+/// Write the request, then read the response into `buf` to its end, at
+/// most [`MAX_RESPONSE_BYTES`] — a HEAD's to the end of its header, as
+/// httpget reads no body for one (httpget.c:1505-1514). Each read that
+/// brings data is logged in `reads`: the bytes read before it, and ms from
+/// `start`.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &[u8],
-) -> std::io::Result<Vec<u8>> {
+    head: bool,
+    start: Instant,
+    buf: &mut Vec<u8>,
+    reads: &mut Vec<(usize, f64)>,
+) -> std::io::Result<()> {
     stream.write_all(request).await?;
-    let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 8192];
     loop {
         let n = match stream.read(&mut chunk).await {
@@ -335,15 +497,28 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         if n == 0 || buf.len() >= MAX_RESPONSE_BYTES {
             break;
         }
+        reads.push((buf.len(), start.elapsed().as_secs_f64() * 1000.0));
         buf.extend_from_slice(&chunk[..n]);
         // Stop once the body is complete by Content-Length or a chunked
         // terminator, so a server that ignores `Connection: close` does
-        // not make the whole-read timeout discard a complete response.
-        if response_complete(&buf) {
+        // not make the whole-read timeout discard a complete response; a
+        // HEAD's once its header has ended.
+        let ended = if head {
+            header_ended(buf)
+        } else {
+            response_complete(buf)
+        };
+        if ended {
             break;
         }
     }
-    Ok(buf)
+    Ok(())
+}
+
+/// Whether `buf` holds a whole header: the status line and header lines,
+/// then an empty line.
+fn header_ended(buf: &[u8]) -> bool {
+    buf.windows(2).any(|w| w == b"\n\n") || buf.windows(3).any(|w| w == b"\n\r\n")
 }
 
 /// TLS over `stream`, sending `name` as the server name: a host name as
@@ -631,6 +806,24 @@ pub fn quoted(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// What a test fetches with: `af`, `--store-headers`, the timeout and
+    /// `--sni`.
+    fn opts(af: u8, store_headers: usize, timeout: Duration, sni: Option<&str>) -> FetchOptions {
+        FetchOptions {
+            af,
+            store_headers,
+            timeout,
+            sni: sni.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The one outcome of a fetch without --all.
+    fn one(mut outs: Vec<RawHttpOutcome>) -> RawHttpOutcome {
+        assert_eq!(outs.len(), 1, "{outs:?}");
+        outs.remove(0)
+    }
+
     /// ip-echo.ripe.net's answer to reference probe 1000004 (13027, from
     /// RIPE's archive): the header list and sizes it stored.
     const ECHO: &[u8] = b"HTTP/1.0 200 OK\r\nX-Client-IP: 2001:418:1::33\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nServer: BigIP\r\nConnection: close\r\nContent-Length: 14\r\n\r\n2001:418:1::33";
@@ -722,11 +915,122 @@ mod tests {
     fn the_request_is_httpgets() {
         let u = parse_http_url("http://[2001:67c:2e8:16::c100:68d]").unwrap();
         assert_eq!(
-            request(&u, false),
+            request(&u, Method::Get, false),
             "GET / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: \
              close\r\nUser-Agent: httpget for atlas.ripe.net\r\n\r\n"
         );
-        assert!(request(&u, true).starts_with("GET / HTTP/1.0\r\n"));
+        assert!(request(&u, Method::Get, true).starts_with("GET / HTTP/1.0\r\n"));
+        // --head and --post send theirs; a POST says its body's type and
+        // length (writecb, httpget.c:1826-1866)
+        assert_eq!(
+            request(&u, Method::Head, false),
+            "HEAD / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: close\r\nUser-Agent: httpget for atlas.ripe.net\r\n\r\n"
+        );
+        assert_eq!(
+            request(&u, Method::Post, false),
+            "POST / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: close\r\nUser-Agent: httpget for atlas.ripe.net\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert_eq!(Method::from_name("head"), Method::Head);
+        assert_eq!(Method::from_name("POST"), Method::Post);
+        assert_eq!(Method::from_name("GET"), Method::Get);
+    }
+
+    /// A HEAD is read to the end of its answer's header: the body its
+    /// Content-Length announces does not come, and the server need not
+    /// close (httpget.c:1505-1514). The reads are logged from offset 0,
+    /// and the times run connect, first byte, end.
+    #[tokio::test]
+    async fn a_head_is_read_to_the_end_of_its_header() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = server.accept().await.unwrap();
+            let mut req = vec![0u8; 512];
+            let n = s.read(&mut req).await.unwrap();
+            assert!(req[..n].starts_with(b"HEAD /x HTTP/1.1\r\n"));
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(s);
+        });
+        let url = parse_http_url(&format!("http://127.0.0.1:{port}/x")).unwrap();
+        let head = FetchOptions {
+            method: Method::Head,
+            ..opts(4, 0, Duration::from_secs(2), None)
+        };
+        let started = Instant::now();
+        let out = one(fetch_via(None, anywhere, &url, &head).await.unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(out.done && out.err.is_none(), "{out:?}");
+        assert_eq!(
+            (out.method, out.res, out.hsize, out.bsize),
+            (Method::Head, 200, 22, 0)
+        );
+        assert_eq!(out.reads.first().map(|&(o, _)| o), Some(0));
+        assert!(
+            0.0 < out.ttc && out.ttc <= out.ttfb() && out.ttfb() <= out.rt,
+            "{out:?}"
+        );
+    }
+
+    /// The lookup's addresses are tried in turn: a refused connect goes on
+    /// to the next, and the fetch that connected is the one reported
+    /// (tu_restart_connect, tcputil.c:81-147; httpget.c:2055-2066). With
+    /// --all each address is fetched from and reported, with its subid and
+    /// submax, and the first connect's ttr. Starla tried the first address
+    /// alone.
+    #[tokio::test]
+    async fn the_addresses_are_tried_in_turn() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = server.accept().await.unwrap();
+                let mut req = vec![0u8; 512];
+                let _ = s.read(&mut req).await.unwrap();
+                s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            }
+        });
+        // the hosts file's, in its order; nothing listens on [::1]
+        let v6 = IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
+        let v4 = IpAddr::from([127, 0, 0, 1]);
+        let dns = Resolver::new(
+            target::ResolvConf::default(),
+            vec![("two.example".into(), v6), ("two.example".into(), v4)],
+        );
+        let url = parse_http_url(&format!("http://two.example:{port}/")).unwrap();
+        let mut either = opts(0, 0, Duration::from_secs(2), None);
+        let out = one(fetch_via(Some(&dns), anywhere, &url, &either)
+            .await
+            .unwrap());
+        assert!(out.done && out.err.is_none(), "{out:?}");
+        assert_eq!((out.dst_addr, out.subid, out.submax), (Some(v4), 2, 2));
+        assert!(out.ttr.is_some());
+
+        either.all = true;
+        let outs = fetch_via(Some(&dns), anywhere, &url, &either)
+            .await
+            .unwrap();
+        assert_eq!(outs.len(), 2, "{outs:?}");
+        let (failed, fetched) = (&outs[0], &outs[1]);
+        assert_eq!(
+            (failed.dst_addr, failed.subid, failed.submax),
+            (Some(v6), 1, 2)
+        );
+        assert!(
+            failed.err.as_deref().unwrap().starts_with("connect: "),
+            "{failed:?}"
+        );
+        assert!(!failed.done && failed.src_addr.is_none() && failed.reads.is_empty());
+        assert_eq!((fetched.dst_addr, fetched.subid), (Some(v4), 2));
+        assert!(fetched.done && fetched.bsize == 2, "{fetched:?}");
+        assert_eq!(
+            failed.connect_ttr, fetched.connect_ttr,
+            "the first connect's"
+        );
     }
 
     #[test]
@@ -762,18 +1066,14 @@ mod tests {
             (format!("https://lan.example:{port}/"), true),
         ] {
             let url = parse_http_url(&url).unwrap();
-            let out = fetch_via(
+            let out = one(fetch_via(
                 Some(&dns),
                 target::address_allowed,
                 &url,
-                4,
-                false,
-                0,
-                Duration::from_secs(5),
-                None,
+                &opts(4, 0, Duration::from_secs(5), None),
             )
             .await
-            .unwrap();
+            .unwrap());
             assert!(out.refused, "{out:?}");
             assert_eq!(out.dst_addr, Some(IpAddr::from([127, 0, 0, 1])));
             assert_eq!(out.ttr.is_some(), ttr);
@@ -797,18 +1097,14 @@ mod tests {
         });
         let url = parse_http_url(&format!("http://127.0.0.1:{port}/")).unwrap();
         let started = Instant::now();
-        let out = fetch_via(
+        let out = one(fetch_via(
             None,
             anywhere,
             &url,
-            4,
-            false,
-            0,
-            Duration::from_millis(400),
-            None,
+            &opts(4, 0, Duration::from_millis(400), None),
         )
         .await
-        .unwrap();
+        .unwrap());
         let took = started.elapsed();
         assert_eq!(out.err.as_deref(), Some("timeout reading status"));
         assert!(took < Duration::from_millis(700), "{took:?}");
@@ -817,18 +1113,14 @@ mod tests {
         let port = closed.local_addr().unwrap().port();
         drop(closed);
         let url = parse_http_url(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let out = fetch_via(
+        let out = one(fetch_via(
             None,
             anywhere,
             &url,
-            4,
-            false,
-            0,
-            Duration::from_secs(2),
-            None,
+            &opts(4, 0, Duration::from_secs(2), None),
         )
         .await
-        .unwrap();
+        .unwrap());
         assert_eq!(out.err.as_deref(), Some("connect: Connection refused"));
     }
 
@@ -862,18 +1154,14 @@ mod tests {
             s.write_all(reply.as_bytes()).await.unwrap();
         });
         let url = parse_http_url(&format!("http://127.0.0.1:{port}/x")).unwrap();
-        let out = fetch_via(
+        let out = one(fetch_via(
             None,
             anywhere,
             &url,
-            4,
-            false,
-            1024,
-            Duration::from_secs(5),
-            None,
+            &opts(4, 1024, Duration::from_secs(5), None),
         )
         .await
-        .unwrap();
+        .unwrap());
         assert!(out.done && out.err.is_none(), "{out:?}");
         assert_eq!(
             (out.res, out.ver.as_str(), out.bsize, out.af),
@@ -912,18 +1200,14 @@ mod tests {
         .await;
         let fetch = |url: String, dns| async move {
             let url = parse_http_url(&url).unwrap();
-            fetch_via(
+            one(fetch_via(
                 Some(dns),
                 anywhere,
                 &url,
-                4,
-                false,
-                0,
-                Duration::from_secs(5),
-                None,
+                &opts(4, 0, Duration::from_secs(5), None),
             )
             .await
-            .unwrap()
+            .unwrap())
         };
         let out = fetch(format!("http://echo.example:{port}/"), &dns).await;
         assert!(out.done && out.dnserr.is_none(), "{out:?}");
@@ -1081,18 +1365,14 @@ mod tests {
         ] {
             let (port, seen) = tls_server(REPLY).await;
             let url = parse_http_url(&format!("https://secure.example:{port}/x")).unwrap();
-            let out = fetch_via(
+            let out = one(fetch_via(
                 Some(&dns),
                 anywhere,
                 &url,
-                4,
-                false,
-                1024,
-                Duration::from_secs(5),
-                sni,
+                &opts(4, 1024, Duration::from_secs(5), sni),
             )
             .await
-            .unwrap();
+            .unwrap());
             assert!(out.done && out.err.is_none(), "{out:?}");
             assert_eq!((out.res, out.ver.as_str(), out.bsize), (200, "1.1", 9));
             assert_eq!(
@@ -1112,18 +1392,14 @@ mod tests {
 
         // A name evdns does not know: dnserr, as for http://
         let url = parse_http_url("https://nx.example/x").unwrap();
-        let out = fetch_via(
+        let out = one(fetch_via(
             Some(&dns),
             anywhere,
             &url,
-            4,
-            false,
-            0,
-            Duration::from_secs(5),
-            None,
+            &opts(4, 0, Duration::from_secs(5), None),
         )
         .await
-        .unwrap();
+        .unwrap());
         assert_eq!(
             out.dnserr.as_deref(),
             Some("nodename nor servname provided, or not known")
@@ -1144,18 +1420,14 @@ mod tests {
             let _ = s.write_all(b"HTTP/1.0 400 Bad Request\r\n\r\n").await;
         });
         let url = parse_http_url(&format!("https://127.0.0.1:{port}/x")).unwrap();
-        let out = fetch_via(
+        let out = one(fetch_via(
             None,
             anywhere,
             &url,
-            4,
-            false,
-            0,
-            Duration::from_secs(5),
-            None,
+            &opts(4, 0, Duration::from_secs(5), None),
         )
         .await
-        .unwrap();
+        .unwrap());
         let err = out.err.as_deref().unwrap();
         assert!(err.starts_with("connect: "), "{err}");
         assert!(!out.done);
@@ -1175,18 +1447,14 @@ mod tests {
             drop(s);
         });
         let url = parse_http_url(&format!("https://127.0.0.1:{port}/x")).unwrap();
-        let out = fetch_via(
+        let out = one(fetch_via(
             None,
             anywhere,
             &url,
-            4,
-            false,
-            0,
-            Duration::from_millis(300),
-            None,
+            &opts(4, 0, Duration::from_millis(300), None),
         )
         .await
-        .unwrap();
+        .unwrap());
         assert_eq!(out.err.as_deref(), Some("connect: timeout"));
     }
 
@@ -1200,16 +1468,12 @@ mod tests {
             ("http://193.0.6.141", 4),
             ("http://[2001:67c:2e8:16::c100:68d]", 6),
         ] {
-            let out = fetch(
+            let out = one(fetch(
                 &parse_http_url(url).unwrap(),
-                af,
-                false,
-                1024,
-                Duration::from_secs(10),
-                None,
+                &opts(af, 1024, Duration::from_secs(10), None),
             )
             .await
-            .unwrap();
+            .unwrap());
             println!("{url}: {out:?}");
             if out.err.is_some() {
                 continue; // no route in that family from here

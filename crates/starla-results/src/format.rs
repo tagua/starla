@@ -206,6 +206,11 @@ impl AtlasResult {
                 MeasurementData::FullLine(s) => {
                     serde_json::Value::String(format!("__FULLLINE__{}", s))
                 }
+                // A line holds no newline, so the bodies are kept apart by
+                // one, and to_result_line writes a line for each
+                MeasurementData::FullLines(lines) => {
+                    serde_json::Value::String(format!("__FULLLINE__{}", lines.join("\n")))
+                }
             },
         }
     }
@@ -269,8 +274,15 @@ impl AtlasResult {
                 // Traceroute, TLS and NTP write their own envelope with a
                 // placeholder "lts":0; the reference writes get_timesync()
                 // there, which is the lts the result was queued with.
-                let body = body.replacen(LTS_PLACEHOLDER, &format!("\"lts\":{},", self.lts), 1);
-                return format!("RESULT {{ {} }}\n", body);
+                // A body for each line when there are several (evhttpget
+                // --all without --combine), each given the lts.
+                let lts = format!("\"lts\":{},", self.lts);
+                return body
+                    .split('\n')
+                    .map(|body| {
+                        format!("RESULT {{ {} }}\n", body.replacen(LTS_PLACEHOLDER, &lts, 1))
+                    })
+                    .collect();
             }
         }
 
@@ -562,6 +574,25 @@ mod tests {
         assert!(line.contains("\"result\": [ { \"rtt\":10.500000 }, { \"rtt\":11.200000 } ]"));
         // Must NOT re-format through format_result_value
         assert!(!line.contains("\"result\": [ { \"rtt\":10.5 }"));
+    }
+
+    /// evhttpget --all without --combine: a RESULT line for each fetch,
+    /// each with the lts.
+    #[test]
+    fn full_lines_are_a_line_each() {
+        let mut result = make_ping_result();
+        result.data = MeasurementData::FullLines(vec![
+            "\"id\":\"42\", \"lts\":0, \"result\":[ { \"subid\":1 } ]".to_string(),
+            "\"id\":\"42\", \"lts\":0, \"result\":[ { \"subid\":2 } ]".to_string(),
+        ]);
+        let line = AtlasResult::from_measurement(result, None)
+            .with_lts(10)
+            .to_result_line();
+        assert_eq!(
+            line,
+            "RESULT { \"id\":\"42\", \"lts\":10, \"result\":[ { \"subid\":1 } ] }\n\
+             RESULT { \"id\":\"42\", \"lts\":10, \"result\":[ { \"subid\":2 } ] }\n"
+        );
     }
 
     #[test]

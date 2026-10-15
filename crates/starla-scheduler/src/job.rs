@@ -136,6 +136,13 @@ pub struct HttpJobSpec {
     pub sni: Option<String>,
     /// `--timeout N` (ms) as the controller sent it; None keeps the default.
     pub timeout_ms: Option<u32>,
+    /// `--all`, `--combine`
+    pub all: bool,
+    pub combine: bool,
+    /// `--etim` 1, `--eetim` 2
+    pub etim: u8,
+    /// `-b`
+    pub bundle: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +343,10 @@ impl MeasurementJob {
                         store_headers: spec.store_headers as usize,
                         http10: spec.http10,
                         sni: spec.sni.clone(),
+                        all: spec.all,
+                        combine: spec.combine,
+                        etim: spec.etim,
+                        bundle: spec.bundle,
                     },
                     probe_id,
                     msm_id,
@@ -1026,6 +1037,10 @@ mod tests {
                     http10: false,
                     sni: None,
                     timeout_ms: None,
+                    all: false,
+                    combine: false,
+                    etim: 0,
+                    bundle: None,
                 }),
                 MeasurementType::Http,
             ),

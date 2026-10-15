@@ -317,6 +317,18 @@ pub struct HttpSpec {
     /// `--timeout`, ms: httpget's 5000 (CONN_TO) when None
     #[serde(default)]
     pub timeout_ms: Option<u32>,
+    /// `--all`: fetch from each address the name has, each fetch reported
+    #[serde(default)]
+    pub all: bool,
+    /// `--combine`: with `--all`, the fetches in one line
+    #[serde(default)]
+    pub combine: bool,
+    /// `--etim` 1, `--eetim` 2 (which wins), else 0 (httpget.c:782-787)
+    #[serde(default)]
+    pub etim: u8,
+    /// `-b`: the bundle, reported as `"bundle"`
+    #[serde(default)]
+    pub bundle: Option<u64>,
     pub spread: Option<u32>,
     pub schedule: ScheduleSpec,
 }
@@ -932,13 +944,23 @@ fn oneoff_file_check(rest: &str) -> Result<(), &'static str> {
 
 /// rebased_validated_filename(ATLAS_SPOOLDIR, path, "crons")
 /// (libbb/validate_filename.c:3-131): the path rebased onto the spool
-/// directory, or None where the reference answers BAD_PATH. The path is
-/// /home/atlas/crons/… or <spooldir>/crons/… (properties 1 and 2), holds no
-/// "/../" and does not end in "/.." (3 and 4).
+/// directory, or None where the reference answers BAD_PATH.
 fn rebased_crons_path(path: &str) -> Option<String> {
+    rebased_validated_filename(path, "crons")
+}
+
+/// rebased_validated_filename(ATLAS_SPOOLDIR, path, prefix)
+/// (libbb/validate_filename.c:3-131), `prefix` relative: the path rebased
+/// onto the spool directory, or None where the reference refuses it. The
+/// path is /home/atlas/<prefix>/… or <spooldir>/<prefix>/… (properties 1
+/// and 2), holds no "/../" and does not end in "/.." (3 and 4).
+fn rebased_validated_filename(path: &str, prefix: &str) -> Option<String> {
     let under = |base: &str| {
-        path.strip_prefix(base)
-            .filter(|rest| rest.starts_with("/crons/"))
+        path.strip_prefix(base).filter(|rest| {
+            rest.strip_prefix('/')
+                .and_then(|rest| rest.strip_prefix(prefix))
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
     };
     let rebased = if let Some(rest) = under(ATLAS_HOME) {
         format!("{ATLAS_SPOOLDIR}{rest}")
@@ -2053,8 +2075,15 @@ fn parse_evtdig(args: &[String], interval: u64, end_time: i64, spread: u32) -> T
 
 /// Parse evhttpget command arguments
 ///
-/// Usage: evhttpget [-4|-6] [-1] [-A msm_id] [-O output] [--store-headers size]
-/// url
+/// Usage: evhttpget [-4|-6] [-0|-1] [-a] [-c] [-b bundle] [-A msm_id]
+/// [-O output] [--get|--head|--post] [--etim] [--eetim]
+/// [--store-headers size] [--sni name] [--timeout ms] url
+///
+/// httpget_init refuses a line whose `-b` is not digits
+/// (validate_atlas_id) or whose --post-header, --post-file or
+/// --post-footer is not under data/out (rebased_validated_filename;
+/// httpget.c:631-668). Their contents are not read: Starla keeps no
+/// data/out files, and httpget posts nothing for a file it cannot open.
 fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -> TelnetCommand {
     let mut af: u8 = 4;
     let mut msm_id: u64 = 0;
@@ -2064,6 +2093,10 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
     let mut http10 = false;
     let mut sni: Option<String> = None;
     let mut timeout_ms: Option<u32> = None;
+    let mut method = "GET";
+    let (mut all, mut combine) = (false, false);
+    let (mut etim, mut eetim) = (false, false);
+    let mut bundle: Option<u64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -2116,10 +2149,39 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
                     i += 1;
                 }
             }
+            // the last of --get, --head and --post is the method
+            // (httpget.c:514-546)
+            "--get" => method = "GET",
+            "--head" => method = "HEAD",
+            "--post" => method = "POST",
+            "-a" | "--all" => all = true,
+            "-c" | "--combine" => combine = true,
+            "--etim" => etim = true,
+            "--eetim" => eetim = true,
+            "-b" => {
+                if i + 1 < args.len() {
+                    // validate_atlas_id(): digits only
+                    let id = &args[i + 1];
+                    if !id.bytes().all(|b| b.is_ascii_digit()) {
+                        warn!("evhttpget: bad bundle ID {:?}", id);
+                        return TelnetCommand::Unknown(format!("evhttpget {:?}", args));
+                    }
+                    bundle = Some(id.parse().unwrap_or(0));
+                    i += 1;
+                }
+            }
+            "--post-file" | "--post-header" | "--post-footer" => {
+                if i + 1 < args.len() {
+                    if rebased_validated_filename(&args[i + 1], "data/out").is_none() {
+                        warn!("evhttpget: insecure file {:?}", args[i + 1]);
+                        return TelnetCommand::Unknown(format!("evhttpget {:?}", args));
+                    }
+                    i += 1;
+                }
+            }
             // httpget options with a value Starla does not use: their value
             // must not be taken for the URL.
-            "-I" | "-R" | "-W" | "-b" | "--host" | "--post-file" | "--post-header"
-            | "--post-footer" | "--read-limit" | "--store-body" | "--user-agent" => {
+            "-I" | "-R" | "-W" | "--host" | "--read-limit" | "--store-body" | "--user-agent" => {
                 if i + 1 < args.len() {
                     i += 1;
                 }
@@ -2150,7 +2212,7 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
     TelnetCommand::Http(HttpSpec {
         msm_id,
         url,
-        method: "GET".to_string(),
+        method: method.to_string(),
         af,
         headers: vec![],
         body: None,
@@ -2159,6 +2221,10 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
         http10,
         sni,
         timeout_ms,
+        all,
+        combine,
+        etim: if eetim { 2 } else { u8::from(etim) },
+        bundle,
         spread: Some(spread),
         schedule: ScheduleSpec {
             interval,
@@ -2535,6 +2601,10 @@ fn parse_json_command(spec: &serde_json::Value) -> TelnetCommand {
                 .get("timeout")
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok()),
+            all: false,
+            combine: false,
+            etim: 0,
+            bundle: None,
             spread,
             schedule,
         }),
@@ -3729,5 +3799,68 @@ mod tests {
             ),
             TelnetCommand::Unknown(_)
         ));
+    }
+
+    /// --get/--head/--post, --etim/--eetim, -a/--all, -c/--combine and -b
+    /// reach the spec. A -b that is not digits, or a post file not under
+    /// data/out, makes httpget_init refuse the line (httpget.c:631-668).
+    /// Starla ignored them all, and fetched with GET.
+    #[test]
+    fn evhttpget_keeps_method_timing_all_and_bundle() {
+        let http = |opts: &str| {
+            parse_command(&format!(
+                r#"CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget -4 {opts} -A "1001" -O /home/atlas/data/new/7 http://193.0.6.139/"#
+            ))
+        };
+        let spec = |opts: &str| match http(opts) {
+            TelnetCommand::Http(s) => s,
+            other => panic!("{opts}: {other:?}"),
+        };
+
+        let plain = spec("");
+        assert_eq!(
+            (
+                plain.method.as_str(),
+                plain.etim,
+                plain.all,
+                plain.combine,
+                plain.bundle
+            ),
+            ("GET", 0, false, false, None)
+        );
+
+        let s = spec("--head -a -c --etim -b 12");
+        assert_eq!(
+            (s.method.as_str(), s.etim, s.all, s.combine, s.bundle),
+            ("HEAD", 1, true, true, Some(12))
+        );
+        assert_eq!(s.url, "http://193.0.6.139/");
+
+        // the last method named; --eetim over --etim
+        let s = spec("--post --get --eetim --etim --all --combine");
+        assert_eq!(
+            (s.method.as_str(), s.etim, s.all, s.combine),
+            ("GET", 2, true, true)
+        );
+
+        // files under data/out, either home: taken, not the URL
+        let s = spec(
+            "--post --post-header /home/atlas/data/out/h \
+             --post-file /var/spool/ripe-atlas/data/out/f --post-footer /home/atlas/data/out/x/y",
+        );
+        assert_eq!(
+            (s.method.as_str(), s.url.as_str()),
+            ("POST", "http://193.0.6.139/")
+        );
+
+        for bad in [
+            "-b 1x",
+            "--post --post-file /etc/passwd",
+            "--post --post-header /home/atlas/data/new/7",
+            "--post --post-footer /home/atlas/data/out/../../../etc/passwd",
+            "--post --post-file /home/atlas/data/outx/f",
+        ] {
+            assert!(matches!(http(bad), TelnetCommand::Unknown(_)), "{bad}");
+        }
     }
 }

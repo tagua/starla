@@ -127,6 +127,10 @@ pub enum MeasurementData {
     /// }`). Used for measurement types (TLS, NTP) that have non-standard
     /// envelope layouts.
     FullLine(String),
+    /// Several complete RESULT line bodies from one run, each a
+    /// [`MeasurementData::FullLine`]'s: evhttpget's `--all` without
+    /// `--combine`, a line for each address fetched from.
+    FullLines(Vec<String>),
 }
 
 #[cfg(test)]
