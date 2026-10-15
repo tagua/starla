@@ -1405,6 +1405,10 @@ async fn run_commands(
     // controller's next push.
     let mut crontab_lines = std::collections::VecDeque::new();
     let mut crontab: Option<starla_scheduler::Crontab> = None;
+    // perd's crontab's condmv lines, while crons/main is the crontab being
+    // taken: the result handler's, the crontab's whole set at once, as perd
+    // reads its crontab anew.
+    let mut perd_condmvs: Option<Vec<starla_results::CondmvLine>> = None;
     // A crontab's lines are turned into jobs here with no await between
     // them: ~800 lines, on the runtime that also runs the SSH session,
     // telnet and the uploads. It yields every LINES_PER_YIELD lines.
@@ -1419,6 +1423,9 @@ async fn run_commands(
             (cmd, Some(shell))
         } else {
             if let Some(crontab) = crontab.take() {
+                if let Some(lines) = perd_condmvs.take() {
+                    result_handler.set_condmv_lines(lines).await;
+                }
                 let send = scheduler_tx.send(SchedulerCommand::Crontab(crontab));
                 if let Err(e) = send.await {
                     scheduler_send_failed(&scheduler_cancel, e);
@@ -1449,6 +1456,7 @@ async fn run_commands(
                     let shell = line.shell().to_string();
                     (line.command, shell)
                 }));
+                perd_condmvs = (spec.dir == PERD_CRONTAB).then(Vec::new);
                 crontab = Some(starla_scheduler::Crontab {
                     file: spec.dir,
                     lines: Vec::new(),
@@ -1693,19 +1701,7 @@ async fn run_commands(
             }
             TelnetCommand::Httppost(spec) => {
                 // The controller's upload line: its URL, on perd's slots.
-                let line = starla_results::HttppostLine {
-                    schedule: starla_results::PostSchedule {
-                        interval: spec.interval,
-                        start_time: spec.start_time,
-                        end_time: spec.end_time,
-                        spread: spec.spread as u64,
-                    },
-                    url: spec.url,
-                    post_dir: spec.post_dir,
-                    set_time: spec.set_time,
-                    local_time: spec.local_time,
-                };
-                if let Err(e) = result_handler.set_httppost_line(line).await {
+                if let Err(e) = result_handler.set_httppost_line(httppost_line(spec)).await {
                     warn!("Ignoring httppost line: {}", e);
                 }
                 Ok(())
@@ -1727,26 +1723,30 @@ async fn run_commands(
                 scheduler_tx.send(SchedulerCommand::Stop(msm_id)).await
             }
             TelnetCommand::Condmv(spec) => {
-                // A crontab's condmv line keeps its timer, for eperd's
-                // record of it when the time is off; the scheduler
-                // takes it in eperd's crontab, crons/7, only
-                // (MeasurementSpec::Condmv). Outside a crontab, or as a
-                // one-off, it is the uploader's, and nothing here.
-                match (&mut crontab, &shell) {
-                    (Some(crontab), Some(shell)) if spec.schedule.interval > 0 => {
-                        crontab.lines.push(starla_scheduler::CrontabLine {
-                            command: shell.clone(),
-                            job: MeasurementJob {
-                                msm_id: 0,
-                                interval: spec.schedule.interval,
-                                start_time: spec.schedule.start_time,
-                                end_time: spec.schedule.stop_time,
-                                spread: spec.spread.unwrap_or(0) as u64,
-                                spec: MeasurementSpec::Condmv,
-                            },
-                        });
+                // A crontab's condmv line. crons/main's is perd's, which
+                // runs busybox's condmv: the result handler's, on perd's
+                // slots, moving httppost's own lines to data/out with the
+                // 9901 marker. Any other is a timed line of the
+                // scheduler's: in crons/7 eperd's built-in, which writes
+                // eperd's record of it when the time is off and appends
+                // the 9907 marker to the results (MeasurementSpec::Condmv);
+                // crons/2's no daemon reads, and the scheduler leaves it.
+                // Outside a crontab, or as a one-off, nothing runs it.
+                match (&mut crontab, &shell, &mut perd_condmvs) {
+                    (Some(_), Some(_), Some(perd)) => match perd_condmv_line(&spec) {
+                        Some(line) => perd.push(line),
+                        None => debug!("condmv line busybox's condmv refuses: {}", spec.from),
+                    },
+                    (Some(crontab), Some(shell), None) if spec.schedule.interval > 0 => {
+                        match eperd_condmv_job(&spec) {
+                            Some(job) => crontab.lines.push(starla_scheduler::CrontabLine {
+                                command: shell.clone(),
+                                job,
+                            }),
+                            None => debug!("condmv line eperd's condmv refuses: {}", shell),
+                        }
                     }
-                    _ => debug!("condmv line outside a crontab: the uploader's"),
+                    _ => debug!("condmv line outside a crontab: nothing runs it"),
                 }
                 Ok(())
             }
@@ -1772,6 +1772,68 @@ async fn run_commands(
 /// How many of a crontab's lines the command handler turns into jobs
 /// between yields.
 const LINES_PER_YIELD: usize = 64;
+
+/// perd's crontab: `perd -c $CRON_DIR/main` (bin/ripe-atlas.in:126-128),
+/// its directory rebased as telnetd rebases a CRONTAB line's onto the spool
+/// directory.
+const PERD_CRONTAB: &str = "/var/spool/ripe-atlas/crons/main";
+
+/// The controller's httppost line as the result handler runs it: its URL
+/// and options, on perd's slots.
+fn httppost_line(spec: starla_controller::telnet::HttppostSpec) -> starla_results::HttppostLine {
+    starla_results::HttppostLine {
+        schedule: starla_results::PostSchedule {
+            interval: spec.interval,
+            start_time: spec.start_time,
+            end_time: spec.end_time,
+            spread: spec.spread as u64,
+        },
+        url: spec.url,
+        post_dir: spec.post_dir,
+        set_time: spec.set_time,
+        local_time: spec.local_time,
+        max_post_size: spec.max_post_size,
+    }
+}
+
+/// crons/main's condmv line as the result handler runs it: busybox's
+/// condmv, whose marker names `from` as the line gives it
+/// (coreutils/condmv.c:150-154). None where condmv refuses the files
+/// ("insecure from file", :77-104), and its runs move nothing.
+fn perd_condmv_line(spec: &starla_controller::CondmvSpec) -> Option<starla_results::CondmvLine> {
+    let (from_file, to_file) = spec.perd_files()?;
+    Some(starla_results::CondmvLine {
+        schedule: starla_results::PostSchedule {
+            interval: spec.schedule.interval,
+            start_time: spec.schedule.start_time,
+            end_time: spec.schedule.stop_time,
+            spread: spec.spread.unwrap_or(0) as u64,
+        },
+        append: spec.append.clone(),
+        force: spec.force,
+        from: spec.from.clone(),
+        from_file,
+        to_file,
+    })
+}
+
+/// crons/7's condmv line as the scheduler runs it: eperd's built-in, whose
+/// marker names `from` rebased onto the spool directory
+/// (eperd/condmv.c:128-130). None where condmv_init refuses the line
+/// (:66-82), and eperd has no test to run.
+fn eperd_condmv_job(spec: &starla_controller::CondmvSpec) -> Option<MeasurementJob> {
+    Some(MeasurementJob {
+        msm_id: 0,
+        interval: spec.schedule.interval,
+        start_time: spec.schedule.start_time,
+        end_time: spec.schedule.stop_time,
+        spread: spec.spread.unwrap_or(0) as u64,
+        spec: MeasurementSpec::Condmv(starla_scheduler::CondmvJobSpec {
+            append: spec.append.clone(),
+            from: spec.eperd_from()?,
+        }),
+    })
+}
 
 /// How often the background runtime reads resolv.conf and the hosts file
 /// for the measurements' lookups: eperd's CheckUpdates, every 60 s
@@ -2365,5 +2427,139 @@ mod tests {
         waits.new_session();
         assert_eq!(waits.rekeep, REKEEP_FIRST);
         assert_eq!(rekeep_in(waits.after(lost(), quick)), 10);
+    }
+
+    /// A crontab as the controller sends one: its CRONLINEs, each parsed.
+    fn crontab_of(dir: &str, lines: &[&str]) -> TelnetCommand {
+        TelnetCommand::Crontab(starla_controller::CrontabSpec {
+            dir: dir.into(),
+            lines: lines
+                .iter()
+                .map(|line| starla_controller::CrontabLine {
+                    command: starla_controller::telnet::parse_command(&format!("CRONLINE {line}")),
+                    line: line.to_string(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Each crontab's condmv line goes to the daemon that reads it there.
+    /// crons/main's, RIPE's in each push of probe 1018212's 2026-10-14
+    /// journal, is perd's busybox condmv: the result handler's, its files
+    /// as the line names them, not the scheduler's. crons/7's, as
+    /// ctr-dub-sw02 sent it on 2026-10-13, is eperd's built-in: a timed
+    /// line of the scheduler's whose marker names data/new/7 rebased onto
+    /// the spool. A crons/main push without the line ends perd's runs of it.
+    #[tokio::test]
+    async fn each_crontabs_condmv_line_goes_to_its_daemon() {
+        const CONDMV_9901: &str = "60 1 2000000000 UNIFORM 14 condmv -A \"RESULT 9901 ongoing\" \
+                                   /home/atlas/data/new/main /home/atlas/data/out/main";
+        const CONDMV_9907: &str = "60 1 2000000000 UNIFORM 14 condmv -A \"RESULT 9907 ongoing\" \
+                                   /home/atlas/data/new/7 /home/atlas/data/out/7";
+        const EVPING: &str = "240 1 2000000000 UNIFORM 120 evping -4 -c 3 -A \"3000000\" \
+                              -O /home/atlas/data/new/7 192.0.2.1";
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(4);
+        let handler = Arc::new(ResultHandler::new(
+            Box::new(SshUploadTransport {
+                ssh: Arc::new(tokio::sync::Mutex::new(None)),
+            }),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            MetricsRegistry::new().unwrap(),
+        ));
+        let commands = tokio::spawn(run_commands(
+            cmd_rx,
+            scheduler_tx,
+            CancellationToken::new(),
+            handler.host_telemetry(),
+            Arc::clone(&handler),
+            MetricsRegistry::new().unwrap(),
+        ));
+
+        cmd_tx
+            .send(crontab_of(PERD_CRONTAB, &[CONDMV_9901]))
+            .await
+            .unwrap();
+        let Some(SchedulerCommand::Crontab(crons_main)) = scheduler_rx.recv().await else {
+            panic!("no crontab");
+        };
+        assert_eq!(crons_main.file, PERD_CRONTAB);
+        assert!(crons_main.lines.is_empty(), "not the scheduler's");
+        let perds = vec![starla_results::CondmvLine {
+            schedule: starla_results::PostSchedule {
+                interval: 60,
+                start_time: 1,
+                end_time: 2_000_000_000,
+                spread: 14,
+            },
+            append: Some("RESULT 9901 ongoing".into()),
+            force: false,
+            from: "/home/atlas/data/new/main".into(),
+            from_file: "data/new/main".into(),
+            to_file: "data/out/main".into(),
+        }];
+        assert_eq!(handler.condmv_lines().await, perds);
+
+        cmd_tx
+            .send(crontab_of(
+                "/var/spool/ripe-atlas/crons/7",
+                &[CONDMV_9907, EVPING],
+            ))
+            .await
+            .unwrap();
+        let Some(SchedulerCommand::Crontab(crons_7)) = scheduler_rx.recv().await else {
+            panic!("no crontab");
+        };
+        assert_eq!(crons_7.lines.len(), 2);
+        let MeasurementSpec::Condmv(condmv) = &crons_7.lines[0].job.spec else {
+            panic!("{:?}", crons_7.lines[0]);
+        };
+        assert_eq!(
+            *condmv,
+            starla_scheduler::CondmvJobSpec {
+                append: Some("RESULT 9907 ongoing".into()),
+                from: "/var/spool/ripe-atlas/data/new/7".into(),
+            }
+        );
+        assert_eq!(
+            (crons_7.lines[0].job.interval, crons_7.lines[0].job.spread),
+            (60, 14)
+        );
+        assert_eq!(handler.condmv_lines().await, perds, "crons/7 is not perd's");
+
+        cmd_tx.send(crontab_of(PERD_CRONTAB, &[])).await.unwrap();
+        let Some(SchedulerCommand::Crontab(_)) = scheduler_rx.recv().await else {
+            panic!("no crontab");
+        };
+        assert!(handler.condmv_lines().await.is_empty());
+
+        drop(cmd_tx);
+        commands.await.unwrap();
+    }
+
+    /// The main httppost line's --maxpostsize, session 2 of enodia's
+    /// 2026-10-13 journal, reaches the result handler's line; a line
+    /// without one leaves it to httppost's own.
+    #[test]
+    fn an_httppost_lines_maxpostsize_reaches_the_result_handler() {
+        let line = |maxpostsize: &str| {
+            let cmd = starla_controller::telnet::parse_command(&format!(
+                "CRONLINE 60 12 2000000000 UNIFORM 20 httppost -A 9015 --set-time 2 \
+                 --delete-file {maxpostsize} --post-header \
+                 /home/atlas/status/p_to_c_report_header --post-dir /home/atlas/data/out \
+                 --post-footer /home/atlas/status/con_session_id.txt \
+                 http://127.0.0.1:8080/?PROBE_ID=1018212&SESSION_ID=s >> /home/atlas/data/new/main"
+            ));
+            let TelnetCommand::Httppost(spec) = cmd else {
+                panic!("{cmd:?}");
+            };
+            httppost_line(spec)
+        };
+        let main = line("--maxpostsize 9000000");
+        assert_eq!(main.max_post_size, Some(9_000_000));
+        assert!(main.post_dir);
+        assert_eq!(main.schedule.spread, 20);
+        assert_eq!(line("").max_post_size, None);
     }
 }

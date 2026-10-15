@@ -35,9 +35,10 @@ pub enum TelnetCommand {
     /// An httppost CRONLINE: when and where the probe posts its results
     Httppost(HttppostSpec),
     /// A condmv CRONLINE: in crons/7 one of eperd's timed lines (condmv is
-    /// an eperd built-in, eperd.c:932), armed and fired like any other;
-    /// its run, moving data/new/7 to data/out/7 with the 9907 marker, is
-    /// the uploader's
+    /// an eperd built-in, eperd.c:932), armed and fired like any other,
+    /// whose run appends the 9907 marker to the results; in crons/main
+    /// perd's, busybox's condmv, whose run moves httppost's own lines to
+    /// data/out with the 9901 marker
     Condmv(CondmvSpec),
     /// A crontab the controller sent whole: its CRONLINEs, handed on once
     /// a line other than a CRONLINE has ended it
@@ -143,14 +144,65 @@ pub struct HttppostSpec {
     pub set_time: Option<i64>,
     /// `--local-time`: send a `Unix-Date:` header
     pub local_time: bool,
+    /// `--maxpostsize N`: the most a post's body may hold; httppost's
+    /// 1000000 without it (httppost.c:129, 197-205)
+    #[serde(default)]
+    pub max_post_size: Option<u64>,
 }
 
-/// A condmv CRONLINE's timing: all of it a cron daemon uses. Its arguments
-/// are the spool's, which Starla does not keep.
+/// A condmv CRONLINE: its timing, and what its run appends and moves.
+/// Which condmv runs it is the crontab's: perd runs busybox's
+/// (coreutils/condmv.c) for crons/main, eperd its own built-in
+/// (eperd/condmv.c) for crons/7.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CondmvSpec {
     pub spread: Option<u32>,
     pub schedule: ScheduleSpec,
+    /// `-A <string>`: appended to the file, with the time and the file's
+    /// name, before it is moved
+    #[serde(default)]
+    pub append: Option<String>,
+    /// `-f`: move even if the destination exists
+    #[serde(default)]
+    pub force: bool,
+    /// The file to move, as the line names it
+    #[serde(default)]
+    pub from: String,
+    /// Where it goes, as the line names it
+    #[serde(default)]
+    pub to: String,
+}
+
+impl CondmvSpec {
+    /// busybox condmv's files (coreutils/condmv.c:77-104), relative to the
+    /// spool directory (`data/new/main`, `data/out/main`): `from` under
+    /// data/new or data/out, `to` under data/out, data/storage or data/new.
+    /// None where condmv refuses the line ("insecure from file").
+    pub fn perd_files(&self) -> Option<(String, String)> {
+        let from = ["data/new", "data/out"]
+            .iter()
+            .find_map(|prefix| rebased_validated_filename(&self.from, prefix))?;
+        let to = ["data/out", "data/storage", "data/new"]
+            .iter()
+            .find_map(|prefix| rebased_validated_filename(&self.to, prefix))?;
+        Some((spool_relative(&from), spool_relative(&to)))
+    }
+
+    /// The file eperd's built-in condmv appends to and names in its marker:
+    /// `from` rebased onto the spool directory (eperd/condmv.c:66-82,
+    /// 128-130), `/home/atlas/data/new/7` as
+    /// `/var/spool/ripe-atlas/data/new/7`. None where condmv_init refuses
+    /// the line: `from` not under data/new or `to` not under data/out.
+    pub fn eperd_from(&self) -> Option<String> {
+        rebased_validated_filename(&self.to, "data/out")?;
+        rebased_validated_filename(&self.from, "data/new")
+    }
+}
+
+/// A path [`rebased_validated_filename`] gave, relative to the spool
+/// directory.
+fn spool_relative(rebased: &str) -> String {
+    rebased[ATLAS_SPOOLDIR.len() + 1..].to_string()
 }
 
 /// Common scheduling fields for recurring measurements
@@ -1261,18 +1313,16 @@ fn parse_cronline(cmd: &str) -> TelnetCommand {
         }
 
         // condmv: a timed line of the cron daemon that reads its crontab,
-        // whose run moves data/new/ to data/out/ — the uploader's here, as
-        // Starla keeps its results in memory. Its timer is kept all the
-        // same: eperd writes a record of it when the time is off
-        // (eperd.c:1268-1303).
-        "condmv" => TelnetCommand::Condmv(CondmvSpec {
-            spread: Some(spread),
-            schedule: ScheduleSpec {
-                interval,
-                start_time: 0,
-                stop_time: end_time,
-            },
-        }),
+        // whose run appends its marker to a spool file in data/new and
+        // moves the file to data/out, where httppost posts it from. Its
+        // timer is eperd's in crons/7, which writes a record of it when the
+        // time is off (eperd.c:1268-1303), and perd's in crons/main.
+        "condmv" => {
+            parse_condmv(measurement_args, interval, end_time, spread).unwrap_or_else(|why| {
+                warn!("Ignoring condmv CRONLINE ({}): {}", why, cmd);
+                TelnetCommand::Ignored(cmd.to_string())
+            })
+        }
 
         // Hardware-probe spool plumbing: dfrm clears stale spool, which
         // starla, queueing results in memory, does not have.
@@ -1323,6 +1373,7 @@ fn parse_httppost(
     let mut post_dir = false;
     let mut set_time = None;
     let mut local_time = false;
+    let mut max_post_size = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if let Some(file) = arg.strip_prefix(">>").or_else(|| arg.strip_prefix('>')) {
@@ -1339,8 +1390,14 @@ fn parse_httppost(
         match name {
             "--delete-file" => {}
             "--local-time" => local_time = true,
-            "-A" | "-O" | "--maxpostsize" | "--post-header" | "--post-footer" | "--timeout" => {
+            "-A" | "-O" | "--post-header" | "--post-footer" | "--timeout" => {
                 value().ok_or("option without its value")?;
+            }
+            "--maxpostsize" => {
+                // strtoul(…, &check, 0) with nothing left over, or httppost
+                // gives up at once (httppost.c:197-205)
+                let size = value().ok_or("option without its value")?;
+                max_post_size = Some(strtoul_whole(&size).ok_or("bad --maxpostsize")?);
             }
             "--post-dir" => {
                 value().ok_or("option without its value")?;
@@ -1365,6 +1422,66 @@ fn parse_httppost(
         post_dir,
         set_time,
         local_time,
+        max_post_size,
+    }))
+}
+
+/// Parse a condmv CRONLINE's arguments as getopt32 takes them: busybox's
+/// condmv's options (`A:a:Dftx`, coreutils/condmv.c:59) and eperd's
+/// (`A:fi:`, eperd/condmv.c:40) anywhere, then exactly two files. `-A` and
+/// `-f` are what Starla's run of the line does anything with; the others
+/// change what busybox's would move where, and RIPE sends none of them.
+fn parse_condmv(
+    args: &[String],
+    interval: u64,
+    end_time: i64,
+    spread: u32,
+) -> Result<TelnetCommand, &'static str> {
+    let mut append = None;
+    let mut force = false;
+    let mut files = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            files.extend(it.by_ref().cloned());
+            break;
+        }
+        let Some(opts) = arg.strip_prefix('-').filter(|o| !o.is_empty()) else {
+            files.push(arg.clone());
+            continue;
+        };
+        for (i, c) in opts.char_indices() {
+            match c {
+                'A' | 'a' | 'i' => {
+                    let rest = &opts[i + 1..];
+                    let value = if rest.is_empty() {
+                        it.next().cloned().ok_or("option without its value")?
+                    } else {
+                        rest.to_string()
+                    };
+                    if c == 'A' {
+                        append = Some(value);
+                    }
+                    break;
+                }
+                'f' => force = true,
+                'D' | 't' | 'x' => {}
+                _ => return Err("bad options"),
+            }
+        }
+    }
+    let [from, to] = <[String; 2]>::try_from(files).map_err(|_| "two arguments expected")?;
+    Ok(TelnetCommand::Condmv(CondmvSpec {
+        spread: Some(spread),
+        schedule: ScheduleSpec {
+            interval,
+            start_time: 0,
+            stop_time: end_time,
+        },
+        append,
+        force,
+        from,
+        to,
     }))
 }
 
@@ -1951,6 +2068,45 @@ fn strtoul(s: &str, base: u32) -> u64 {
     };
     let end = s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
     u64::from_str_radix(&s[..end], radix).unwrap_or(0)
+}
+
+/// strtoul(s, &check, 0) where the caller wants `check[0] == '\0'`: the
+/// value if it read the whole string, as C reads it — blanks and a sign
+/// first, `-n` wrapping, a value too big saturating — or None. An empty
+/// string is 0, as strtoul leaves `check` at its end.
+fn strtoul_whole(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return Some(0);
+    }
+    let digits = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, digits) = match digits.as_bytes().first() {
+        Some(b'-') => (true, &digits[1..]),
+        Some(b'+') => (false, &digits[1..]),
+        _ => (false, digits),
+    };
+    let (digits, radix) = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+        .filter(|h| h.starts_with(|c: char| c.is_ascii_hexdigit()))
+    {
+        (hex, 16)
+    } else if digits.starts_with('0') {
+        (digits, 8)
+    } else {
+        (digits, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let value = digits.chars().fold(0u64, |n, c| {
+        n.saturating_mul(radix as u64)
+            .saturating_add(c.to_digit(radix).unwrap_or(0) as u64)
+    });
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
 }
 
 /// Parse an evtdig CRONLINE as tdig_init() and argProcess() do
@@ -3620,6 +3776,7 @@ mod tests {
                 post_dir: true,
                 set_time: Some(2),
                 local_time: false,
+                max_post_size: Some(9_000_000),
             }
         );
 
@@ -3655,6 +3812,39 @@ mod tests {
         assert_eq!(spec.set_time, Some(3));
         assert!(spec.local_time && spec.post_dir);
         assert_eq!(spec.url, "http://127.0.0.1:8080/?PROBE_ID=1");
+        assert_eq!(spec.max_post_size, None, "httppost's own 1000000");
+    }
+
+    /// --maxpostsize as httppost reads it: strtoul(…, &check, 0) with
+    /// nothing left over (httppost.c:197-205), or the line never posts.
+    #[test]
+    fn maxpostsize_is_read_as_httppost_reads_it() {
+        let size = |value: &str| match parse_command(&format!(
+            "CRONLINE 60 12 2000000000 UNIFORM 20 httppost --maxpostsize {value} \
+                 --post-dir /home/atlas/data/out http://127.0.0.1:8080/?PROBE_ID=1"
+        )) {
+            TelnetCommand::Httppost(spec) => spec.max_post_size,
+            _ => None,
+        };
+        assert_eq!(size("9000000"), Some(9_000_000));
+        assert_eq!(size("0x1000"), Some(4096));
+        assert_eq!(size("010"), Some(8));
+        assert_eq!(size("0"), Some(0));
+        assert_eq!(size("+5"), Some(5));
+        for bad in ["9e6", "9000000k", "0x", "08", "-"] {
+            assert_eq!(size(bad), None, "{bad}");
+            assert!(matches!(
+                parse_command(&format!(
+                    "CRONLINE 60 12 2000000000 UNIFORM 20 httppost --maxpostsize {bad} \
+                     http://127.0.0.1:8080/"
+                )),
+                TelnetCommand::Ignored(_)
+            ));
+        }
+        assert_eq!(strtoul_whole(""), Some(0));
+        assert_eq!(strtoul_whole(" 7"), Some(7));
+        assert_eq!(strtoul_whole("-1"), Some(u64::MAX));
+        assert_eq!(strtoul_whole("99999999999999999999999"), Some(u64::MAX));
     }
 
     /// The twin's ONEOFFs: marked, the measurement inside parsed as before.
@@ -3712,8 +3902,76 @@ mod tests {
             ),
             (60, 1, 2_000_000_000)
         );
+        assert_eq!(spec.append.as_deref(), Some("RESULT 9907 ongoing"));
+        assert!(!spec.force);
+        assert_eq!(
+            (spec.from.as_str(), spec.to.as_str()),
+            ("/home/atlas/data/new/7", "/home/atlas/data/out/7")
+        );
+        // eperd's built-in names the file rebased (eperd/condmv.c:128-130)
+        assert_eq!(
+            spec.eperd_from().as_deref(),
+            Some("/var/spool/ripe-atlas/data/new/7")
+        );
         let cmd = parse_command("CRONLINE 60 0 0 UNIFORM 5 dfrm /home/atlas/data/new/foo");
         assert!(matches!(cmd, TelnetCommand::Ignored(_)));
+    }
+
+    /// crons/main's condmv line, as RIPE sent it in each of the 29 pushes
+    /// of probe 1018212's 2026-10-14 journal: busybox's condmv, whose files
+    /// are the spool's.
+    #[test]
+    fn crons_mains_condmv_line_keeps_its_files() {
+        let line = r#"CRONLINE 60 1 2000000000 UNIFORM 14 condmv -A "RESULT 9901 ongoing" /home/atlas/data/new/main /home/atlas/data/out/main"#;
+        let TelnetCommand::Condmv(spec) = parse_command(line) else {
+            panic!("{:?}", parse_command(line));
+        };
+        assert_eq!(spec.append.as_deref(), Some("RESULT 9901 ongoing"));
+        assert_eq!(spec.from, "/home/atlas/data/new/main");
+        assert_eq!(
+            spec.perd_files(),
+            Some(("data/new/main".into(), "data/out/main".into()))
+        );
+
+        // Options anywhere, joined or not, as getopt32 takes them
+        let TelnetCommand::Condmv(spec) = parse_command(
+            "CRONLINE 60 1 0 NONE 0 condmv /var/spool/ripe-atlas/data/new/x -fA x \
+             /home/atlas/data/storage/x",
+        ) else {
+            panic!("not a condmv line");
+        };
+        assert!(spec.force);
+        assert_eq!(spec.append.as_deref(), Some("x"));
+        assert_eq!(
+            spec.perd_files(),
+            Some(("data/new/x".into(), "data/storage/x".into()))
+        );
+        assert_eq!(spec.eperd_from(), None, "eperd's moves to data/out only");
+
+        // condmv refuses these: insecure files, and they move nothing
+        for (from, to) in [
+            ("/home/atlas/crons/main", "/home/atlas/data/out/main"),
+            ("/home/atlas/data/new/main", "/tmp/main"),
+            ("/home/atlas/data/new/../x", "/home/atlas/data/out/x"),
+        ] {
+            let line = format!("CRONLINE 60 1 0 NONE 0 condmv {from} {to}");
+            let TelnetCommand::Condmv(spec) = parse_command(&line) else {
+                panic!("{line}");
+            };
+            assert_eq!(spec.perd_files(), None, "{line}");
+        }
+        // and these it refuses to run at all
+        for line in [
+            "CRONLINE 60 1 0 NONE 0 condmv /home/atlas/data/new/main",
+            "CRONLINE 60 1 0 NONE 0 condmv -A",
+            "CRONLINE 60 1 0 NONE 0 condmv -q /home/atlas/data/new/a /home/atlas/data/out/a",
+            "CRONLINE 60 1 0 NONE 0 condmv a b c",
+        ] {
+            assert!(
+                matches!(parse_command(line), TelnetCommand::Ignored(_)),
+                "{line}"
+            );
+        }
     }
 
     #[test]

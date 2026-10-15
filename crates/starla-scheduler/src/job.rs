@@ -63,11 +63,30 @@ pub enum MeasurementSpec {
     /// /home/atlas/data/new/7 /home/atlas/data/out/7`): a timed line like
     /// any other — condmv is one of eperd's built-ins (eperd.c:932), so
     /// Start arms it and RunJob fires it, and writes its 9807 record when
-    /// the time is off (eperd.c:838-848, 1268-1303) — whose run is the
-    /// uploader's to do: Starla has no data/new/7 to move, and writes the
-    /// 9907 marker itself (starla_results::system_status). A run of it
-    /// starts nothing.
-    Condmv,
+    /// the time is off (eperd.c:838-848, 1268-1303). Its run measures
+    /// nothing: it appends its marker to data/new/7, which in Starla is the
+    /// results queue, after the results taken before it.
+    Condmv(CondmvJobSpec),
+}
+
+/// What a run of eperd's condmv line writes (condmv_start,
+/// eperd/condmv.c:115-136): `<-A> <time> <from>`, `from` the file as
+/// condmv_init rebased it onto the spool directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondmvJobSpec {
+    /// `-A`: without it the run appends nothing
+    pub append: Option<String>,
+    /// The file the marker names: `/var/spool/ripe-atlas/data/new/7`
+    pub from: String,
+}
+
+impl CondmvJobSpec {
+    /// The run's marker at unix time `now`, without its newline; None
+    /// without `-A`.
+    pub fn marker(&self, now: i64) -> Option<String> {
+        let append = self.append.as_ref()?;
+        Some(format!("{append} {now} {}", self.from))
+    }
 }
 
 impl MeasurementSpec {
@@ -79,13 +98,13 @@ impl MeasurementSpec {
             MeasurementSpec::Http(_) => "http",
             MeasurementSpec::Tls(_) => "tls",
             MeasurementSpec::Ntp(_) => "ntp",
-            MeasurementSpec::Condmv => "condmv",
+            MeasurementSpec::Condmv(_) => "condmv",
         }
     }
 
     /// Whether a run of the line measures anything: condmv's does not.
     pub(crate) fn measures(&self) -> bool {
-        !matches!(self, MeasurementSpec::Condmv)
+        !matches!(self, MeasurementSpec::Condmv(_))
     }
 }
 
@@ -253,7 +272,7 @@ impl MeasurementSpec {
             MeasurementSpec::Http(_) => MeasurementType::Http,
             MeasurementSpec::Tls(_) => MeasurementType::Tls,
             MeasurementSpec::Ntp(_) => MeasurementType::Ntp,
-            MeasurementSpec::Condmv => return None,
+            MeasurementSpec::Condmv(_) => return None,
         })
     }
 }
@@ -386,7 +405,7 @@ impl MeasurementJob {
                     dst_name,
                 }))
             }
-            MeasurementSpec::Condmv => anyhow::bail!("condmv: a line that measures nothing"),
+            MeasurementSpec::Condmv(_) => anyhow::bail!("condmv: a line that measures nothing"),
         }
     }
 

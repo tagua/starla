@@ -11,8 +11,8 @@ mod lines;
 pub mod task;
 
 pub use job::{
-    DnsJobSpec, HttpJobSpec, MeasurementJob, MeasurementSpec, NtpJobSpec, PingJobSpec, TlsJobSpec,
-    TracerouteJobSpec,
+    CondmvJobSpec, DnsJobSpec, HttpJobSpec, MeasurementJob, MeasurementSpec, NtpJobSpec,
+    PingJobSpec, TlsJobSpec, TracerouteJobSpec,
 };
 pub use lines::{Crontab, CrontabLine};
 
@@ -487,7 +487,8 @@ impl Scheduler {
     /// and queue the records of the lines found more than 10 s off their
     /// time. RunJob appends those to eperd's out file, data/new/7
     /// (eperd.c:1270-1303), the spool of the lines' own results, so they go
-    /// with the next main upload, before its 9907 marker.
+    /// with the next main upload; a condmv line's run queues its 9907
+    /// marker after them.
     ///
     /// While the tray pauses the probe, nothing runs and nothing is
     /// recorded, whatever comes due: a tick, a crontab's push, a job of
@@ -509,6 +510,7 @@ impl Scheduler {
             starts,
             gone,
             inconsistent,
+            condmvs,
         } = lines.take_due(now);
         self.publish_counts(&mut lines);
         drop(lines);
@@ -523,6 +525,16 @@ impl Scheduler {
                 }
             }
         }
+        // eperd's condmv: its marker goes to data/new/7 after the results
+        // taken before it, at time(NULL) of its run (condmv_start,
+        // eperd/condmv.c:115-136). The reference then moves the file to
+        // data/out/7.<minute>, for the next post; Starla keeps its results
+        // in one queue, and the next post takes them all.
+        if let Some(results) = &self.results {
+            for marker in condmvs.iter().filter_map(|c| c.marker(now.wall)) {
+                results.submit(self.spool_line(now.wall, marker));
+            }
+        }
         jobs.into_iter()
             .zip(starts.into_iter().zip(gone))
             .map(|(job, start)| {
@@ -530,6 +542,20 @@ impl Scheduler {
                 self.spawn_run(job, Some(start))
             })
             .collect()
+    }
+
+    /// A spool line of eperd's own (condmv's marker) as the results queue
+    /// takes a result: written as it is, under eperd's id.
+    fn spool_line(&self, now: i64, line: String) -> MeasurementResult {
+        MeasurementResult {
+            data: MeasurementData::Line(line),
+            ..self.inconsistent_result(
+                now,
+                InconsistentRecord {
+                    body: String::new(),
+                },
+            )
+        }
     }
 
     /// A line's "inconsistent time" record as the results queue takes a
@@ -1154,7 +1180,8 @@ mod tests {
 
     /// A line found more than 10 s late runs nothing, and its record is
     /// queued as eperd appends it to data/new/7: it goes with the next main
-    /// upload, among the lines' results, before condmv's 9907 marker.
+    /// upload, among the lines' results. With no condmv line in crons/7, as
+    /// here, nothing writes a 9907 marker: only that line's runs do.
     #[tokio::test]
     async fn a_late_lines_record_goes_with_the_next_upload() {
         let (bodies, mut posted) = tokio::sync::mpsc::unbounded_channel();
@@ -1200,11 +1227,85 @@ mod tests {
              cycle 29863940; generated 1791836377\", \"cmd\": \"evtdig -4 --timeout 3000 -A \
              \\\"5009\\\" 127.0.0.1\" }"
         );
-        assert!(rest.starts_with("RESULT 9907 ongoing "), "{rest}");
+        assert_eq!(rest, "\nSESSION_ID s\n", "no marker without a condmv line");
         assert_eq!(handler.queue_stats().await.count, 0);
 
         // and the line runs at its next slot
         assert!(scheduler.run_due(at(slot + 59)).await.is_empty());
         assert_eq!(scheduler.run_due(at(slot + 60)).await.len(), 1);
+    }
+
+    /// crons/7's condmv line, as ctr-dub-sw02 sent it on 2026-10-13 (spread
+    /// 0 here, for its time): each run appends eperd's marker to data/new/7
+    /// — time(NULL) of the run and the file rebased, as condmv_start writes
+    /// them (eperd/condmv.c:128-130) — after the results taken before it,
+    /// and the next main upload takes it with them. Nothing measures.
+    #[tokio::test]
+    async fn crons_7s_condmv_run_appends_eperds_marker() {
+        let (bodies, mut posted) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = starla_metrics::MetricsRegistry::new().unwrap();
+        let handler = Arc::new(ResultHandler::new(
+            Box::new(Controller(bodies)),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            metrics.clone(),
+        ));
+        handler
+            .set_endpoint_path("/?PROBE_ID=1018212&SESSION_ID=s".into())
+            .await
+            .unwrap();
+        handler.set_session_id("s".into()).await;
+        let (scheduler, _) = scheduler_for(&handler, metrics);
+
+        let condmv = |append: Option<&str>| CrontabLine {
+            command: format!(
+                "condmv {}/home/atlas/data/new/7 /home/atlas/data/out/7",
+                append.map_or(String::new(), |a| format!("-A \"{a}\" "))
+            ),
+            job: MeasurementJob {
+                msm_id: 0,
+                interval: 60,
+                start_time: 1,
+                end_time: 2_000_000_000,
+                spread: 0,
+                spec: MeasurementSpec::Condmv(CondmvJobSpec {
+                    append: append.map(str::to_string),
+                    from: "/var/spool/ripe-atlas/data/new/7".into(),
+                }),
+            },
+        };
+        let crons_7 = |lines| Crontab {
+            file: "/var/spool/ripe-atlas/crons/7".into(),
+            lines,
+        };
+        let slot = 1_791_836_401; // 1 + 29863940 * 60
+        scheduler
+            .synchronize_at(
+                crons_7(vec![condmv(Some("RESULT 9907 ongoing"))]),
+                at(slot - 30),
+            )
+            .await;
+        assert!(
+            scheduler.run_due(at(slot)).await.is_empty(),
+            "starts nothing"
+        );
+        assert!(scheduler.run_due(at(slot + 60)).await.is_empty());
+        assert_eq!(handler.queue_stats().await.count, 2);
+
+        handler.upload_pending().await.unwrap();
+        assert_eq!(
+            posted.recv().await.unwrap(),
+            "P_TO_C_REPORT\n\
+             RESULT 9907 ongoing 1791836401 /var/spool/ripe-atlas/data/new/7\n\
+             RESULT 9907 ongoing 1791836461 /var/spool/ripe-atlas/data/new/7\n\
+             \nSESSION_ID s\n"
+        );
+
+        // Without -A, condmv moves the file and appends nothing
+        scheduler
+            .synchronize_at(crons_7(vec![condmv(None)]), at(slot + 90))
+            .await;
+        assert!(scheduler.run_due(at(slot + 120)).await.is_empty());
+        assert_eq!(handler.queue_stats().await.count, 0);
     }
 }

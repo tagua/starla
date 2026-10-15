@@ -131,6 +131,10 @@ pub enum MeasurementData {
     /// [`MeasurementData::FullLine`]'s: evhttpget's `--all` without
     /// `--combine`, a line for each address fetched from.
     FullLines(Vec<String>),
+    /// A line as written to the spool, without the `RESULT { … }` envelope
+    /// and without its newline: eperd's condmv marker, `RESULT 9907 ongoing
+    /// <time> <file>`.
+    Line(String),
 }
 
 #[cfg(test)]

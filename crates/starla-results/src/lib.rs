@@ -10,6 +10,7 @@ pub mod format;
 pub mod host_telemetry;
 mod post_schedule;
 mod queue;
+mod spool;
 mod system_status;
 mod time_sync;
 mod uploader;
@@ -21,10 +22,11 @@ pub use queue::{QueueStats, QueuedResult, ResultQueue};
 pub use time_sync::TimeSyncTracker;
 pub use uploader::{
     PostTarget, RateLimited, ResultUploader, UploadStream, UploadTransport, UploaderConfig,
-    UPLOAD_BODY_TARGET,
+    DEFAULT_MAX_POST_SIZE, UPLOAD_BODY_TARGET,
 };
 
 use post_schedule::Slots;
+use spool::Spool;
 use starla_common::MeasurementResult;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -33,6 +35,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use uploader::MainPost;
 
 /// Configuration for the result handler
 #[derive(Debug, Clone)]
@@ -88,6 +91,36 @@ pub struct HttppostLine {
     pub set_time: Option<i64>,
     /// `--local-time`
     pub local_time: bool,
+    /// `--maxpostsize N`; None is httppost's [`DEFAULT_MAX_POST_SIZE`]
+    pub max_post_size: Option<u64>,
+}
+
+/// A condmv CRONLINE of perd's crontab, crons/main, which perd runs as
+/// busybox's condmv (coreutils/condmv.c). RIPE's, in each of the 29 pushes
+/// of probe 1018212's 2026-10-14 journal: `CRONLINE 60 1 2000000000 UNIFORM
+/// 14 condmv -A "RESULT 9901 ongoing" /home/atlas/data/new/main
+/// /home/atlas/data/out/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondmvLine {
+    /// The CRONLINE's timing fields
+    pub schedule: PostSchedule,
+    /// `-A`: appended, with the time and `from`, before the move
+    pub append: Option<String>,
+    /// `-f`: move even onto a file not yet posted
+    pub force: bool,
+    /// The file to move as the line names it, which the marker names:
+    /// `/home/atlas/data/new/main`, wherever the spool is
+    pub from: String,
+    /// The files moved, under the spool directory: `data/new/main`,
+    /// `data/out/main`
+    pub from_file: String,
+    pub to_file: String,
+}
+
+/// One condmv line as Starla runs it: what it moves, and perd's slot state.
+struct CondmvRun {
+    condmv: spool::Condmv,
+    slots: Slots,
 }
 
 /// One httppost line as Starla runs it: where, and perd's slot state.
@@ -214,7 +247,15 @@ pub struct ResultHandler {
     session_id: Arc<Mutex<Option<String>>>,
     host_telemetry: Arc<HostTelemetry>,
     lines: Mutex<PostLines>,
-    /// An httppost line was set, or the session's lines were dropped
+    /// crons/main's condmv lines, as the controller last sent the crontab.
+    /// Unlike the httppost lines they name no session, and a new session
+    /// keeps them, as perd keeps its crontab until a new one comes.
+    condmv_lines: Mutex<Vec<CondmvRun>>,
+    /// perd's spool files, shared with the uploader: httppost's lines go
+    /// to data/new/main, condmv moves it to data/out, the main post takes it
+    spool: Arc<Spool>,
+    /// An httppost or condmv line was set, or the session's lines were
+    /// dropped
     lines_changed: Notify,
     wall_clock: WallClock,
     metrics: starla_metrics::MetricsRegistry,
@@ -250,6 +291,7 @@ impl ResultHandler {
             Arc::clone(&host_telemetry),
             Arc::clone(&time_sync),
         );
+        let spool = uploader.spool();
 
         Self {
             inbox: std::sync::Mutex::new(inbox),
@@ -264,6 +306,8 @@ impl ResultHandler {
             session_id: Arc::new(Mutex::new(None)),
             host_telemetry,
             lines: Mutex::new(PostLines::default()),
+            condmv_lines: Mutex::new(Vec::new()),
+            spool,
             lines_changed: Notify::new(),
             wall_clock: Arc::new(system_wall_clock),
             metrics,
@@ -320,7 +364,10 @@ impl ResultHandler {
                 s.start_time
             );
         }
-        let target = PostTarget::from_url(&line.url, line.set_time, line.local_time)?;
+        let target = PostTarget {
+            max_post_size: line.max_post_size.unwrap_or(DEFAULT_MAX_POST_SIZE),
+            ..PostTarget::from_url(&line.url, line.set_time, line.local_time)?
+        };
         let now = self.wall_now() as i64;
         let mut lines = self.lines.lock().await;
         let slot = lines.line(line.post_dir);
@@ -340,6 +387,64 @@ impl ResultHandler {
         drop(lines);
         self.lines_changed.notify_one();
         Ok(())
+    }
+
+    /// crons/main's condmv lines, as the crontab the controller just ended
+    /// has them: they replace the ones it had, and run on perd's slots, as
+    /// the httppost lines do. A line the crontab repeats keeps its slot
+    /// (perd's CopyFromOld); a line perd would refuse (an interval outside
+    /// 1..=2 years, a negative start time) is left out.
+    pub async fn set_condmv_lines(&self, lines: Vec<CondmvLine>) {
+        let now = self.wall_now() as i64;
+        let mut runs = self.condmv_lines.lock().await;
+        let mut old = std::mem::take(&mut *runs);
+        for line in lines {
+            let s = &line.schedule;
+            if !(1..=post_schedule::MAX_INTERVAL).contains(&s.interval) || s.start_time < 0 {
+                warn!(
+                    "Ignoring condmv line with interval {} and start time {}",
+                    s.interval, s.start_time
+                );
+                continue;
+            }
+            let condmv = spool::Condmv {
+                append: line.append,
+                from: line.from,
+                from_file: line.from_file,
+                to_file: line.to_file,
+                force: line.force,
+            };
+            let kept = old
+                .iter()
+                .position(|o| o.condmv == condmv && o.slots.same_cycles(&line.schedule))
+                .map(|i| old.remove(i));
+            let slots = match kept {
+                Some(o) => Slots::carried_over(&o.slots, line.schedule),
+                None => Slots::new(line.schedule, now),
+            };
+            debug!(next = ?slots.next_run(now), "condmv line: {}", condmv.from);
+            runs.push(CondmvRun { condmv, slots });
+        }
+        drop(runs);
+        self.lines_changed.notify_one();
+    }
+
+    /// crons/main's condmv lines as the handler runs them, in the
+    /// crontab's order.
+    pub async fn condmv_lines(&self) -> Vec<CondmvLine> {
+        self.condmv_lines
+            .lock()
+            .await
+            .iter()
+            .map(|run| CondmvLine {
+                schedule: run.slots.schedule,
+                append: run.condmv.append.clone(),
+                force: run.condmv.force,
+                from: run.condmv.from.clone(),
+                from_file: run.condmv.from_file.clone(),
+                to_file: run.condmv.to_file.clone(),
+            })
+            .collect()
     }
 
     /// Set the session ID (for upload body footer)
@@ -532,18 +637,32 @@ impl ResultHandler {
             debug!("Uploading no results (status and clock check)");
         }
 
-        let session_id = self.session_id.lock().await;
-        let session_id_ref = session_id.as_deref();
-
-        let uploader = self.uploader.lock().await;
-        match uploader
-            .upload_batch_to(target, &uploadable, session_id_ref)
+        let session_id = self.session_id.lock().await.clone();
+        let MainPost {
+            sent,
+            deferred,
+            dropped,
+            outcome,
+        } = self
+            .uploader
+            .lock()
             .await
-        {
+            .upload_batch_to(target, uploadable, session_id.as_deref())
+            .await;
+
+        for _ in 0..dropped {
+            self.metrics.record_queue_drop();
+        }
+        let mut queue = self.queue.lock().await;
+        // What --maxpostsize left out waits for the next post, as do_dir
+        // leaves a file that does not fit: it was not posted, so no attempt
+        // is counted.
+        queue.put_back(deferred);
+        let result = match outcome {
             Ok(()) => {
-                info!("Successfully uploaded {} results", count);
+                info!("Successfully uploaded {} results", sent.len());
                 self.metrics.record_upload_success();
-                Ok(count)
+                Ok(sent.len())
             }
             Err(e) => {
                 warn!("Upload failed: {}", e);
@@ -554,12 +673,12 @@ impl ResultHandler {
                 // 429s in ~5 min dropped every result probe 1018212 measured
                 // while RIPE refused it, and on 2026-10-14 its KEEP
                 // disconnects dropped more.
-                let mut queue = self.queue.lock().await;
-                queue.requeue(uploadable);
-                self.metrics.update_queue_depth(queue.stats().count as i64);
+                queue.requeue(sent);
                 Err(e)
             }
-        }
+        };
+        self.metrics.update_queue_depth(queue.stats().count as i64);
+        result
     }
 
     /// Post the queued one-off results, as eooqd does once a one-off is
@@ -677,6 +796,45 @@ impl ResultHandler {
         Some(line.target.clone())
     }
 
+    /// When crons/main's next condmv line is due, as a tokio deadline: None
+    /// without one that will run again.
+    async fn condmv_deadline(&self, now: Instant) -> Option<Instant> {
+        let wall = self.wall_now();
+        let mut runs = self.condmv_lines.lock().await;
+        runs.iter_mut()
+            .filter_map(|run| {
+                run.slots.check_clock(wall as i64);
+                run.slots.next_run(wall as i64)
+            })
+            .min()
+            .map(|at| now + Duration::from_secs_f64((at as f64 - wall).max(0.0)))
+    }
+
+    /// Run the condmv lines that are due, in the crontab's order, each
+    /// moved on to its next cycle (perd's TestJobs), at time(NULL) of the
+    /// run.
+    async fn run_due_condmvs(&self) {
+        let now = self.wall_now() as i64;
+        let due: Vec<spool::Condmv> = {
+            let mut runs = self.condmv_lines.lock().await;
+            runs.iter_mut()
+                .filter(|run| run.slots.is_due(now))
+                .map(|run| {
+                    run.slots.advance(now);
+                    run.condmv.clone()
+                })
+                .collect()
+        };
+        for condmv in due {
+            if !self.spool.condmv(&condmv, now).await {
+                debug!(
+                    "condmv: not moving {} to {}",
+                    condmv.from_file, condmv.to_file
+                );
+            }
+        }
+    }
+
     /// Run the upload loop
     pub async fn run(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         info!("Result handler starting");
@@ -719,6 +877,9 @@ impl ResultHandler {
             had_lines = (main_line.is_some(), timesync_line.is_some());
             let main_at = main_line.unwrap_or(Some(own_main_at));
             let timesync_at = timesync_line.unwrap_or(Some(own_timesync_at));
+            // crons/main's condmv: no line, nothing moves, and httppost's
+            // own lines wait in data/new/main
+            let condmv_at = self.condmv_deadline(now).await;
 
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -779,6 +940,11 @@ impl ResultHandler {
                     if let Err(e) = sent {
                         debug!("Timesync post failed: {}", e);
                     }
+                }
+
+                // Not held by a 429: a move is no request
+                _ = sleep_until(condmv_at) => {
+                    self.run_due_condmvs().await;
                 }
 
                 _ = self.oneoff_ready.notified() => {
@@ -1402,6 +1568,7 @@ mod tests {
             post_dir: src.is_none(),
             set_time: Some(2),
             local_time: false,
+            max_post_size: None,
         }
     }
 
@@ -1914,6 +2081,165 @@ mod tests {
 
         cancel.cancel();
         background.join().unwrap();
+    }
+
+    /// An OK whose Date is `offset_secs` off the system clock, which
+    /// httppost's --set-time judges against.
+    fn ok_dated(offset_secs: i64) -> &'static str {
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(offset_secs))
+            .format("%a, %d %b %Y %H:%M:%S GMT");
+        Box::leak(
+            format!("HTTP/1.1 200 \r\nDate: {date}\r\nConnection: close\r\n\r\nOK\n")
+                .into_boxed_str(),
+        )
+    }
+
+    /// crons/main's condmv line, as RIPE sent it on 2026-10-14, spread 0
+    /// to pin its slots: 1 + k·60.
+    fn crons_main_condmv() -> CondmvLine {
+        CondmvLine {
+            schedule: PostSchedule {
+                interval: 60,
+                start_time: 1,
+                end_time: 2_000_000_000,
+                spread: 0,
+            },
+            append: Some("RESULT 9901 ongoing".into()),
+            force: false,
+            from: "/home/atlas/data/new/main".into(),
+            from_file: "data/new/main".into(),
+            to_file: "data/out/main".into(),
+        }
+    }
+
+    /// perd's side of the spool, as the reference runs crons/main: the
+    /// condmv line moves data/new/main to data/out/main on its slots with
+    /// its 9901 marker (the file as the line names it, condmv.c:150-154),
+    /// a marker alone when httppost wrote nothing; the main post takes
+    /// data/out and deletes it on an OK; httppost's 9015 line goes to
+    /// data/new/main and out with the next move. A crontab without the
+    /// line moves nothing more, and the 9015 lines wait.
+    #[tokio::test(start_paused = true)]
+    async fn crons_mains_condmv_moves_httpposts_lines_to_the_next_post() {
+        let (transport, mut seen) = answering(&[ok_dated(3600)]);
+        let (handler, t0) = twin_handler(transport).await;
+        handler
+            .set_httppost_line(twin_line(60, 12, 0, None))
+            .await
+            .unwrap();
+        handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+        let cancel = start(&handler);
+        // condmv at …141 and …201, posts at …152 and …212
+        tokio::time::sleep(Duration::from_secs(105)).await;
+        handler.set_condmv_lines(Vec::new()).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        cancel.cancel();
+
+        // The bodies without the status lines (7001, 9018) of the 180 s loop
+        let posts: Vec<(f64, String, String)> = posts(&mut seen, t0)
+            .into_iter()
+            .map(|(t, target, body)| {
+                let body = body
+                    .lines()
+                    .filter(|l| !l.starts_with("RESULT { "))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                (t, target, body)
+            })
+            .collect();
+        let at: Vec<i64> = posts.iter().map(|(t, _, _)| t.round() as i64).collect();
+        assert_eq!(at, [1_791_871_152, 1_791_871_212, 1_791_871_272]);
+        let footer = format!("\nSESSION_ID {SID}\n");
+        assert_eq!(
+            posts[0].2,
+            format!(
+                "P_TO_C_REPORT\nRESULT 9901 ongoing 1791871141 /home/atlas/data/new/main\n{footer}"
+            )
+        );
+        let second = posts[1].2.strip_prefix("P_TO_C_REPORT\n").unwrap();
+        let (clock, rest) = second.split_once('\n').unwrap();
+        assert!(
+            clock.starts_with("RESULT 9015 ongoing ") && clock.contains(" httppost not in sync, "),
+            "{second}"
+        );
+        assert_eq!(
+            rest,
+            format!("RESULT 9901 ongoing 1791871201 /home/atlas/data/new/main\n{footer}")
+        );
+        assert_eq!(
+            posts[2].2,
+            format!("P_TO_C_REPORT\n{footer}"),
+            "nothing moved"
+        );
+        let waiting = handler.spool.file("data/new/main").await.unwrap();
+        assert_eq!(waiting.lines().count(), 2, "{waiting}");
+        assert!(handler.spool.outgoing().await.is_empty());
+    }
+
+    /// A crontab that repeats the condmv line keeps its slot and offset
+    /// (perd's CopyFromOld); a line perd would refuse is left out.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_condmv_line_keeps_its_slot() {
+        let (transport, _seen) = answering(&[OK]);
+        let (handler, t0) = twin_handler(transport).await;
+        let mut line = crons_main_condmv();
+        line.schedule.spread = 14;
+        handler.set_condmv_lines(vec![line.clone()]).await;
+        let next = handler.condmv_deadline(t0).await;
+        assert!(next.is_some());
+        for _ in 0..20 {
+            handler.set_condmv_lines(vec![line.clone()]).await;
+            assert_eq!(handler.condmv_deadline(t0).await, next, "offset kept");
+        }
+        let mut bad = line.clone();
+        bad.schedule.interval = 0;
+        handler.set_condmv_lines(vec![bad]).await;
+        assert_eq!(handler.condmv_deadline(t0).await, None);
+    }
+
+    /// The line's --maxpostsize: a result that does not fit waits for the
+    /// next post, with no attempt counted, as it was not posted.
+    #[tokio::test]
+    async fn results_the_lines_maxpostsize_holds_back_go_with_the_next_post() {
+        let (transport, mut seen) = answering(&[OK]);
+        let handler = ResultHandler::new(
+            transport,
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            starla_metrics::MetricsRegistry::new().unwrap(),
+        );
+        handler
+            .set_endpoint_path("/?PROBE_ID=1018212&SESSION_ID=s".into())
+            .await
+            .unwrap();
+        handler.set_session_id("s".into()).await;
+        let line_len = AtlasResult::from_measurement(make_result(1001), None)
+            .with_lts(-1)
+            .to_result_line()
+            .len();
+        // Room for one result, not two; each no more than half of it
+        let header_footer = "P_TO_C_REPORT\n".len() + "\nSESSION_ID s\n".len();
+        let mut line = twin_line(60, 12, 0, None);
+        line.url = "http://127.0.0.1:8080/?PROBE_ID=1018212&SESSION_ID=s".into();
+        line.max_post_size = Some((2 * line_len + header_footer - 1) as u64);
+        handler.set_httppost_line(line).await.unwrap();
+        handler.submit(make_result(1001));
+        handler.submit(make_result(1002));
+
+        assert_eq!(handler.upload_pending().await.unwrap(), 1);
+        let waiting = handler.queue.lock().await.drain_all();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].attempts, 0, "not posted: no attempt");
+        handler.queue.lock().await.put_back(waiting);
+        assert_eq!(handler.upload_pending().await.unwrap(), 1);
+        assert_eq!(handler.queue_stats().await.count, 0);
+        let (_, first) = seen.try_recv().unwrap();
+        let (_, second) = seen.try_recv().unwrap();
+        assert!(
+            first.contains("\"1001\"") && !first.contains("\"1002\""),
+            "{first}"
+        );
+        assert!(second.contains("\"1002\""), "{second}");
     }
 
     /// A line the controller's crontab repeats keeps its slot (perd's

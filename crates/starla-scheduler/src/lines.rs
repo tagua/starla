@@ -25,6 +25,7 @@
 //! had run early in its cycle (a negative offset) and was re-sent before
 //! that cycle's slot ran in it again: two results for one slot.
 
+use crate::job::{CondmvJobSpec, MeasurementSpec};
 use crate::task::{Fired, LineGone, Now, ScheduledTask, Start};
 use crate::MeasurementJob;
 use std::collections::HashMap;
@@ -116,6 +117,8 @@ pub(crate) struct Due {
     /// The records of the lines found more than 10 s from their time, in
     /// the order their timers were set to fire
     pub inconsistent: Vec<InconsistentRecord>,
+    /// The condmv lines that ran: what each appends to data/new/7
+    pub condmvs: Vec<CondmvJobSpec>,
 }
 
 /// RunJob's "inconsistent time" record of a crontab line (eperd.c:1268-1303)
@@ -333,8 +336,12 @@ impl Lines {
             fired += 1;
             match fire {
                 Fired::NotYet => {}
-                // condmv's run is the uploader's (MeasurementSpec::Condmv)
-                Fired::Run if !task.job.spec.measures() => {}
+                // condmv's run measures nothing: it appends its marker
+                Fired::Run if !task.job.spec.measures() => {
+                    if let MeasurementSpec::Condmv(condmv) = &task.job.spec {
+                        due.condmvs.push(condmv.clone());
+                    }
+                }
                 Fired::Run => {
                     due.jobs.push(task.job.clone());
                     due.starts.push(start);
@@ -474,7 +481,10 @@ mod tests {
                 start_time: 1,
                 end_time: 2_000_000_000,
                 spread: 14,
-                spec: MeasurementSpec::Condmv,
+                spec: MeasurementSpec::Condmv(crate::job::CondmvJobSpec {
+                    append: Some("RESULT 9907 ongoing".into()),
+                    from: "/var/spool/ripe-atlas/data/new/7".into(),
+                }),
             },
         }
     }
@@ -1374,7 +1384,7 @@ mod tests {
     /// the order of their times: the record the twin's reference wrote
     /// (task.rs, a_timer_more_than_10_s_late_runs_nothing_and_gives_eperds_
     /// record). Starla parsed the line to Ignored and never wrote it. Its
-    /// runs start nothing, the uploader writing the 9907 marker. In
+    /// runs start nothing; each appends its 9907 marker (Due::condmvs). In
     /// crons/main condmv is perd's, which writes no record (perd.c:
     /// 1226-1248), and crons/2 no daemon reads: there it is no line.
     #[test]

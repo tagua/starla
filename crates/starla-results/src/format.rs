@@ -211,6 +211,9 @@ impl AtlasResult {
                 MeasurementData::FullLines(lines) => {
                     serde_json::Value::String(format!("__FULLLINE__{}", lines.join("\n")))
                 }
+                MeasurementData::Line(line) => {
+                    serde_json::Value::String(format!("{LINE_MARK}{line}"))
+                }
             },
         }
     }
@@ -266,6 +269,13 @@ impl AtlasResult {
 
         if let Some(line) = self.dns_result_line() {
             return line;
+        }
+
+        // A spool line (condmv's marker): written as it is, no envelope
+        if let serde_json::Value::String(ref v) = self.result {
+            if let Some(line) = v.strip_prefix(LINE_MARK) {
+                return format!("{line}\n");
+            }
         }
 
         // FullLine: the measurement provided the complete line body
@@ -368,6 +378,11 @@ impl AtlasResult {
 
 /// The lts a full-line measurement writes in its own envelope.
 pub const LTS_PLACEHOLDER: &str = "\"lts\":0,";
+
+/// How [`MeasurementData::Line`] travels in `result` from
+/// [`AtlasResult::from_measurement`] to [`AtlasResult::to_result_line`], as
+/// a FullLine does with `__FULLLINE__`.
+const LINE_MARK: &str = "__LINE__";
 
 /// What evtdig's line has in place of each lts: the seconds before the
 /// result's time that query was reported, between two of these
@@ -592,6 +607,22 @@ mod tests {
             line,
             "RESULT { \"id\":\"42\", \"lts\":10, \"result\":[ { \"subid\":1 } ] }\n\
              RESULT { \"id\":\"42\", \"lts\":10, \"result\":[ { \"subid\":2 } ] }\n"
+        );
+    }
+
+    /// condmv's marker is a spool line of its own: no envelope, no lts.
+    #[test]
+    fn a_spool_line_is_written_as_it_is() {
+        let mut result = make_ping_result();
+        result.data = MeasurementData::Line(
+            "RESULT 9907 ongoing 1792040000 /var/spool/ripe-atlas/data/new/7".to_string(),
+        );
+        let line = AtlasResult::from_measurement(result, None)
+            .with_lts(10)
+            .to_result_line();
+        assert_eq!(
+            line,
+            "RESULT 9907 ongoing 1792040000 /var/spool/ripe-atlas/data/new/7\n"
         );
     }
 

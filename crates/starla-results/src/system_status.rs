@@ -4,10 +4,12 @@
 //! uptime report (`rptuptime`, 7001) and a disk report (`dfrm -A 9018
 //! $ATLAS_DATA 600 …`, whose 600 is the minimum free KB, not an uptime gate),
 //! plus interface counters (`rxtxrpt -A 9002`) only when RXTXRPT=yes, which it
-//! is not by default. condmv then appends a marker when it moves a spool file
-//! to data/out: 9907 after eperd's results (data/new/7), 9901 after httppost's
-//! own lines (data/new/main). Starla sent 9018, 7001, 9002 and a `9901 ...
-//! starla` line in every upload instead.
+//! is not by default. Starla sent 9018, 7001, 9002 and a `9901 ... starla`
+//! line in every upload instead.
+//!
+//! The condmv markers are not status lines: each is a crontab line's, 9901
+//! crons/main's (spool.rs), 9907 crons/7's (starla-scheduler), and comes
+//! only when the controller's crontab has that line.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,35 +89,6 @@ pub fn rxtxrpt_line(lts: i64) -> Option<String> {
             .collect::<Vec<_>>()
             .join(", ")
     ))
-}
-
-/// condmv -A "RESULT <id> ongoing": the marker appended to a spool file as it
-/// is moved to data/out.
-pub fn spool_marker(id: u32, spool: &str) -> String {
-    format!("RESULT {id} ongoing {} {spool}\n", unix_now())
-}
-
-/// Measurement results: eperd's crons/7, `condmv -A "RESULT 9907 ongoing"`.
-pub fn results_marker() -> String {
-    spool_marker(9907, &spool_path("7"))
-}
-
-/// httppost's own lines: crons/main, `condmv -A "RESULT 9901 ongoing"`.
-pub fn main_marker() -> String {
-    spool_marker(9901, &spool_path("main"))
-}
-
-/// The spool path condmv reports for a file under `data/new`. The reference
-/// software probe's spool is under `@atlas_spooldir@`, not the hardware
-/// probe's `/home/atlas/data/new`, so hardcoding the latter was wrong for a
-/// software probe. Use the probe's own state directory.
-fn spool_path(name: &str) -> String {
-    starla_common::state_dir()
-        .join("data")
-        .join("new")
-        .join(name)
-        .display()
-        .to_string()
 }
 
 /// The host's uptime in seconds (sysinfo on Linux, kern.boottime on macOS,
@@ -263,20 +236,14 @@ mod tests {
         assert!(lines.len() <= 2, "{lines:?}");
     }
 
+    /// A status pass writes no condmv marker: 9901 and 9907 are the
+    /// crontabs' condmv lines' to write, with the file each line names.
     #[test]
-    fn markers_are_condmvs() {
-        let spool = starla_common::state_dir().join("data").join("new");
-        let m = results_marker();
-        assert!(m.starts_with("RESULT 9907 ongoing "), "{m}");
-        assert!(
-            m.ends_with(&format!(" {}\n", spool.join("7").display())),
-            "{m}"
-        );
-        let m = main_marker();
-        assert!(m.starts_with("RESULT 9901 ongoing "), "{m}");
-        assert!(
-            m.ends_with(&format!(" {}\n", spool.join("main").display())),
-            "{m}"
-        );
+    fn a_status_pass_writes_no_condmv_marker() {
+        let lines = status_lines(-1, &std::env::temp_dir(), true);
+        for line in &lines {
+            assert!(line.starts_with("RESULT { \"id\""), "{line}");
+            assert!(!line.contains(" ongoing "), "{line}");
+        }
     }
 }

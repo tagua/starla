@@ -116,6 +116,20 @@ impl ResultQueue {
         }
     }
 
+    /// Put results a post left out back at the front, in their order, no
+    /// attempt counted: they did not fit its `--maxpostsize`, so they were
+    /// not posted, as do_dir leaves a file that does not fit for the next
+    /// post (httppost.c:1118-1131).
+    pub fn put_back(&mut self, results: Vec<QueuedResult>) {
+        for r in results.into_iter().rev() {
+            self.items.push_front(r);
+        }
+
+        while self.items.len() > self.max_capacity {
+            self.items.pop_back();
+        }
+    }
+
     /// Remove results older than `max_age_secs`. Returns number of items
     /// removed.
     pub fn cleanup_expired(&mut self, max_age_secs: i64) -> usize {

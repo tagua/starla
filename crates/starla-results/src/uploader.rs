@@ -6,7 +6,7 @@
 use super::format::AtlasResult;
 use super::host_telemetry::HostTelemetry;
 use super::queue::QueuedResult;
-use super::system_status;
+use super::spool::{Spool, HTTPPOST_OUT};
 use super::time_sync::TimeSyncTracker;
 use std::future::Future;
 use std::pin::Pin;
@@ -35,10 +35,110 @@ async fn append_result_lines(body: &mut Vec<u8>, results: &[QueuedResult]) {
         if i > 0 && i.is_multiple_of(RESULTS_PER_YIELD) {
             tokio::task::yield_now().await;
         }
-        let atlas_result =
-            AtlasResult::from_measurement(queued.result.clone(), None).with_lts(queued.lts);
-        body.extend_from_slice(atlas_result.to_result_line().as_bytes());
+        body.extend_from_slice(result_line(queued).as_bytes());
     }
+}
+
+/// [`append_result_lines`] under a post's [`Budget`]: each result's line
+/// that fits is appended. The results whose lines went in, those left for
+/// the next post, and how many were dropped as too big ever to fit.
+async fn append_fitting_result_lines(
+    body: &mut Vec<u8>,
+    results: Vec<QueuedResult>,
+    budget: &mut Budget,
+) -> (Vec<QueuedResult>, Vec<QueuedResult>, usize) {
+    let (mut sent, mut deferred, mut dropped) = (Vec::new(), Vec::new(), 0);
+    for (i, queued) in results.into_iter().enumerate() {
+        if i > 0 && i.is_multiple_of(RESULTS_PER_YIELD) {
+            tokio::task::yield_now().await;
+        }
+        let line = result_line(&queued);
+        match budget.fit(line.len()) {
+            Fit::Take => {
+                body.extend_from_slice(line.as_bytes());
+                sent.push(queued);
+            }
+            Fit::Later => deferred.push(queued),
+            Fit::Delete => dropped += 1,
+        }
+    }
+    (sent, deferred, dropped)
+}
+
+/// A queued result's RESULT line, with the lts it was measured at.
+fn result_line(queued: &QueuedResult) -> String {
+    AtlasResult::from_measurement(queued.result.clone(), None)
+        .with_lts(queued.lts)
+        .to_result_line()
+}
+
+/// The main post's header, httppost's `--post-header` file.
+const POST_HEADER: &[u8] = b"P_TO_C_REPORT\n";
+
+/// httppost's `--maxpostsize` without the option (httppost.c:129); the same
+/// for eooqd's one-off posts, whose lines name none.
+pub const DEFAULT_MAX_POST_SIZE: u64 = 1_000_000;
+
+/// What do_dir makes of a file for a post (httppost.c:1118-1131).
+#[derive(Debug, PartialEq, Eq)]
+enum Fit {
+    /// In this post
+    Take,
+    /// "too big to fit this time": left for the next post
+    Later,
+    /// More than half the most a post may hold: deleted, never posted
+    Delete,
+}
+
+/// do_dir's running total (httppost.c:1057-1140): what a post holds so far,
+/// header and footer first (cLength before do_dir), against
+/// `--maxpostsize`. Each file of the directory that fits is added; one that
+/// does not is left, or deleted if it never could, and the scan goes on, so
+/// a smaller one after it may still fit. Starla's units are the files'
+/// lines: each telemetry line, each spool file of data/out, each result.
+/// do_dir's MAX_FILES (1000 files a post) is a count of files, of which
+/// Starla's results are none, and is left out.
+struct Budget {
+    used: u64,
+    max: u64,
+}
+
+impl Budget {
+    fn new(max: u64, header_and_footer: usize) -> Self {
+        Self {
+            used: header_and_footer as u64,
+            max,
+        }
+    }
+
+    fn fit(&mut self, size: usize) -> Fit {
+        let size = size as u64;
+        if self.used.saturating_add(size) > self.max {
+            if size > self.max / 2 {
+                Fit::Delete
+            } else {
+                Fit::Later
+            }
+        } else {
+            self.used += size;
+            Fit::Take
+        }
+    }
+}
+
+/// What a main post did with the results it was handed.
+pub(crate) struct MainPost {
+    /// The results the body carried: posted on an OK, for the caller to
+    /// requeue otherwise
+    pub(crate) sent: Vec<QueuedResult>,
+    /// The results that did not fit under `--maxpostsize`: left for the
+    /// next post, as do_dir leaves a file, the attempt not counted
+    pub(crate) deferred: Vec<QueuedResult>,
+    /// How many results were dropped as more than half the most a post may
+    /// hold, as do_dir unlinks such a file
+    pub(crate) dropped: usize,
+    /// The controller's answer
+    pub(crate) outcome: anyhow::Result<()>,
 }
 
 /// An async bidirectional stream for upload transport.
@@ -104,6 +204,9 @@ pub struct PostTarget {
     pub set_time: Option<i64>,
     /// `--local-time`: a `Unix-Date:` header (httppost.c:404-408)
     pub local_time: bool,
+    /// `--maxpostsize N`: the most the body may hold, header and footer
+    /// included (httppost.c:197-205, 1118)
+    pub max_post_size: u64,
 }
 
 /// The tunnel's one endpoint: the reference reaches the controller through
@@ -117,6 +220,8 @@ impl PostTarget {
     /// `/`, the rest (or `/`) as the path; the host is the authority less a
     /// `:port` and the brackets of an IPv6 literal. Only the tunnel's port
     /// is reachable: a URL naming another is refused, not posted to 8080.
+    /// The most a post may hold is httppost's own; a line's `--maxpostsize`
+    /// replaces it.
     pub fn from_url(url: &str, set_time: Option<i64>, local_time: bool) -> anyhow::Result<Self> {
         let rest = url
             .get(..7)
@@ -154,6 +259,7 @@ impl PostTarget {
             path: path.to_string(),
             set_time: set_time.filter(|&t| t != 0),
             local_time,
+            max_post_size: DEFAULT_MAX_POST_SIZE,
         })
     }
 }
@@ -166,6 +272,9 @@ pub struct ResultUploader {
     host_telemetry: Arc<HostTelemetry>,
     /// Marked synced when an accepted upload's Date agrees with our clock.
     time_sync: Arc<TimeSyncTracker>,
+    /// perd's spool files: httppost's own lines go to data/new/main, and
+    /// the main post takes data/out
+    spool: Arc<Spool>,
     metrics: starla_metrics::MetricsRegistry,
 }
 
@@ -183,8 +292,15 @@ impl ResultUploader {
             config,
             host_telemetry,
             time_sync,
+            spool: Arc::default(),
             metrics,
         }
+    }
+
+    /// The spool files this uploader posts from and writes httppost's own
+    /// lines to, for crons/main's condmv to move.
+    pub(crate) fn spool(&self) -> Arc<Spool> {
+        Arc::clone(&self.spool)
     }
 
     /// Set the endpoint path (call after controller connection).
@@ -221,6 +337,7 @@ impl ResultUploader {
             path,
             set_time: Some(SET_TIME_TOLERANCE_SECS),
             local_time: false,
+            max_post_size: DEFAULT_MAX_POST_SIZE,
         }
     }
 
@@ -234,65 +351,131 @@ impl ResultUploader {
         results: &[QueuedResult],
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.upload_batch_to(&self.default_target(None), results, session_id)
+        self.upload_batch_to(&self.default_target(None), results.to_vec(), session_id)
             .await
+            .outcome
     }
 
     /// [`upload_batch`](Self::upload_batch) as an httppost line with
-    /// `--post-dir` posts it: to `target`.
-    pub async fn upload_batch_to(
+    /// `--post-dir` posts it: to `target`, under its `--maxpostsize`. The
+    /// body is the header, then what fits of the host telemetry, the spool
+    /// files of data/out and the results, each in turn ([`Budget`]), then
+    /// the footer. Posted spool files are deleted on an OK
+    /// (`--delete-file`); telemetry lines go back for the next post unless
+    /// they went out with an OK; the results are the caller's to requeue.
+    pub(crate) async fn upload_batch_to(
         &self,
         target: &PostTarget,
-        results: &[QueuedResult],
+        results: Vec<QueuedResult>,
         session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> MainPost {
         // An empty batch is still posted (header, telemetry, footer), as the
         // reference probe's minutely httppost is with an empty data/out.
         if !self.has_endpoint() {
-            anyhow::bail!("No upload endpoint configured");
+            return MainPost {
+                sent: results,
+                deferred: Vec::new(),
+                dropped: 0,
+                outcome: Err(anyhow::anyhow!("No upload endpoint configured")),
+            };
         }
 
         self.metrics.record_upload_attempt();
         let start_time = std::time::Instant::now();
 
-        // Build POST body
-        let mut body = Vec::new();
-        body.extend_from_slice(b"P_TO_C_REPORT\n");
+        let footer = session_id
+            .map(|sid| format!("\nSESSION_ID {sid}\n"))
+            .unwrap_or_default();
+        let mut budget = Budget::new(target.max_post_size, POST_HEADER.len() + footer.len());
+        let mut body = POST_HEADER.to_vec();
 
-        // Host telemetry RESULT lines (buddyinfo, rptaddrs) accumulated since
-        // the last upload. Pushed by HostTelemetry's periodic reporters, and
-        // put back if this upload fails (below).
-        let telemetry = self.host_telemetry.drain().await;
-        for line in &telemetry {
-            body.extend_from_slice(line.as_bytes());
+        // Host telemetry RESULT lines (buddyinfo, rptaddrs, the status
+        // lines) accumulated since the last upload. Pushed by HostTelemetry's
+        // periodic reporters, and put back if this upload fails (below).
+        let mut telemetry = Vec::new();
+        for line in self.host_telemetry.drain().await {
+            let took = match budget.fit(line.len()) {
+                Fit::Take => {
+                    body.extend_from_slice(line.as_bytes());
+                    true
+                }
+                Fit::Later => false,
+                Fit::Delete => {
+                    warn!(
+                        "Dropping a {}-byte telemetry line: more than half of --maxpostsize {}",
+                        line.len(),
+                        target.max_post_size
+                    );
+                    continue;
+                }
+            };
+            telemetry.push((line, took));
         }
 
-        append_result_lines(&mut body, results).await;
-        if !results.is_empty() {
-            body.extend_from_slice(system_status::results_marker().as_bytes());
+        // data/out's files: perd's condmv moved them there
+        let (mut posted_files, mut too_big) = (Vec::new(), Vec::new());
+        for (name, content) in self.spool.outgoing().await {
+            match budget.fit(content.len()) {
+                Fit::Take => {
+                    body.extend_from_slice(content.as_bytes());
+                    posted_files.push(name);
+                }
+                Fit::Later => {}
+                Fit::Delete => {
+                    warn!(
+                        "Deleting {name}, {} bytes: too big ever to post",
+                        content.len()
+                    );
+                    too_big.push(name);
+                }
+            }
+        }
+        self.spool.delete(&too_big).await;
+
+        let (sent, deferred, dropped) =
+            append_fitting_result_lines(&mut body, results, &mut budget).await;
+        if dropped > 0 {
+            warn!(
+                "Dropping {dropped} results: each more than half of --maxpostsize {}",
+                target.max_post_size
+            );
+        }
+        if !deferred.is_empty() {
+            debug!(
+                "{} results wait for the next post: --maxpostsize {}",
+                deferred.len(),
+                target.max_post_size
+            );
         }
 
-        if let Some(sid) = session_id {
-            body.push(b'\n');
-            body.extend_from_slice(b"SESSION_ID ");
-            body.extend_from_slice(sid.as_bytes());
-            body.push(b'\n');
-        }
+        body.extend_from_slice(footer.as_bytes());
 
         debug!(
             "Uploading batch of {} results ({} bytes)",
-            results.len(),
+            sent.len(),
             body.len(),
         );
         trace!(target: UPLOAD_BODY_TARGET, "Upload body:\n{}", String::from_utf8_lossy(&body));
 
-        let sent = self.post(target, &body, results.len(), start_time).await;
-        if sent.is_err() {
-            // The caller requeues this batch's results (`requeue_failed`); its
-            // telemetry lines go back too, or a failed upload loses them.
-            self.host_telemetry.restore(telemetry).await;
+        let outcome = self.post(target, &body, sent.len(), start_time).await;
+        // The lines this post carried are gone with an OK; any other line
+        // goes back, ahead of those queued since, in the order it came.
+        let ok = outcome.is_ok();
+        let back: Vec<String> = telemetry
+            .into_iter()
+            .filter(|&(_, took)| !(ok && took))
+            .map(|(line, _)| line)
+            .collect();
+        self.host_telemetry.restore(back).await;
+        if ok {
+            self.spool.delete(&posted_files).await;
         }
-        sent
+        MainPost {
+            sent,
+            deferred,
+            dropped,
+            outcome,
+        }
     }
 
     /// The controller's 900 s `httppost … &SRC=timesync` line: header and
@@ -350,8 +533,10 @@ impl ResultUploader {
 
     /// httppost --set-time N: compare the answer's Date with our clock. In
     /// step and answered within a second: a time sync (lts restarts from 0).
-    /// Otherwise a RESULT 9015 line, uploaded with the next batch, as
-    /// httppost's stdout goes to data/new/main. Starla never sets the clock.
+    /// Otherwise a RESULT 9015 line on httppost's stdout, which the line's
+    /// `>> /home/atlas/data/new/main` appends to that spool file: crons/main's
+    /// condmv moves it to data/out with its 9901 marker, for a later post
+    /// to take. Starla never sets the clock.
     async fn judge_clock(&self, response: &str, rtt: Duration, tolerance: i64) {
         let Some(server) = response
             .lines()
@@ -369,21 +554,25 @@ impl ResultUploader {
             ClockVerdict::InSync => self.time_sync.mark_synced(),
             ClockVerdict::NotInSync => {
                 warn!("Clock not in sync with the controller: local {now}, remote {server}");
-                self.host_telemetry
-                    .push(format!(
-                        "RESULT 9015 ongoing {now} httppost not in sync, local {now}, remote \
-                         {server}\n{}",
-                        system_status::main_marker()
-                    ))
+                self.spool
+                    .append(
+                        HTTPPOST_OUT,
+                        &format!(
+                            "RESULT 9015 ongoing {now} httppost not in sync, local {now}, \
+                             remote {server}\n"
+                        ),
+                    )
                     .await;
             }
             ClockVerdict::SlowAnswer => {
-                self.host_telemetry
-                    .push(format!(
-                        "RESULT 9015 ongoing {now} httppost rtt {} ms\n{}",
-                        format_g(rtt.as_secs_f64() * 1000.0),
-                        system_status::main_marker()
-                    ))
+                self.spool
+                    .append(
+                        HTTPPOST_OUT,
+                        &format!(
+                            "RESULT 9015 ongoing {now} httppost rtt {} ms\n",
+                            format_g(rtt.as_secs_f64() * 1000.0)
+                        ),
+                    )
                     .await;
             }
         }
@@ -870,65 +1059,198 @@ mod tests {
         assert!(telemetry.drain().await.is_empty());
     }
 
+    /// httppost's 9015 line is its stdout, appended to data/new/main
+    /// (`>> /home/atlas/data/new/main`): no marker of its own, and not in
+    /// the next post until crons/main's condmv has moved it to data/out.
     #[tokio::test]
     async fn an_answer_an_hour_off_is_reported_not_trusted() {
         let (u, telemetry, sync) = with_time_sync(reply_dated(3600));
         u.upload_batch(&[], Some("s")).await.unwrap();
         assert_eq!(sync.lts(), -1);
-        let lines = telemetry.drain().await;
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(telemetry.drain().await.is_empty());
+        let main = u.spool().file(HTTPPOST_OUT).await.unwrap();
         assert!(
-            lines[0].starts_with("RESULT 9015 ongoing ")
-                && lines[0].contains(" httppost not in sync, local "),
-            "{}",
-            lines[0]
+            main.starts_with("RESULT 9015 ongoing ")
+                && main.contains(" httppost not in sync, local ")
+                && main.ends_with('\n')
+                && main.lines().count() == 1,
+            "{main}"
         );
-        // condmv's marker for data/new/main follows httppost's own line.
-        assert!(
-            lines[0].contains("\nRESULT 9901 ongoing ")
-                && lines[0].ends_with(&format!(
-                    " {}\n",
-                    starla_common::state_dir()
-                        .join("data")
-                        .join("new")
-                        .join("main")
-                        .display()
-                )),
-            "{}",
-            lines[0]
-        );
+        assert!(u.spool().outgoing().await.is_empty(), "not moved yet");
     }
 
     /// The reference sends status lines from its 180 s loop, not with every
-    /// upload, and marks eperd's results with condmv's 9907 line.
+    /// upload. A post writes no condmv marker either: eperd's 9907 is
+    /// crons/7's condmv's to append (starla-scheduler), perd's 9901
+    /// crons/main's (spool.rs), and each comes only from its line.
     #[tokio::test]
-    async fn an_upload_carries_results_and_their_marker_only() {
+    async fn an_upload_carries_results_and_no_marker() {
         let (u, _telemetry, mut seen) = uploader("HTTP/1.1 200 \r\n\r\nOK\n");
         u.upload_batch(&one_result(), Some("s")).await.unwrap();
         let req = seen.recv().await.unwrap();
         let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines[0], "P_TO_C_REPORT");
-        assert!(lines[1].contains("\"1001\""), "{body}");
-        assert!(
-            lines[2].starts_with("RESULT 9907 ongoing ")
-                && lines[2].ends_with(&format!(
-                    " {}",
-                    starla_common::state_dir()
-                        .join("data")
-                        .join("new")
-                        .join("7")
-                        .display()
-                )),
-            "{body}"
-        );
-        for gone in ["\"7001\"", "\"9018\"", "\"9002\""] {
+        let line = result_line(&one_result()[0]);
+        assert_eq!(body, format!("P_TO_C_REPORT\n{line}\nSESSION_ID s\n"));
+        for gone in ["\"7001\"", "\"9018\"", "\"9002\"", "9907", "9901"] {
             assert!(!body.contains(gone), "{gone} in {body}");
         }
+    }
 
-        u.upload_batch(&[], Some("s")).await.unwrap();
+    /// do_dir's test of each file against --maxpostsize, header and footer
+    /// counted first (httppost.c:1118-1131).
+    #[test]
+    fn a_post_holds_what_maxpostsize_lets_it() {
+        let mut b = Budget::new(100, 20);
+        assert_eq!(b.fit(30), Fit::Take);
+        assert_eq!(b.fit(50), Fit::Take, "exactly 100");
+        assert_eq!(b.fit(1), Fit::Later, "one byte over: next time");
+        assert_eq!(b.fit(50), Fit::Later, "half: next time");
+        assert_eq!(b.fit(51), Fit::Delete, "more than half: never");
+        assert_eq!(b.fit(0), Fit::Take);
+        // httppost's default
+        let mut b = Budget::new(DEFAULT_MAX_POST_SIZE, 14);
+        assert_eq!(b.fit(500_000), Fit::Take);
+        assert_eq!(b.fit(500_001), Fit::Delete);
+        assert_eq!(b.fit(499_986), Fit::Take);
+        assert_eq!(b.fit(1), Fit::Later);
+    }
+
+    /// A post under --maxpostsize: what fits goes, in order, and the scan
+    /// goes on past what does not; a result that does not fit waits for
+    /// the next post, and one that never could is dropped.
+    #[tokio::test]
+    async fn a_post_leaves_the_results_that_do_not_fit_for_the_next() {
+        let (u, _telemetry, mut seen) = uploader("HTTP/1.1 200 \r\n\r\nOK\n");
+        let mut results: Vec<QueuedResult> = (0..3).flat_map(|_| one_result()).collect();
+        results[1].result.msm_id = MeasurementId(1002);
+        results[1].result.data =
+            MeasurementData::Generic(serde_json::json!([{"rtt": 4.2, "x": 1}]));
+        results[2].result.msm_id = MeasurementId(1003);
+        let small = result_line(&results[0]).len();
+        let big = result_line(&results[1]).len();
+        // Room for the header, the two small results and the footer, not
+        // the big one, which is no more than half of it
+        let max = (POST_HEADER.len() + 2 * small + "\nSESSION_ID s\n".len()) as u64;
+        assert!(big > small && big as u64 <= max / 2, "{small} {big} {max}");
+        let target = PostTarget {
+            max_post_size: max,
+            ..u.default_target(None)
+        };
+
+        let post = u.upload_batch_to(&target, results, Some("s")).await;
+        post.outcome.unwrap();
         let req = seen.recv().await.unwrap();
-        assert!(!req.contains("9907"), "no results, no marker: {req}");
+        let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
+        assert_eq!(body.len() as u64, max);
+        let ids = |rs: &[QueuedResult]| rs.iter().map(|r| r.result.msm_id.0).collect::<Vec<_>>();
+        assert_eq!(ids(&post.sent), [1001, 1003], "past the one that waits");
+        assert_eq!(ids(&post.deferred), [1002]);
+        assert_eq!(post.dropped, 0);
+
+        // A result more than half of it is dropped
+        let target = PostTarget {
+            max_post_size: small as u64 + 20,
+            ..target
+        };
+        let post = u.upload_batch_to(&target, one_result(), Some("s")).await;
+        post.outcome.unwrap();
+        assert!(post.sent.is_empty() && post.deferred.is_empty());
+        assert_eq!(post.dropped, 1);
+        let req = seen.recv().await.unwrap();
+        assert!(
+            req.ends_with("\r\n\r\nP_TO_C_REPORT\n\nSESSION_ID s\n"),
+            "{req}"
+        );
+    }
+
+    /// Telemetry under --maxpostsize: a line that does not fit goes back
+    /// for the next post, even with an OK, in its place; one too big ever
+    /// to fit is dropped.
+    #[tokio::test]
+    async fn telemetry_that_does_not_fit_waits_for_the_next_post() {
+        let (u, telemetry, mut seen) = uploader("HTTP/1.1 200 \r\n\r\nOK\n");
+        const LATER: &str = "RESULT { \"later\": 1 }\n";
+        let huge = format!("RESULT {{ \"x\": \"{}\" }}\n", "z".repeat(3000));
+        let max = (POST_HEADER.len() + REPORT.len() + 10) as u64;
+        assert!(LATER.len() as u64 <= max / 2);
+        let target = PostTarget {
+            max_post_size: max,
+            ..u.default_target(None)
+        };
+        for line in [REPORT, &huge, LATER] {
+            telemetry.push(line.to_string()).await;
+        }
+        u.upload_batch_to(&target, Vec::new(), None)
+            .await
+            .outcome
+            .unwrap();
+        let req = seen.recv().await.unwrap();
+        assert!(
+            req.ends_with(&format!("\r\n\r\nP_TO_C_REPORT\n{REPORT}")),
+            "{req}"
+        );
+        assert_eq!(telemetry.drain().await, [LATER], "the huge one is gone");
+    }
+
+    /// The main post takes data/out's files, which crons/main's condmv put
+    /// there (`--post-dir /home/atlas/data/out`), and deletes them once the
+    /// controller has answered OK (`--delete-file`); a failed post leaves
+    /// them for the next, and a file too big ever to post is deleted.
+    #[tokio::test]
+    async fn the_main_post_takes_data_out_and_deletes_it_on_an_ok() {
+        use crate::spool::Condmv;
+        let crons_main = Condmv {
+            append: Some("RESULT 9901 ongoing".into()),
+            from: "/home/atlas/data/new/main".into(),
+            from_file: HTTPPOST_OUT.into(),
+            to_file: "data/out/main".into(),
+            force: false,
+        };
+        let moved = "RESULT 9015 ongoing 10 httppost rtt 1523.46 ms\nRESULT 9901 ongoing 60 \
+                     /home/atlas/data/new/main\n";
+        for (reply, kept) in [
+            ("HTTP/1.1 500 \r\n\r\n", true),
+            ("HTTP/1.1 200 \r\n\r\nOK\n", false),
+        ] {
+            let (u, _telemetry, mut seen) = uploader(reply);
+            let spool = u.spool();
+            spool
+                .append(
+                    HTTPPOST_OUT,
+                    "RESULT 9015 ongoing 10 httppost rtt 1523.46 ms\n",
+                )
+                .await;
+            assert!(spool.condmv(&crons_main, 60).await);
+            let post = u
+                .upload_batch_to(&u.default_target(None), one_result(), Some("s"))
+                .await;
+            assert_eq!(post.outcome.is_ok(), !kept);
+            let req = seen.recv().await.unwrap();
+            let body = &req[req.find("\r\n\r\n").unwrap() + 4..];
+            let line = result_line(&one_result()[0]);
+            assert_eq!(
+                body,
+                format!("P_TO_C_REPORT\n{moved}{line}\nSESSION_ID s\n")
+            );
+            assert_eq!(spool.file("data/out/main").await.is_some(), kept, "{reply}");
+        }
+
+        let (u, _telemetry, mut seen) = uploader("HTTP/1.1 200 \r\n\r\nOK\n");
+        u.spool().append(HTTPPOST_OUT, &"x".repeat(600)).await;
+        assert!(u.spool().condmv(&crons_main, 60).await);
+        // ~650 bytes with its marker: more than the post may hold, and more
+        // than half of it
+        let target = PostTarget {
+            max_post_size: 600,
+            ..u.default_target(None)
+        };
+        u.upload_batch_to(&target, Vec::new(), None)
+            .await
+            .outcome
+            .unwrap();
+        assert_eq!(u.spool().file("data/out/main").await, None, "deleted");
+        let req = seen.recv().await.unwrap();
+        assert!(req.ends_with("\r\n\r\nP_TO_C_REPORT\n"), "{req}");
     }
 
     /// The twin's reference probe, 2026-10-13 (wire-ctrl.jsonl): its
