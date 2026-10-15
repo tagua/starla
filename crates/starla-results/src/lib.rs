@@ -14,7 +14,7 @@ mod system_status;
 mod time_sync;
 mod uploader;
 
-pub use format::{AtlasResult, ResultBundle};
+pub use format::AtlasResult;
 pub use host_telemetry::{HostTelemetry, HostTelemetryKind};
 pub use post_schedule::PostSchedule;
 pub use queue::{QueueStats, QueuedResult, ResultQueue};

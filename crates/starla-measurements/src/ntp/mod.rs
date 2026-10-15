@@ -23,16 +23,20 @@ pub struct NtpConfig {
     pub count: u32,
     /// `-g`: minimum time between requests (5130)
     pub gap_ms: u64,
+    /// `-B`: the bundle, digits as given, reported as "bundle"
+    #[serde(default)]
+    pub bundle: Option<String>,
 }
 
 /// evntp's RESULT line (probe-busybox/eperd/ntp.c report(), 363-481), as
-/// Starla writes it: the envelope, `"dst_name"` and, for a name, `"ttr"`
-/// (400-416); `"dst_addr"` and `"src_addr"` when a server was picked
-/// (418-435); proto and af (437-441); the server's header fields once one
-/// answered (443-479); the result entries (481).
+/// Starla writes it: the envelope, -B's `"bundle"` (396-397), `"dst_name"`
+/// and, for a name, `"ttr"` (400-416); `"dst_addr"` and `"src_addr"` when a
+/// server was picked (418-435); proto and af (437-441); the server's header
+/// fields once one answered (443-479); the result entries (481).
 struct Report<'a> {
     msm_id: u64,
     time: i64,
+    bundle: Option<&'a str>,
     dst_name: &'a DstName,
     dst_addr: Option<IpAddr>,
     src_addr: Option<&'a str>,
@@ -47,14 +51,20 @@ impl Report<'_> {
     /// the result was queued at.
     fn body(&self) -> String {
         let mut s = format!(
-            "\"id\":\"{}\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":{}, \
-             \"dst_name\":{}",
+            "\"id\":\"{}\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":{}, ",
             self.msm_id,
             starla_common::FIRMWARE_VERSION,
             self.time,
-            // The controller names the target: quote it so a \" cannot
-            // break the RESULT line.
-            crate::http::raw::quoted(&self.dst_name.name),
+        );
+        if let Some(bundle) = self.bundle {
+            let _ = write!(s, "\"bundle\":{bundle}, ");
+        }
+        // The controller names the target: quote it so a \" cannot break
+        // the RESULT line.
+        let _ = write!(
+            s,
+            "\"dst_name\":{}",
+            crate::http::raw::quoted(&self.dst_name.name)
         );
         if let Some(ttr) = self.dst_name.ttr {
             let _ = write!(s, ", \"ttr\":{ttr:.6}");
@@ -287,6 +297,7 @@ fn result_body(
         return Report {
             msm_id,
             time: timestamp,
+            bundle: config.bundle.as_deref(),
             dst_name,
             dst_addr: Some(config.target),
             src_addr: src_addr.as_deref(),
@@ -329,6 +340,7 @@ fn result_body(
     Report {
         msm_id,
         time: timestamp,
+        bundle: config.bundle.as_deref(),
         dst_name,
         dst_addr: Some(config.target),
         src_addr: Some(src_addr.as_deref().unwrap_or_default()),
@@ -384,6 +396,7 @@ impl Ntp {
         let body = Report {
             msm_id: self.msm_id.0,
             time,
+            bundle: self.config.bundle.as_deref(),
             dst_name: &self.dst_name,
             dst_addr,
             src_addr: None,
@@ -457,6 +470,7 @@ mod tests {
             port: 123,
             count: 3,
             gap_ms: 4000,
+            bundle: None,
         }
     }
 
@@ -508,6 +522,50 @@ mod tests {
         assert!(
             body.ends_with("\"result\": [ { \"x\":\"*\" }, { \"x\":\"*\" }, { \"x\":\"*\" } ]"),
             "{body}"
+        );
+    }
+
+    /// -B's "bundle" comes right after "time", before "dst_name"
+    /// (ntp.c:386-401); without -B there is none.
+    #[test]
+    fn the_bundle_is_written_after_time() {
+        let results = client::NtpResult {
+            samples: vec![None, None, None],
+            src_addr: Some("199.184.91.28".parse().unwrap()),
+            error: None,
+        };
+        let dst_name = DstName {
+            name: "ntp.ripe.net".into(),
+            ttr: Some(12.5),
+        };
+        let line = |bundle: Option<&str>| {
+            let config = NtpConfig {
+                bundle: bundle.map(String::from),
+                ..config()
+            };
+            result_body(13023, &config, &dst_name, 4, 1791942167, &results)
+        };
+        assert_eq!(
+            line(None),
+            "\"id\":\"13023\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1791942167, \
+             \"dst_name\":\"ntp.ripe.net\", \"ttr\":12.500000, \"dst_addr\":\"193.0.0.229\", \
+             \"src_addr\":\"199.184.91.28\", \"proto\":\"UDP\", \"af\": 4, \
+             \"result\": [ { \"x\":\"*\" }, { \"x\":\"*\" }, { \"x\":\"*\" } ]"
+        );
+        assert_eq!(
+            line(Some("77")),
+            "\"id\":\"13023\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1791942167, \
+             \"bundle\":77, \"dst_name\":\"ntp.ripe.net\", \"ttr\":12.500000, \
+             \"dst_addr\":\"193.0.0.229\", \"src_addr\":\"199.184.91.28\", \"proto\":\"UDP\", \
+             \"af\": 4, \"result\": [ { \"x\":\"*\" }, { \"x\":\"*\" }, { \"x\":\"*\" } ]"
+        );
+        // dns_cb's lines carry it too
+        let mut ntp = ntp("::", dst_name.clone());
+        ntp.config.bundle = Some("77".into());
+        let line = body(ntp.lookup_failed(LookupError::Fail).unwrap());
+        assert!(
+            line.contains(", \"bundle\":77, \"dst_name\":\"ntp.ripe.net\", \"ttr\":12.500000, "),
+            "{line}"
         );
     }
 
@@ -1118,6 +1176,7 @@ mod tests {
                 port,
                 count: 3,
                 gap_ms: 150,
+                bundle: None,
             },
             probe_id: ProbeId(1018212),
             msm_id: MeasurementId(1),
@@ -1220,6 +1279,7 @@ mod tests {
                 port,
                 count: 2,
                 gap_ms: 1200,
+                bundle: None,
             },
             probe_id: ProbeId(1018212),
             msm_id: MeasurementId(1),

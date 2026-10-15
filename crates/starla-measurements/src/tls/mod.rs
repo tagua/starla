@@ -40,8 +40,8 @@ pub const CONN_TO_MS: u64 = 5000;
 const READ_CHUNK: usize = 4096;
 
 /// A crontab line, as far as sslgetcert's state goes: its id, target,
-/// port, family and -h.
-type Line = (u64, String, u16, u8, Option<String>);
+/// port, family, -h and -B.
+type Line = (u64, String, u16, u8, Option<String>, Option<String>);
 
 /// state->server_cipher outlives a run. The reference allocates one state
 /// per crontab line (sslgetcert_init(), sslgetcert.c:954, xzalloc) and only
@@ -69,6 +69,8 @@ pub struct TlsConfig {
     pub af: u8,
     /// `-h`: the server_name to send; without it the hello has none
     pub sni: Option<String>,
+    /// `-B`: the bundle, digits as given, reported as "bundle"
+    pub bundle: Option<String>,
     /// atlas_check_addr() refuses private and special addresses, unless
     /// ATLAS_DISABLE_CHECK_ADDR=yes
     pub check_addr: bool,
@@ -85,6 +87,7 @@ impl TlsConfig {
             port,
             af,
             sni,
+            bundle: None,
             check_addr: !resolve::check_addr_disabled(),
             timeout_ms: CONN_TO_MS,
             nameservers: Vec::new(),
@@ -96,6 +99,8 @@ impl TlsConfig {
 struct Envelope<'a> {
     /// `-A`: without one there is no id, version or lts
     atlas: Option<&'a str>,
+    /// `-B`, which both reports print only with an id
+    bundle: Option<&'a str>,
     dst_name: &'a str,
     dst_port: u16,
     /// tu_env.ttr in ms; None when the host was an address literal
@@ -119,10 +124,11 @@ fn af_of(ip: IpAddr) -> u8 {
 }
 
 /// report(), sslgetcert.c:1012-1092: the error report. "time" is the
-/// measurement's start (state->gstart) and comes only with an id; dst_addr
-/// and af come unless resolution failed; `result` is whatever add_str()
-/// gathered since the last connect attempt. "lts":0 is the placeholder the
-/// results crate fills in.
+/// measurement's start (state->gstart) and comes only with an id, and so
+/// does -B's "bundle" after it (:1038-1039); dst_addr and af come unless
+/// resolution failed; `result` is whatever add_str() gathered since the
+/// last connect attempt. "lts":0 is the placeholder the results crate
+/// fills in.
 fn report_body(env: &Envelope, gstart: i64, dst: Option<IpAddr>, result: &str) -> String {
     let mut s = String::new();
     if let Some(id) = env.atlas {
@@ -131,6 +137,9 @@ fn report_body(env: &Envelope, gstart: i64, dst: Option<IpAddr>, result: &str) -
             "\"id\":\"{id}\", {}, \"lts\":0, \"time\":{gstart}, ",
             version_json()
         );
+        if let Some(bundle) = env.bundle {
+            let _ = write!(s, "\"bundle\":{bundle}, ");
+        }
     }
     let _ = write!(
         s,
@@ -174,10 +183,19 @@ fn method_ver(version: (u8, u8)) -> (&'static str, String) {
 
 /// report_head(), sslgetcert.c:1157-1262: the report of an answer, with
 /// "time" taken now. The caller appends the alert or the certificates.
+///
+/// With -A and -B the reference prints `"lts":34"bundle":77, , "time":…`:
+/// it ends the envelope at "lts" with no comma, prints "bundle" as report()
+/// does, then ", " before "time" (:1183-1195) — not JSON, which RIPE could
+/// not store. Starla writes `"lts":0, "bundle":77, "time":…`: the second
+/// ", " before "time" moved to after "lts".
 fn head_body(env: &Envelope, now: i64, h: &Head) -> String {
     let mut s = String::new();
     if let Some(id) = env.atlas {
         let _ = write!(s, "\"id\":\"{id}\", {}, \"lts\":0, ", version_json());
+        if let Some(bundle) = env.bundle {
+            let _ = write!(s, "\"bundle\":{bundle}, ");
+        }
     }
     let _ = write!(
         s,
@@ -248,6 +266,7 @@ pub async fn sslgetcert(config: &TlsConfig, atlas: Option<&str>, cipher: u16) ->
     let (resolved, ttr) = resolve::resolve(&config.target, config.af, &config.nameservers).await;
     let env = Envelope {
         atlas,
+        bundle: config.bundle.as_deref(),
         dst_name: &config.target,
         dst_port: config.port,
         ttr: (!literal).then_some(ttr),
@@ -401,7 +420,14 @@ impl Measurement for Tls {
         // -A is the id; a line without one reports no id, version or lts
         let atlas = (self.msm_id.0 != 0).then(|| self.msm_id.0.to_string());
         let c = &self.config;
-        let line: Line = (self.msm_id.0, c.target.clone(), c.port, c.af, c.sni.clone());
+        let line: Line = (
+            self.msm_id.0,
+            c.target.clone(),
+            c.port,
+            c.af,
+            c.sni.clone(),
+            c.bundle.clone(),
+        );
         let last = LAST_CIPHER
             .lock()
             .ok()
@@ -464,6 +490,7 @@ mod tests {
     fn env_15001(ttr: Option<f64>) -> Envelope<'static> {
         Envelope {
             atlas: Some("15001"),
+            bundle: None,
             dst_name: "www.ripe.net",
             dst_port: 443,
             ttr,
@@ -545,6 +572,63 @@ mod tests {
         assert!(head_body(&env, 7, &head).starts_with("\"time\":7, \"dst_name\""));
         assert_eq!(method_ver((3, 0)), ("SSL", "3.0".into()));
         assert_eq!(method_ver((0x48, 0x54)), ("(unknown)", "72.84".into()));
+    }
+
+    /// -B's "bundle" comes after "time" in report()'s line and after "lts"
+    /// in report_head()'s, both only with an id (sslgetcert.c:1032-1040,
+    /// 1183-1195); without -B there is none. report_head() leaves out the
+    /// comma after "lts" and so writes `"lts":0"bundle":77, , "time"`;
+    /// Starla writes JSON there.
+    #[test]
+    fn the_bundle_is_written_as_both_reports_write_it() {
+        let head = Head {
+            version: (3, 3),
+            dst: "193.0.6.139".parse().unwrap(),
+            src: "192.0.2.10".into(),
+            ttc: 1.0,
+            rt: 2.0,
+            cipher: 0xc02b,
+        };
+        let with = Envelope {
+            bundle: Some("77"),
+            ..env_15001(Some(12.5))
+        };
+        let dnserr = "\"dnserr\":\"non-recoverable failure in name resolution\"";
+        assert_eq!(
+            report_body(&env_15001(Some(12.5)), 1791871374, None, dnserr),
+            "\"id\":\"15001\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1791871374, \
+             \"dst_name\":\"www.ripe.net\", \"dst_port\":\"443\", \"ttr\":12.500000, \
+             \"dnserr\":\"non-recoverable failure in name resolution\""
+        );
+        assert_eq!(
+            report_body(&with, 1791871374, None, dnserr),
+            "\"id\":\"15001\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1791871374, \
+             \"bundle\":77, \"dst_name\":\"www.ripe.net\", \"dst_port\":\"443\", \"ttr\":12.500000, \
+             \"dnserr\":\"non-recoverable failure in name resolution\""
+        );
+        assert_eq!(
+            head_body(&env_15001(Some(12.5)), 7, &head) + &alert_suffix(2, 70),
+            "\"id\":\"15001\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"time\":7, \
+             \"dst_name\":\"www.ripe.net\", \"dst_port\":\"443\", \"ttr\":12.500000, \"method\":\"TLS\", \
+             \"ver\":\"1.2\", \"dst_addr\":\"193.0.6.139\", \"af\": 4, \"src_addr\":\"192.0.2.10\", \
+             \"ttc\": 1.000000, \"rt\": 2.000000, \"server_cipher\": \"0xc02b\", \
+             \"alert\": { \"level\": 2, \"description\": 70 }"
+        );
+        assert_eq!(
+            head_body(&with, 7, &head) + &alert_suffix(2, 70),
+            "\"id\":\"15001\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"bundle\":77, \
+             \"time\":7, \"dst_name\":\"www.ripe.net\", \"dst_port\":\"443\", \"ttr\":12.500000, \
+             \"method\":\"TLS\", \"ver\":\"1.2\", \"dst_addr\":\"193.0.6.139\", \"af\": 4, \
+             \"src_addr\":\"192.0.2.10\", \"ttc\": 1.000000, \"rt\": 2.000000, \
+             \"server_cipher\": \"0xc02b\", \"alert\": { \"level\": 2, \"description\": 70 }"
+        );
+        // Without -A neither report has a bundle
+        let without_id = Envelope {
+            atlas: None,
+            ..with
+        };
+        assert!(!report_body(&without_id, 7, None, dnserr).contains("bundle"));
+        assert!(head_body(&without_id, 7, &head).starts_with("\"time\":7, \"dst_name\""));
     }
 
     /// Replaces the measured numbers so a live run can be compared whole.
@@ -858,6 +942,17 @@ mod tests {
             "\"id\":\"15001\", \"fw\":5130, \"mver\": \"2.6.4\", \"lts\":0, \"time\":N, \
              \"dst_name\":\"127.0.0.1\", \"dst_port\":\"443\", \"dst_addr\":\"127.0.0.1\", \
              \"af\": 4, \"error\": \"address not allowed\""
+        );
+        // The line's -B goes into its report
+        let cfg = TlsConfig {
+            bundle: Some("77".into()),
+            ..cfg
+        };
+        let out = sslgetcert(&cfg, Some("15001"), 0).await;
+        assert!(
+            mask(&out.body).contains("\"time\":N, \"bundle\":77, \"dst_name\":\"127.0.0.1\""),
+            "{}",
+            out.body
         );
     }
 

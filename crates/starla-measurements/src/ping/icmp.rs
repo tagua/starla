@@ -614,6 +614,7 @@ mod tests {
                 ttl: 64,
                 interval_ms: 1000,
                 backend: Default::default(),
+                bundle: None,
                 kept: Default::default(),
             },
             probe_id: ProbeId(1018212),
@@ -678,6 +679,7 @@ mod tests {
             ttl: 64,
             interval_ms: 300,
             backend: Default::default(),
+            bundle: None,
             kept: Default::default(),
         }
     }

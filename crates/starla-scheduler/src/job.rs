@@ -98,6 +98,8 @@ pub struct PingJobSpec {
     /// answer (ping.c:44, 785-787, 800-812)
     pub packet_interval: u32,
     pub size: u16,
+    /// `-B`: the bundle, reported as "bundle"
+    pub bundle: Option<String>,
     /// What the measurement's runs leave for the next: one per delivered
     /// line, from `PingKept::for_line`.
     pub kept: std::sync::Arc<PingKept>,
@@ -142,6 +144,8 @@ pub struct TlsJobSpec {
     pub port: u16,
     pub af: u8,
     pub hostname: Option<String>,
+    /// `-B`: the bundle, reported as "bundle"
+    pub bundle: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +155,8 @@ pub struct NtpJobSpec {
     pub packets: u32,
     pub timeout_ms: u32,
     pub gap_ms: u32,
+    /// `-B`: the bundle, reported as "bundle"
+    pub bundle: Option<String>,
     /// ntpstate->busy, shared by the line's runs: a line a push repeats
     /// keeps its job, and this with it
     pub busy: std::sync::Arc<NtpBusy>,
@@ -284,6 +290,7 @@ impl MeasurementJob {
                         ttl: 64,
                         interval_ms: u64::from(spec.packet_interval),
                         backend: Default::default(),
+                        bundle: spec.bundle.clone(),
                         kept: spec.kept.clone(),
                     },
                     probe_id,
@@ -337,7 +344,10 @@ impl MeasurementJob {
             // sslgetcert resolves the name itself (its ttr and dnserr), and
             // sends a server_name only for -h
             MeasurementSpec::Tls(spec) => Ok(Box::new(Tls {
-                config: TlsConfig::new(&spec.target, spec.port, spec.af, spec.hostname.clone()),
+                config: TlsConfig {
+                    bundle: spec.bundle.clone(),
+                    ..TlsConfig::new(&spec.target, spec.port, spec.af, spec.hostname.clone())
+                },
                 probe_id,
                 msm_id,
             })),
@@ -350,6 +360,7 @@ impl MeasurementJob {
                         port: 123,
                         count: spec.packets,
                         gap_ms: spec.gap_ms as u64,
+                        bundle: spec.bundle.clone(),
                     },
                     probe_id,
                     msm_id,
@@ -519,6 +530,7 @@ mod tests {
             packets: 16,
             packet_interval: 1000,
             size: 0,
+            bundle: None,
             kept: Default::default(),
         })
     }
@@ -983,6 +995,7 @@ mod tests {
             port: 443,
             af: 6,
             hostname: None,
+            bundle: None,
         });
         for spec in [dns, tls] {
             assert_eq!(spec.target(), None, "{}", spec.type_name());
@@ -1030,6 +1043,7 @@ mod tests {
             packets: 3,
             timeout_ms: 1000,
             gap_ms: 4000,
+            bundle: None,
             busy: Default::default(),
         })
     }

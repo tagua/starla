@@ -49,6 +49,9 @@ pub struct PingConfig {
     pub interval_ms: u64,
     #[serde(default)]
     pub backend: PingBackend,
+    /// `-B`: the bundle, digits as given, reported as "bundle"
+    #[serde(default)]
+    pub bundle: Option<String>,
     /// What the measurement's runs leave for the next one.
     #[serde(skip)]
     pub kept: Arc<PingKept>,
@@ -125,6 +128,7 @@ pub struct PingLine {
     pub packets: u32,
     pub packet_interval: u32,
     pub size: u16,
+    pub bundle: Option<String>,
     pub interval: u64,
     pub start_time: i64,
 }
@@ -553,6 +557,8 @@ struct Report<'a> {
     msm_id: u64,
     /// atlas_time() when the report is written
     time: i64,
+    /// `-B`, after "time" (ping.c:249-250)
+    bundle: Option<&'a str>,
     dst_name: &'a DstName,
     /// The family -4/-6 asked for
     af: u8,
@@ -574,13 +580,15 @@ impl Report<'_> {
     /// crate replaces with the lts the result was queued at.
     fn body(&self) -> String {
         let mut s = format!(
-            "\"id\":\"{}\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":{}, {}, \"af\":{}",
+            "\"id\":\"{}\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":{}, ",
             self.msm_id,
             starla_common::FIRMWARE_VERSION,
             self.time,
-            self.dst_name.fields(),
-            self.af,
         );
+        if let Some(bundle) = self.bundle {
+            s.push_str(&format!("\"bundle\":{bundle}, "));
+        }
+        s.push_str(&format!("{}, \"af\":{}", self.dst_name.fields(), self.af));
         if let Some(dst) = self.dst_addr {
             s.push_str(&format!(", \"dst_addr\":\"{dst}\""));
             if let Some(src) = &self.src_addr {
@@ -656,6 +664,7 @@ impl Ping {
                 self.result(Report {
                     msm_id: self.msm_id.0,
                     time,
+                    bundle: self.config.bundle.as_deref(),
                     dst_name: &self.dst_name,
                     af: self.af(),
                     dst_addr: Some(self.config.target),
@@ -679,6 +688,7 @@ impl Ping {
                 self.result(Report {
                     msm_id: self.msm_id.0,
                     time,
+                    bundle: self.config.bundle.as_deref(),
                     dst_name: &self.dst_name,
                     af: self.af(),
                     dst_addr: Some(self.config.target),
@@ -703,6 +713,7 @@ impl Ping {
         self.result(Report {
             msm_id: self.msm_id.0,
             time: Timestamp::now().0,
+            bundle: self.config.bundle.as_deref(),
             dst_name: &self.dst_name,
             af: self.af(),
             dst_addr,
@@ -802,6 +813,7 @@ mod tests {
                 ttl: 64,
                 interval_ms: DEFAULT_INTERVAL_MS,
                 backend: PingBackend::Native,
+                bundle: None,
                 kept: Default::default(),
             },
             probe_id: ProbeId(1018212),
@@ -1002,6 +1014,48 @@ mod tests {
         );
         let result = p.address_not_allowed().unwrap();
         assert!(body(&result).ends_with(r#""dst_name":"lan.example", "ttr":1.500000, "af":6, "dst_addr":"fd00::20", "proto":"ICMP", "size":0, "result": [ { "error":"address not allowed" } ]"#), "{}", body(&result));
+    }
+
+    /// -B's "bundle" comes right after "time", before "dst_name"
+    /// (ping.c:239-253); without -B there is none.
+    #[test]
+    fn the_bundle_is_written_after_time() {
+        let dst_name = DstName {
+            name: "k.root-servers.net".into(),
+            ttr: Some(1.5),
+        };
+        let report = |bundle| {
+            Report {
+                msm_id: 1001,
+                time: 1791885799,
+                bundle,
+                dst_name: &dst_name,
+                af: 4,
+                dst_addr: ip("193.0.14.129"),
+                src_addr: Some("192.0.2.10".into()),
+                ttl: Some(59),
+                size: 32,
+                result: r#"[ { "rtt":3.643373 } ]"#,
+            }
+            .body()
+        };
+        assert_eq!(
+            report(None),
+            r#""id":"1001", "fw":5130, "mver": "2.6.4", "lts":0, "time":1791885799, "dst_name":"k.root-servers.net", "ttr":1.500000, "af":4, "dst_addr":"193.0.14.129", "src_addr":"192.0.2.10", "proto":"ICMP", "ttl":59, "size":32, "result": [ { "rtt":3.643373 } ]"#
+        );
+        assert_eq!(
+            report(Some("77")),
+            r#""id":"1001", "fw":5130, "mver": "2.6.4", "lts":0, "time":1791885799, "bundle":77, "dst_name":"k.root-servers.net", "ttr":1.500000, "af":4, "dst_addr":"193.0.14.129", "src_addr":"192.0.2.10", "proto":"ICMP", "ttl":59, "size":32, "result": [ { "rtt":3.643373 } ]"#
+        );
+        // The measurement's lines carry its -B
+        let mut p = ping("193.0.14.129", 3, 0, literal("193.0.14.129"));
+        p.config.bundle = Some("77".into());
+        let result = p.address_not_allowed().unwrap();
+        assert!(
+            body(&result).contains(r#", "bundle":77, "dst_name":"193.0.14.129", "af":4,"#),
+            "{}",
+            body(&result)
+        );
     }
 
     /// RIPE's latest msm 1001 and 2001 results from probes on firmware
@@ -1435,6 +1489,7 @@ mod tests {
             packets: 3,
             packet_interval: 1000,
             size: 0,
+            bundle: None,
             interval: 240,
             start_time: 0,
         };

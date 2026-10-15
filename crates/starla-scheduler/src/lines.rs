@@ -510,6 +510,7 @@ mod tests {
                     packets: 3,
                     packet_interval: 1000,
                     size: 0,
+                    bundle: None,
                     kept: Default::default(),
                 }),
             },

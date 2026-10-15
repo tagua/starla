@@ -173,7 +173,10 @@ pub struct PingSpec {
     pub packets: u32,
     pub size: u16,
     pub packet_interval: u32, // ms between packets
-    pub spread: Option<u32>,  // random spread time in seconds
+    /// `-B`: the bundle, digits as given, reported as `"bundle"`
+    #[serde(default)]
+    pub bundle: Option<String>,
+    pub spread: Option<u32>, // random spread time in seconds
     pub schedule: ScheduleSpec,
 }
 
@@ -328,6 +331,9 @@ pub struct TlsSpec {
     pub af: u8,
     /// `-h`: the server_name to send; evsslgetcert sends none without it
     pub hostname: Option<String>,
+    /// `-B`: the bundle, digits as given, reported as `"bundle"`
+    #[serde(default)]
+    pub bundle: Option<String>,
     pub spread: Option<u32>,
     pub schedule: ScheduleSpec,
 }
@@ -343,6 +349,9 @@ pub struct NtpSpec {
     pub timeout_ms: u32,
     /// `-g`: minimum ms between requests (5130; default 4000, 2000..=60000)
     pub gap_ms: u32,
+    /// `-B`: the bundle, digits as given, reported as `"bundle"`
+    #[serde(default)]
+    pub bundle: Option<String>,
     pub spread: Option<u32>,
     pub schedule: ScheduleSpec,
 }
@@ -1410,6 +1419,15 @@ fn tokenize_cronline(cmd: &str) -> Vec<String> {
     tokens
 }
 
+/// An -B value as ping_init, ntp_init and sslgetcert_init take it: what
+/// validate_atlas_id() accepts (libbb/validate_atlas_id.c), digits only,
+/// kept as given since report() prints it with %s. validate_atlas_id()
+/// takes an empty one too, and report() would then write `"bundle":, `,
+/// which is not JSON; the controller sends none, and Starla refuses it.
+fn bundle_id(value: &str) -> Option<String> {
+    (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())).then(|| value.to_string())
+}
+
 /// Parse evping command arguments as ping_init does (ping.c:1262-1281,
 /// 1347-1350). PING_OPT_STRING is "!46eprc:s:A:B:O:i:I:R:W:": -c, -s, -A,
 /// -B, -O, -i, -I, -R and -W take a value, -4, -6, -e, -p and -r do not.
@@ -1423,14 +1441,19 @@ fn tokenize_cronline(cmd: &str) -> Vec<String> {
 /// 2026-10-13 has it); only the probe's own SOS ping, msm 9017, does
 /// (bin/ripe-atlas.in), which belongs to registration.
 ///
-/// Usage: evping [-4|-6] [-c count] [-s size] [-i interval] [-A msm_id] [-O
-/// output] target
+/// -B is the bundle, which the line reports as "bundle"; one that is not
+/// a bundle id ([`bundle_id`]) refuses the line, as ping_init refuses it
+/// (ping.c:1338-1345).
+///
+/// Usage: evping [-4|-6] [-c count] [-s size] [-i interval] [-A msm_id]
+/// [-B bundle] [-O output] target
 fn parse_evping(args: &[String], interval: u64, end_time: i64, spread: u32) -> TelnetCommand {
     let mut v4 = false;
     let mut count: u32 = 3;
     let mut size: u16 = 0;
     let mut packet_interval: u32 = 1000;
     let mut msm_id: u64 = 0;
+    let mut bundle: Option<String> = None;
     let mut target = String::new();
 
     let mut i = 0;
@@ -1446,8 +1469,14 @@ fn parse_evping(args: &[String], interval: u64, end_time: i64, spread: u32) -> T
                     "-s" => size = value.parse().unwrap_or(0),
                     "-A" => msm_id = value.parse().unwrap_or(0),
                     "-i" => packet_interval = value.parse().unwrap_or(1000),
-                    // -B bundle, -O output file, -I interface, -R/-W
-                    // fuzzing files
+                    "-B" => match bundle_id(value) {
+                        Some(id) => bundle = Some(id),
+                        None => {
+                            warn!("evping: bad bundle ID '{}'", value);
+                            return TelnetCommand::Unknown(format!("evping {:?}", args));
+                        }
+                    },
+                    // -O output file, -I interface, -R/-W fuzzing files
                     _ => {}
                 }
                 i += 1;
@@ -1487,6 +1516,7 @@ fn parse_evping(args: &[String], interval: u64, end_time: i64, spread: u32) -> T
         packets: count,
         size,
         packet_interval,
+        bundle,
         spread: Some(spread),
         schedule: ScheduleSpec {
             interval,
@@ -2146,13 +2176,15 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
 ///
 /// Neither -4 nor -6 is af 0: either family. The server_name is -h's alone —
 /// without it the reference sends none (state->sni is h_arg, :966), so the
-/// hostname is not a default. An unknown option or other than one hostname
-/// makes sslgetcert_init() refuse the line.
+/// hostname is not a default. -B is the bundle, reported as "bundle". An
+/// unknown option, a -B that is not a bundle id ([`bundle_id`], :919-925)
+/// or other than one hostname makes sslgetcert_init() refuse the line.
 fn parse_evsslgetcert(args: &[String], interval: u64, end_time: i64, spread: u32) -> TelnetCommand {
     let mut af: u8 = 0;
     let mut port: u16 = 443;
     let mut msm_id: u64 = 0;
     let mut hostname: Option<String> = None;
+    let mut bundle: Option<String> = None;
     let mut targets: Vec<&String> = Vec::new();
 
     let mut i = 0;
@@ -2161,8 +2193,8 @@ fn parse_evsslgetcert(args: &[String], interval: u64, end_time: i64, spread: u32
         match arg.as_str() {
             "-4" => af = 4,
             "-6" => af = 6,
-            // -B bundle, -O output, -R/-W fuzzing files, -V protocol version
-            // (the controller sends none of them but -O), -i interface
+            // -O output, -R/-W fuzzing files, -V protocol version (the
+            // controller sends none of them but -O), -i interface
             "-p" | "-A" | "-h" | "-B" | "-O" | "-R" | "-V" | "-W" | "-i" => {
                 let Some(value) = args.get(i + 1) else {
                     warn!("evsslgetcert: {} needs an argument", arg);
@@ -2172,6 +2204,13 @@ fn parse_evsslgetcert(args: &[String], interval: u64, end_time: i64, spread: u32
                     "-p" => port = value.parse().unwrap_or(443),
                     "-A" => msm_id = value.parse().unwrap_or(0),
                     "-h" => hostname = Some(value.clone()),
+                    "-B" => match bundle_id(value) {
+                        Some(id) => bundle = Some(id),
+                        None => {
+                            warn!("evsslgetcert: bad bundle ID '{}'", value);
+                            return TelnetCommand::Unknown(format!("evsslgetcert {:?}", args));
+                        }
+                    },
                     _ => {}
                 }
                 i += 1;
@@ -2207,6 +2246,7 @@ fn parse_evsslgetcert(args: &[String], interval: u64, end_time: i64, spread: u32
         port,
         af,
         hostname,
+        bundle,
         spread: Some(spread),
         schedule: ScheduleSpec {
             interval,
@@ -2216,21 +2256,24 @@ fn parse_evsslgetcert(args: &[String], interval: u64, end_time: i64, spread: u32
     })
 }
 
-/// Parse evntp command arguments
-///
-/// Usage: evntp [-4|-6] [-c count] [-A msm_id] [-O output] target
 /// evntp's defaults and 5130's gap bounds (probe-busybox/eperd/ntp.c).
 pub const NTP_TIMEOUT_DEFAULT_MS: u32 = 1000;
 pub const NTP_GAP_DEFAULT_MS: u32 = 4000;
 pub const NTP_GAP_MIN_MS: u32 = 2000;
 pub const NTP_GAP_MAX_MS: u32 = 60000;
 
+/// Parse evntp command arguments. -B is the bundle, reported as "bundle";
+/// one that is not a bundle id ([`bundle_id`]) refuses the line, as
+/// ntp_init refuses it (ntp.c:1084-1091).
+///
+/// Usage: evntp [-4|-6] [-c count] [-A msm_id] [-B bundle] [-O output] target
 fn parse_evntp(args: &[String], interval: u64, end_time: i64, spread: u32) -> TelnetCommand {
     let mut af: u8 = 4;
     let mut packets: u32 = 3;
     let mut timeout_ms = NTP_TIMEOUT_DEFAULT_MS;
     let mut gap_ms = NTP_GAP_DEFAULT_MS;
     let mut msm_id: u64 = 0;
+    let mut bundle: Option<String> = None;
     let mut target = String::new();
 
     let mut i = 0;
@@ -2265,8 +2308,20 @@ fn parse_evntp(args: &[String], interval: u64, end_time: i64, spread: u32) -> Te
                     i += 1;
                 }
             }
+            "-B" => {
+                if let Some(value) = args.get(i + 1) {
+                    match bundle_id(value) {
+                        Some(id) => bundle = Some(id),
+                        None => {
+                            warn!("evntp: bad bundle ID '{}'", value);
+                            return TelnetCommand::Unknown(format!("evntp {:?}", args));
+                        }
+                    }
+                    i += 1;
+                }
+            }
             // Options with a value Starla does not use.
-            "-O" | "-s" | "-i" | "-B" => {
+            "-O" | "-s" | "-i" => {
                 if i + 1 < args.len() {
                     i += 1;
                 }
@@ -2308,6 +2363,7 @@ fn parse_evntp(args: &[String], interval: u64, end_time: i64, spread: u32) -> Te
         packets,
         timeout_ms,
         gap_ms,
+        bundle,
         spread: Some(spread),
         schedule: ScheduleSpec {
             interval,
@@ -2363,6 +2419,7 @@ fn parse_json_command(spec: &serde_json::Value) -> TelnetCommand {
                 .get("packet_interval")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1000) as u32,
+            bundle: None,
             spread,
             schedule,
         }),
@@ -2492,6 +2549,7 @@ fn parse_json_command(spec: &serde_json::Value) -> TelnetCommand {
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or(Some(target)),
+            bundle: None,
             spread,
             schedule,
         }),
@@ -2503,6 +2561,7 @@ fn parse_json_command(spec: &serde_json::Value) -> TelnetCommand {
             packets: spec.get("packets").and_then(|v| v.as_u64()).unwrap_or(3) as u32,
             timeout_ms: NTP_TIMEOUT_DEFAULT_MS,
             gap_ms: NTP_GAP_DEFAULT_MS,
+            bundle: None,
             spread,
             schedule,
         }),
@@ -3584,6 +3643,39 @@ mod tests {
                 r#"CRONLINE 1800 12 2000000000 UNIFORM 30 evntp -4 -g {ok} -A "30003" ntp.ripe.net"#
             );
             assert!(ntp(&line).is_some(), "gap {ok} is in bounds");
+        }
+    }
+
+    /// -B is the bundle evping, evntp and evsslgetcert report as "bundle",
+    /// kept as given; one that is not digits refuses the line, as
+    /// ping_init, ntp_init and sslgetcert_init refuse it ("bad bundle ID").
+    #[test]
+    fn evping_evntp_and_evsslgetcert_keep_b_as_the_bundle() {
+        let bundle = |line: &str| match parse_command(line) {
+            TelnetCommand::Ping(s) => s.bundle,
+            TelnetCommand::Ntp(s) => s.bundle,
+            TelnetCommand::Tls(s) => s.bundle,
+            other => panic!("{other:?}"),
+        };
+        for cmd in [
+            "evping -4 -c 3",
+            "evntp -4 -c 3",
+            "evsslgetcert -4 -h www.ripe.net",
+        ] {
+            let line = |b: &str| {
+                format!(
+                    r#"CRONLINE 240 1 2000000000 UNIFORM 3 {cmd} {b}-A "1001" -O /home/atlas/data/new/7 www.ripe.net"#
+                )
+            };
+            assert_eq!(bundle(&line("")), None, "{cmd}");
+            assert_eq!(bundle(&line("-B 77 ")).as_deref(), Some("77"), "{cmd}");
+            assert_eq!(bundle(&line("-B 007 ")).as_deref(), Some("007"), "{cmd}");
+            for bad in ["-B 7x ", "-B -1 ", r#"-B "" "#] {
+                assert!(
+                    matches!(parse_command(&line(bad)), TelnetCommand::Unknown(_)),
+                    "{cmd} {bad}"
+                );
+            }
         }
     }
 

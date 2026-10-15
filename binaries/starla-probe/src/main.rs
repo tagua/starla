@@ -1545,6 +1545,7 @@ async fn run_commands(
                             packets: spec.packets,
                             packet_interval: spec.packet_interval,
                             size: spec.size,
+                            bundle: spec.bundle.clone(),
                             interval: spec.schedule.interval,
                             start_time: spec.schedule.start_time,
                         }
@@ -1554,6 +1555,7 @@ async fn run_commands(
                     packets: spec.packets,
                     packet_interval: spec.packet_interval,
                     size: spec.size,
+                    bundle: spec.bundle,
                 })
             ),
             TelnetCommand::Traceroute(spec) => dispatch_measurement!(
@@ -1646,6 +1648,7 @@ async fn run_commands(
                     port: spec.port,
                     af: spec.af,
                     hostname: spec.hostname,
+                    bundle: spec.bundle,
                 })
             ),
             TelnetCommand::Ntp(spec) => dispatch_measurement!(
@@ -1660,6 +1663,7 @@ async fn run_commands(
                     packets: spec.packets,
                     timeout_ms: spec.timeout_ms,
                     gap_ms: spec.gap_ms,
+                    bundle: spec.bundle,
                     busy: Default::default(),
                 })
             ),

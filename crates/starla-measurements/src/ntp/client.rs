@@ -496,6 +496,7 @@ mod tests {
             port,
             count: 3,
             gap_ms: 200,
+            bundle: None,
         };
         let res = execute_ntp_query(&config).await.unwrap();
         assert_eq!(res.samples.len(), 3);
@@ -539,6 +540,7 @@ mod tests {
             port,
             count,
             gap_ms,
+            bundle: None,
         }
     }
 

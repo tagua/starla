@@ -3,7 +3,6 @@
 //! This module provides types for wrapping measurement results in the
 //! official RIPE Atlas result format.
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use starla_common::{MeasurementData, MeasurementResult, MeasurementType};
 use std::net::IpAddr;
@@ -131,14 +130,6 @@ pub struct AtlasResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paris_id: Option<u8>,
 
-    /// Group ID for bundled results
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<u64>,
-
-    /// Bundle index within a group
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bundle: Option<u32>,
-
     /// Measurement-specific result data (NOT flattened - stays as nested
     /// object/array)
     pub result: serde_json::Value,
@@ -209,8 +200,6 @@ impl AtlasResult {
             size,
             endtime: None,
             paris_id: None,
-            group_id: None,
-            bundle: None,
             result: match result.data {
                 MeasurementData::Generic(v) => v,
                 MeasurementData::PreFormatted(s) => serde_json::Value::String(s),
@@ -257,13 +246,6 @@ impl AtlasResult {
         self
     }
 
-    /// Set group and bundle for grouped results
-    pub fn with_bundle(mut self, group_id: u64, bundle: u32) -> Self {
-        self.group_id = Some(group_id);
-        self.bundle = Some(bundle);
-        self
-    }
-
     /// Format as a RESULT line matching the exact output of the official C
     /// probe.
     ///
@@ -305,11 +287,6 @@ impl AtlasResult {
             self.time,
         )
         .unwrap();
-
-        // Optional bundle
-        if let Some(ref bundle) = self.bundle {
-            write!(s, ", \"bundle\":{}", bundle).unwrap();
-        }
 
         // dst_name (always present for ping/traceroute, absent for DNS)
         if let Some(ref name) = self.dst_name {
@@ -374,46 +351,6 @@ impl AtlasResult {
         s.push_str(" }\n");
 
         s
-    }
-}
-
-/// Result bundle for grouped measurements
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResultBundle {
-    /// Bundle ID
-    pub bundle_id: u64,
-    /// Results in this bundle
-    pub results: Vec<AtlasResult>,
-    /// When bundle was created
-    pub created_at: i64,
-}
-
-impl ResultBundle {
-    /// Create a new result bundle
-    pub fn new(bundle_id: u64) -> Self {
-        Self {
-            bundle_id,
-            results: Vec::new(),
-            created_at: Utc::now().timestamp(),
-        }
-    }
-
-    /// Add a result to the bundle
-    pub fn add(&mut self, mut result: AtlasResult) {
-        let bundle_index = self.results.len() as u32;
-        result.group_id = Some(self.bundle_id);
-        result.bundle = Some(bundle_index);
-        self.results.push(result);
-    }
-
-    /// Get the number of results in the bundle
-    pub fn len(&self) -> usize {
-        self.results.len()
-    }
-
-    /// Check if bundle is empty
-    pub fn is_empty(&self) -> bool {
-        self.results.is_empty()
     }
 }
 
