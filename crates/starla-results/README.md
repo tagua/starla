@@ -6,7 +6,7 @@ Result management and upload for Starla.
 
 - **Bounded in-memory queue**: configurable capacity; the oldest results are dropped when the buffer is full
 - **Batch upload**: the queue is drained and posted in one request, on the controller's own `httppost` slots
-- **Retry and backoff**: a failed upload is re-queued, and a `429` holds uploads with an increasing backoff
+- **Retry and backoff**: a failed upload is re-queued until a post delivers it or it is older than `max_result_age_secs`, never dropped for its failed attempts; a `429` holds uploads with an increasing backoff
 - **RIPE Atlas format**: results are formatted to match the official C probe exactly — field order, spacing, numeric precision
 - **Clock sync (`lts`)**: tracks the last agreement with the controller, persisted across restarts
 
@@ -22,7 +22,6 @@ let handler = ResultHandler::new(
     ResultHandlerConfig {
         upload_interval: Duration::from_secs(60),
         max_result_age_secs: 3600,
-        max_attempts: 5,
         cleanup_interval: Duration::from_secs(300),
         max_queue_size: 10_000,
         ..Default::default()

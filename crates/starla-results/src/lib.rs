@@ -40,11 +40,12 @@ pub struct ResultHandlerConfig {
     /// Starla's own upload interval, until the controller's httppost line
     /// arrives
     pub upload_interval: Duration,
-    /// Maximum result age before dropping (seconds)
+    /// Maximum result age before dropping (seconds). With
+    /// `max_queue_size`, the only bound on results a post has not
+    /// delivered: however many posts fail, they wait for the next one, as
+    /// the reference's spool files do.
     pub max_result_age_secs: i64,
-    /// Maximum retry attempts per result
-    pub max_attempts: u32,
-    /// Cleanup interval for expired/failed results
+    /// Cleanup interval for expired results
     pub cleanup_interval: Duration,
     /// Maximum number of results in queue
     pub max_queue_size: usize,
@@ -60,8 +61,7 @@ impl Default for ResultHandlerConfig {
     fn default() -> Self {
         Self {
             upload_interval: Duration::from_secs(60),
-            max_result_age_secs: 3600, // 1 hour
-            max_attempts: 5,
+            max_result_age_secs: 3600,                  // 1 hour
             cleanup_interval: Duration::from_secs(300), // 5 minutes
             max_queue_size: 10000,
             rxtxrpt: false,
@@ -515,26 +515,12 @@ impl ResultHandler {
 
         // Drain all available results: upload everything each cycle,
         // matching the official probe's httppost behavior
-        let results = {
+        let uploadable = {
             let mut queue = self.queue.lock().await;
             let res = queue.drain_all();
             self.metrics.update_queue_depth(0);
             res
         };
-
-        let (uploadable, failed): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .partition(|r| r.attempts < self.config.max_attempts);
-
-        if !failed.is_empty() {
-            warn!(
-                "Dropping {} results that exceeded max attempts",
-                failed.len()
-            );
-            for _ in 0..failed.len() {
-                self.metrics.record_queue_drop();
-            }
-        }
 
         // Nothing queued is still an upload: the reference probe posts every
         // minute whatever data/out holds, and each accepted post is a chance
@@ -562,14 +548,14 @@ impl ResultHandler {
             Err(e) => {
                 warn!("Upload failed: {}", e);
                 self.metrics.record_upload_failure();
+                // However it failed, the results wait for the next post, as
+                // perd's next httppost finds data/out's files still there.
+                // Five failed posts used to drop them: on 2026-10-12 five
+                // 429s in ~5 min dropped every result probe 1018212 measured
+                // while RIPE refused it, and on 2026-10-14 its KEEP
+                // disconnects dropped more.
                 let mut queue = self.queue.lock().await;
-                if is_rate_limited(&e) {
-                    // 2026-10-12: five 429s in ~5 min dropped every result
-                    // probe 1018212 measured while RIPE refused it.
-                    queue.requeue_refused(uploadable);
-                } else {
-                    queue.requeue_failed(uploadable);
-                }
+                queue.requeue(uploadable);
                 self.metrics.update_queue_depth(queue.stats().count as i64);
                 Err(e)
             }
@@ -579,23 +565,18 @@ impl ResultHandler {
     /// Post the queued one-off results, as eooqd does once a one-off is
     /// done (cmddone → post_results, eooqd.c:604-645). Nothing queued,
     /// nothing posted (`need_post`, eooqd.c:733-783). A failed post leaves
-    /// them queued for the next one, as httppost's `--delete-file` only
-    /// deletes on an OK.
+    /// them queued for the next one, however many have failed: httppost's
+    /// `--delete-file` only deletes on an OK, and eooqd's re_post tries
+    /// out/ooq again every 60 s for as long as it takes (eooqd.c:265-272,
+    /// 712-719, 821-829). 2026-10-14 17:25-18:23 UTC, probe 1018212's KEEP
+    /// disconnects: five one-offs were dropped after five failed posts,
+    /// each newly queued one-off's post at once counting one more.
     pub async fn upload_oneoffs(&self) -> anyhow::Result<usize> {
         if !self.has_endpoint().await {
             return Ok(0);
         }
         self.take_submitted().await;
-        let results = self.oneoff_queue.lock().await.drain_all();
-        let (uploadable, failed): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .partition(|r| r.attempts < self.config.max_attempts);
-        if !failed.is_empty() {
-            warn!(
-                "Dropping {} one-off results that exceeded max attempts",
-                failed.len()
-            );
-        }
+        let uploadable = self.oneoff_queue.lock().await.drain_all();
         if uploadable.is_empty() {
             return Ok(0);
         }
@@ -614,12 +595,7 @@ impl ResultHandler {
             }
             Err(e) => {
                 warn!("One-off post failed: {}", e);
-                let mut queue = self.oneoff_queue.lock().await;
-                if is_rate_limited(&e) {
-                    queue.requeue_refused(uploadable);
-                } else {
-                    queue.requeue_failed(uploadable);
-                }
+                self.oneoff_queue.lock().await.requeue(uploadable);
                 Err(e)
             }
         }
@@ -643,25 +619,33 @@ impl ResultHandler {
             .await
     }
 
-    /// Run cleanup to remove expired and failed results
+    /// Drop the results older than `max_result_age_secs`, from both queues:
+    /// with the queues' size, the only bound on results a post has not
+    /// delivered.
     pub async fn run_cleanup(&self) {
         self.take_submitted().await;
+        let max_age = self.config.max_result_age_secs;
         let mut queue = self.queue.lock().await;
-        let removed_expired = queue.cleanup_expired(self.config.max_result_age_secs);
-        let removed_failed = queue.cleanup_failed(self.config.max_attempts);
-
-        let total_removed = removed_expired + removed_failed;
-        if total_removed > 0 {
-            for _ in 0..total_removed {
+        let expired = queue.cleanup_expired(max_age);
+        if expired > 0 {
+            warn!("Dropped {} results older than {} s", expired, max_age);
+            for _ in 0..expired {
                 self.metrics.record_queue_drop();
             }
             self.metrics.update_queue_depth(queue.stats().count as i64);
         }
         drop(queue);
 
-        let mut oneoffs = self.oneoff_queue.lock().await;
-        oneoffs.cleanup_expired(self.config.max_result_age_secs);
-        oneoffs.cleanup_failed(self.config.max_attempts);
+        let expired = self.oneoff_queue.lock().await.cleanup_expired(max_age);
+        if expired > 0 {
+            warn!(
+                "Dropped {} one-off results older than {} s",
+                expired, max_age
+            );
+            for _ in 0..expired {
+                self.metrics.record_queue_drop();
+            }
+        }
     }
 
     /// When the controller's line of this kind is next due, as a tokio
@@ -1146,7 +1130,7 @@ mod tests {
     }
 
     /// 2026-10-12: five 429s dropped every result probe 1018212 measured while
-    /// RIPE refused it. A refusal is not a failed attempt.
+    /// RIPE refused it. However many posts are refused, the results wait.
     #[tokio::test]
     async fn a_refused_upload_drops_nothing() {
         let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
@@ -1162,7 +1146,7 @@ mod tests {
             .unwrap();
         handler.submit(make_result(1001));
 
-        let tries = ResultHandlerConfig::default().max_attempts + 3;
+        let tries = 8;
         for _ in 0..tries {
             let err = handler.upload_pending().await.unwrap_err();
             assert!(is_rate_limited(&err), "{err}");
@@ -1183,10 +1167,7 @@ mod tests {
         let handler = Arc::new(ResultHandler::new(
             Box::new(RateLimitingController(tx)),
             UploaderConfig::default(),
-            ResultHandlerConfig {
-                max_attempts: u32::MAX,
-                ..Default::default()
-            },
+            ResultHandlerConfig::default(),
             starla_metrics::MetricsRegistry::new().unwrap(),
         ));
         handler
@@ -1624,6 +1605,161 @@ mod tests {
             .map(|(t, _, _)| (t - KEEP).round() as i64)
             .collect();
         assert_eq!(oneoffs, [5, 60]);
+    }
+
+    /// The probe's SSH session as the upload transport sees it: while it is
+    /// down a post fails at once, as SshUploadTransport's does without a
+    /// connection; while it is up, the controller answers OK.
+    struct SessionGoesDown {
+        up: Arc<std::sync::atomic::AtomicBool>,
+        controller: AnsweringController,
+    }
+
+    impl UploadTransport for SessionGoesDown {
+        fn open(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Box<dyn UploadStream>>> + Send + '_,
+            >,
+        > {
+            if !self.up.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { anyhow::bail!("SSH connection not established") });
+            }
+            self.controller.open()
+        }
+    }
+
+    /// A transport on a session that is up until the test takes it down.
+    fn session_goes_down() -> (
+        Box<dyn UploadTransport>,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::sync::mpsc::UnboundedReceiver<(tokio::time::Instant, String)>,
+    ) {
+        let (tx, seen) = tokio::sync::mpsc::unbounded_channel();
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let transport = SessionGoesDown {
+            up: Arc::clone(&up),
+            controller: AnsweringController {
+                answers: std::sync::Mutex::new(vec![OK]),
+                seen: tx,
+            },
+        };
+        (Box::new(transport), up, seen)
+    }
+
+    /// 2026-10-14 17:25-18:23 UTC, probe 1018212: a burst of KEEP
+    /// disconnects, and five of 97 one-offs dropped after five failed posts.
+    /// One-offs done while the SSH session is down — each posted at once,
+    /// in vain — then ten minutes of failed re-posts and cleanups: every one
+    /// goes out once the probe is back on a new session, as eooqd's out/ooq
+    /// would, and so does the scheduled result measured meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn one_offs_done_during_a_disconnect_are_posted_after_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (transport, up, mut seen) = session_goes_down();
+        let (handler, t0) = twin_handler(transport).await;
+        let cancel = start(&handler);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        up.store(false, SeqCst);
+        let oneoffs: Vec<u64> = (0..10).map(|i| 222_024_177 + i).collect();
+        for &msm_id in &oneoffs {
+            handler.expect_oneoff(msm_id).await;
+            handler.submit(make_result(msm_id));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        handler.submit(make_result(1001));
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(posts(&mut seen, t0).is_empty(), "the session was down");
+        assert_eq!(handler.oneoff_queue.lock().await.stats().count, 10);
+
+        // Back: a controller INIT, and a new session
+        up.store(true, SeqCst);
+        handler
+            .set_endpoint_path("/?PROBE_ID=1018212&SESSION_ID=next".into())
+            .await
+            .unwrap();
+        handler.set_session_id("next".into()).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        cancel.cancel();
+
+        let posts = posts(&mut seen, t0);
+        let bodies = |to: &str| -> String {
+            posts
+                .iter()
+                .filter(|(_, target, _)| target == to)
+                .map(|(_, _, body)| body.as_str())
+                .collect()
+        };
+        let posted = bodies("/?PROBE_ID=1018212&SESSION_ID=next&SRC=oneoff");
+        for msm_id in &oneoffs {
+            let id = format!("\"{msm_id}\"");
+            assert_eq!(posted.matches(&id).count(), 1, "{id} once: {posts:?}");
+        }
+        let main = bodies("/?PROBE_ID=1018212&SESSION_ID=next");
+        assert_eq!(main.matches("\"1001\"").count(), 1, "{posts:?}");
+        assert!(!main.contains("22202417"), "no one-off in it: {main}");
+        assert_eq!(handler.oneoff_queue.lock().await.stats().count, 0);
+        assert_eq!(handler.queue_stats().await.count, 0);
+    }
+
+    /// However many posts fail, and however many cleanups run meanwhile, a
+    /// result waits for the post that delivers it, scheduled or one-off: the
+    /// reference leaves data/out's and out/ooq's files until an OK.
+    #[tokio::test]
+    async fn no_number_of_failed_posts_drops_a_result() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (transport, up, mut seen) = session_goes_down();
+        let handler = ResultHandler::new(
+            transport,
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            starla_metrics::MetricsRegistry::new().unwrap(),
+        );
+        handler
+            .set_endpoint_path("/?PROBE_ID=1&SESSION_ID=s".into())
+            .await
+            .unwrap();
+        handler.expect_oneoff(7001).await;
+        handler.submit(make_result(7001));
+        handler.submit(make_result(1001));
+        up.store(false, SeqCst);
+        for _ in 0..20 {
+            assert!(handler.upload_oneoffs().await.is_err());
+            assert!(handler.upload_pending().await.is_err());
+            handler.run_cleanup().await;
+        }
+        assert_eq!(handler.oneoff_queue.lock().await.stats().count, 1);
+        assert_eq!(handler.queue_stats().await.count, 1);
+
+        up.store(true, SeqCst);
+        assert_eq!(handler.upload_oneoffs().await.unwrap(), 1);
+        assert_eq!(handler.upload_pending().await.unwrap(), 1);
+        let (_, oneoff) = seen.try_recv().unwrap();
+        assert!(oneoff.contains("&SRC=oneoff ") && oneoff.contains("\"7001\""));
+        let (_, main) = seen.try_recv().unwrap();
+        assert!(main.contains("\"1001\"") && !main.contains("\"7001\""));
+    }
+
+    /// What bounds them is their age, `max_result_age_secs`, in both queues
+    /// (and each queue's size).
+    #[tokio::test]
+    async fn results_past_the_max_age_are_dropped() {
+        let handler = ResultHandler::new(
+            Box::new(NoopTransport),
+            UploaderConfig::default(),
+            ResultHandlerConfig {
+                max_result_age_secs: 0,
+                ..Default::default()
+            },
+            starla_metrics::MetricsRegistry::new().unwrap(),
+        );
+        handler.expect_oneoff(7001).await;
+        handler.submit(make_result(7001));
+        handler.submit(make_result(1001));
+        handler.run_cleanup().await;
+        assert_eq!(handler.oneoff_queue.lock().await.stats().count, 0);
+        assert_eq!(handler.queue_stats().await.count, 0);
     }
 
     /// 0007's holds stand on the controller's slots too: refused uploads go

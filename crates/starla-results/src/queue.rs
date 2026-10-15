@@ -90,8 +90,13 @@ impl ResultQueue {
         self.items.drain(..).collect()
     }
 
-    /// Put failed results back at the front with incremented attempt counter
-    pub fn requeue_failed(&mut self, mut results: Vec<QueuedResult>) {
+    /// Put results a post did not deliver back at the front, in their order,
+    /// one more attempt counted. However many posts fail — a 429, the SSH
+    /// session down, any other answer than OK — they wait for the next one,
+    /// as httppost's `--delete-file` only deletes the spool's files on an OK
+    /// (httppost.c:602): only their age (`cleanup_expired`) and the queue's
+    /// size drop them.
+    pub fn requeue(&mut self, mut results: Vec<QueuedResult>) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -99,29 +104,6 @@ impl ResultQueue {
 
         for r in &mut results {
             r.attempts += 1;
-            r.last_attempt_at = Some(now);
-        }
-
-        for r in results.into_iter().rev() {
-            self.items.push_front(r);
-        }
-
-        while self.items.len() > self.max_capacity {
-            self.items.pop_back();
-        }
-    }
-
-    /// Put results the controller refused to take (429) back at the front,
-    /// without counting an attempt: nothing was wrong with them, so they wait
-    /// out the refusal and only their age (`cleanup_expired`) can drop them.
-    /// The reference probe leaves refused files in its spool the same way.
-    pub fn requeue_refused(&mut self, mut results: Vec<QueuedResult>) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        for r in &mut results {
             r.last_attempt_at = Some(now);
         }
 
@@ -147,18 +129,6 @@ impl ResultQueue {
         let removed = before - self.items.len();
         if removed > 0 {
             debug!("Cleaned up {} expired results", removed);
-        }
-        removed
-    }
-
-    /// Remove results that exceeded max attempts. Returns number of items
-    /// removed.
-    pub fn cleanup_failed(&mut self, max_attempts: u32) -> usize {
-        let before = self.items.len();
-        self.items.retain(|r| r.attempts < max_attempts);
-        let removed = before - self.items.len();
-        if removed > 0 {
-            warn!("Dropped {} results that exceeded max attempts", removed);
         }
         removed
     }
@@ -226,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn test_requeue_failed() {
+    fn test_requeue() {
         let mut q = ResultQueue::new(100);
         q.enqueue(make_result(1));
         q.enqueue(make_result(2));
@@ -234,42 +204,30 @@ mod tests {
         let batch = q.drain_batch(2);
         assert_eq!(q.stats().count, 0);
 
-        q.requeue_failed(batch);
+        q.requeue(batch);
         assert_eq!(q.stats().count, 2);
 
         let batch = q.drain_batch(1);
         assert_eq!(batch[0].attempts, 1);
     }
 
+    /// httppost leaves a file it got no OK for in the spool, however often
+    /// that happens: a result is never dropped for its failed posts.
     #[test]
-    fn test_cleanup_failed() {
-        let mut q = ResultQueue::new(100);
-        q.enqueue(make_result(1));
-
-        for _ in 0..5 {
-            let batch = q.drain_batch(1);
-            q.requeue_failed(batch);
-        }
-
-        assert_eq!(q.stats().count, 1);
-        q.cleanup_failed(5);
-        assert_eq!(q.stats().count, 0);
-    }
-
-    #[test]
-    fn a_refused_result_keeps_its_attempts() {
+    fn a_result_waits_out_any_number_of_failed_posts() {
         let mut q = ResultQueue::new(10);
         q.enqueue(make_result(1));
         q.enqueue(make_result(2));
-        for _ in 0..10 {
+        for _ in 0..100 {
             let batch = q.drain_all();
-            q.requeue_refused(batch);
+            q.requeue(batch);
         }
+        q.enqueue(make_result(3));
         let back = q.drain_all();
-        assert_eq!(back.len(), 2);
-        assert_eq!(back[0].result.msm_id.0, 1, "order kept");
-        assert!(back
+        let ids: Vec<u64> = back.iter().map(|r| r.result.msm_id.0).collect();
+        assert_eq!(ids, [1, 2, 3], "none dropped, order kept");
+        assert!(back[..2]
             .iter()
-            .all(|r| r.attempts == 0 && r.last_attempt_at.is_some()));
+            .all(|r| r.attempts == 100 && r.last_attempt_at.is_some()));
     }
 }

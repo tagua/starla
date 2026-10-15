@@ -243,7 +243,7 @@
       "id": 3,
       "type": "stat",
       "title": "Results lost",
-      "description": "Share of measurement results produced in the time range that were dropped before upload: queue overflow, too many failed upload attempts, or older than max_result_age.",
+      "description": "Share of measurement results produced in the time range that were dropped before upload: queue overflow, or older than max_result_age.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
