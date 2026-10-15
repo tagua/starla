@@ -242,9 +242,48 @@
       </div>
 
       <h3>HTTP — <code>evhttpget</code></h3>
-      <pre><div class="pre-head"><span class="lang">grammar</span></div><div class="pre-body"><code>evhttpget [-4|-6] [-A msm_id] [-O output] [-M max_body] &lt;url&gt;</code></div></pre>
+      <pre><div class="pre-head"><span class="lang">grammar</span></div><div class="pre-body"><code>evhttpget [-4|-6] [-0|-1] [-a] [-c] [-b bundle] [--get|--head|--post]
+  [--post-header file] [--post-file file] [--post-footer file]
+  [--store-headers N] [--read-limit N] [--user-agent S] [--host H]
+  [--sni name] [--timeout ms] [--etim|--eetim] [-A msm_id] [-O output] &lt;url&gt;</code></div></pre>
 
-      <pre><div class="pre-head"><span class="lang">json</span><span>result</span></div><div class="pre-body"><code>RESULT { "id":"12023", "fw":5120, "mver": "2.6.4", "lts":19, "time":1775317966, "dst_name":"example.com", "af":4, "dst_addr":"93.184.216.34", "proto":"TCP", "result": [ { "method":"GET", "af": 6, "dst_addr":"2600:140f:3::17df:2fba", "src_addr":"10.0.0.1", "rt":106.612889, "res":200, "ver":"1.1", "hsize":296, "bsize":0 } ] }</code></div></pre>
+      <p>Parsed as <code>eperd/httpget.c</code> parses it, for <code>http://</code> and <code>https://</code> URLs (over TLS the certificate is not verified, as httpget does not). A line httpget refuses is refused: a <code>-b</code> that is not digits, a <code>--timeout</code> or <code>--read-limit</code> that is not a number, a post file not under <code>data/out</code>.</p>
+
+      <table>
+        <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-4</code> / <code>-6</code></td><td>The address family the URL's host is looked up in</td></tr>
+          <tr><td><code>-0</code> / <code>-1</code></td><td>HTTP/1.0 / HTTP/1.1 (default)</td></tr>
+          <tr><td><code>--get</code>, <code>--head</code>, <code>--post</code></td><td>The method, the last one named. A HEAD reads no body; a POST sends <code>Content-Length: 0</code>, its post files being files Starla does not keep</td></tr>
+          <tr><td><code>--store-headers N</code></td><td>The response's header lines within N bytes, as <code>"header"</code>; the line that overruns is cut and marked <code>[...]</code></td></tr>
+          <tr><td><code>--read-limit N</code></td><td>Stop reading once N bytes are read, and say <code>"read-truncated": true</code> after <code>"af"</code>. In the status line or the header the result is <code>"err":"bad status line: read truncated"</code> or <code>"bad header line: read truncated"</code>; in the body the response is done, <code>bsize</code> what was read of it</td></tr>
+          <tr><td><code>--user-agent S</code></td><td>The User-Agent sent (<code>httpget for atlas.ripe.net</code>)</td></tr>
+          <tr><td><code>--host H</code></td><td>The Host header, in place of the URL's host and port; the name looked up and the TLS server name stay the URL's</td></tr>
+          <tr><td><code>--sni name</code></td><td>The TLS server name (the URL's host)</td></tr>
+          <tr><td><code>--timeout ms</code></td><td>One timer from the connect to the end of the response (5000)</td></tr>
+          <tr><td><code>-a</code>/<code>--all</code>, <code>-c</code>/<code>--combine</code></td><td>Fetch from each address the name has: a line each with <code>subid</code> and <code>submax</code>, or with <code>--combine</code> one line, each fetch with the <code>time</code> its connect started</td></tr>
+          <tr><td><code>--etim</code>, <code>--eetim</code></td><td><code>ttr</code>, <code>ttc</code> and <code>ttfb</code> after <code>bsize</code>; <code>--eetim</code> adds <code>readtiming</code></td></tr>
+          <tr><td><code>-b bundle</code></td><td><code>"bundle"</code> in the envelope, after <code>"time"</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><div class="pre-head"><span class="lang">json</span><span>result · FullLine</span></div><div class="pre-body"><code>RESULT { "id":"13027", "fw":5130, "mver": "2.6.4", "lts":19,
+  "time":1791860335, "result":[ { "header": [
+    "X-Client-IP: 2602:f337:ed:4174:2020:2041:746c:6173",
+    "Content-Length: 37", "" ], "method":"GET", "af": 6,
+    "dst_addr":"2001:67c:2e8:16::c100:68d",
+    "src_addr":"2602:f337:ed:4174:2020:2041:746c:6173",
+    "rt":269.242169, "res":200, "ver":"1.0", "hsize":72, "bsize":37 } ] }</code></div></pre>
+
+      <p>The envelope is <code>id</code>, <code>fw</code>, <code>mver</code>, <code>lts</code>, <code>time</code>, then <code>bundle</code> (<code>-b</code>) and <code>ttr</code> (when a name was looked up); there is no <code>dst_name</code>, <code>af</code>, <code>dst_addr</code> or <code>proto</code> beside them. A failed lookup is <code>{ "dnserr":"…" }</code> alone in <code>result</code>, an address atlas_check_addr() refuses <code>{ "error": "address not allowed", "dst_addr":"…" }</code>, and a failed connect has <code>"err":"connect: …"</code> and no <code>rt</code>. The ip-echo built-ins (12027, 13027) ask for <code>--store-headers 1024</code>: RIPE reads the probe's address from <code>X-Client-IP</code>.</p>
+
+      <pre><div class="pre-head"><span class="lang">json</span><span>result · --read-limit 2000, cut in the body</span></div><div class="pre-body"><code>RESULT { "id":"1001", "fw":5130, "mver": "2.6.4", "lts":3,
+  "time":1791860335, "result":[ { "method":"GET", "af": 4,
+    "read-truncated": true, "dst_addr":"193.0.6.139",
+    "src_addr":"192.0.2.10", "rt":4.500000, "res":200, "ver":"1.1",
+    "hsize":120, "bsize":2048 } ] }</code></div></pre>
+
+      <p>httpget checks the limit between the steps of its parse (a line of the status or header, a piece of the body), not as it reads, and takes at most 2048 bytes at a time. So a limit of 2048 or less that the first read reaches stops the response after its status line, <code>"bad header line: read truncated"</code> however much of the header came; and when it is found in the body, up to 2047 bytes past the limit have been read, and are counted in <code>bsize</code>. Starla replays that parse over its own reads, at most 4096 bytes as libevent's are: where data comes in other pieces than the reference would have read, or over TLS (whose records the reference reads whole, up to 16 KB), the bytes read can differ by up to a read.</p>
 
       <h3>TLS — <code>evsslgetcert</code></h3>
       <pre><div class="pre-head"><span class="lang">grammar</span></div><div class="pre-body"><code>evsslgetcert [-4|-6] [-p port] [-h hostname] [-A msm_id] [-O output] &lt;target&gt;</code></div></pre>

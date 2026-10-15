@@ -143,6 +143,11 @@ pub struct HttpJobSpec {
     pub etim: u8,
     /// `-b`
     pub bundle: Option<u64>,
+    /// `--user-agent`, `--host`
+    pub user_agent: Option<String>,
+    pub host: Option<String>,
+    /// `--read-limit`, 0 for none
+    pub read_limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +352,9 @@ impl MeasurementJob {
                         combine: spec.combine,
                         etim: spec.etim,
                         bundle: spec.bundle,
+                        user_agent: spec.user_agent.clone(),
+                        host: spec.host.clone(),
+                        read_limit: spec.read_limit,
                     },
                     probe_id,
                     msm_id,
@@ -1041,6 +1049,9 @@ mod tests {
                     combine: false,
                     etim: 0,
                     bundle: None,
+                    user_agent: None,
+                    host: None,
+                    read_limit: 0,
                 }),
                 MeasurementType::Http,
             ),

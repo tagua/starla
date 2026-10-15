@@ -1639,6 +1639,9 @@ async fn run_commands(
                     combine: spec.combine,
                     etim: spec.etim,
                     bundle: spec.bundle,
+                    user_agent: spec.user_agent,
+                    host: spec.host,
+                    read_limit: spec.read_limit,
                 })
             ),
             TelnetCommand::Tls(spec) => dispatch_measurement!(

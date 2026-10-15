@@ -46,6 +46,15 @@ pub struct HttpConfig {
     /// `-b`: the bundle, reported as "bundle"
     #[serde(default)]
     pub bundle: Option<u64>,
+    /// `--user-agent`: the User-Agent sent, httpget's own when None
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    /// `--host`: the Host header's, in place of the URL's host and port
+    #[serde(default)]
+    pub host: Option<String>,
+    /// `--read-limit`: stop reading after this many bytes, 0 for no limit
+    #[serde(default)]
+    pub read_limit: usize,
 }
 
 pub struct Http {
@@ -151,6 +160,9 @@ fn entry(report: &Report, out: &raw::RawHttpOutcome) -> String {
         out.method.as_str(),
         out.af
     );
+    if out.read_truncated {
+        r.push_str(", \"read-truncated\": true");
+    }
     if let Some(dst) = out.dst_addr {
         let _ = write!(r, ", \"dst_addr\":\"{dst}\"");
     }
@@ -227,6 +239,9 @@ impl Measurement for Http {
             sni: self.config.sni.clone(),
             method: raw::Method::from_name(&self.config.method),
             all: self.config.all,
+            user_agent: self.config.user_agent.clone(),
+            host: self.config.host.clone(),
+            read_limit: self.config.read_limit,
         };
         let outs = match raw::fetch(&url, &opts).await {
             Ok(outs) => outs,
@@ -486,6 +501,62 @@ mod tests {
         let body = result_lines(&report, &[failed]).remove(0);
         assert!(body.ends_with("{ \"err\":\"connect: timeout\", \"method\":\"GET\", \"af\": 4, \"dst_addr\":\"193.0.6.139\" } ]"), "{body}");
         parsed(&body);
+    }
+
+    /// `--read-limit`: `"read-truncated": true` right after "af", the
+    /// response done when the limit was found in the body, else the error
+    /// err_status or err_header wrote, the header lines read so far ahead
+    /// of it with no closing "" (httpget.c:909-910, 1168-1188, 1212-1229).
+    /// Starla read to the end and never said so.
+    #[test]
+    fn a_read_limit_line_says_read_truncated() {
+        let line = |out: &raw::RawHttpOutcome| {
+            let body = result_body(1001, 1, out);
+            parsed(&body);
+            body.strip_prefix(&format!(
+                "\"id\":\"1001\", \"fw\":{}, \"mver\": \"2.6.4\", \"lts\":0, \"time\":1, \"result\":[ ",
+                starla_common::FIRMWARE_VERSION
+            ))
+            .and_then(|b| b.strip_suffix(" ]"))
+            .map(str::to_string)
+            .unwrap()
+        };
+        let in_body = raw::RawHttpOutcome {
+            read_truncated: true,
+            ..fetched(raw::Method::Get, vec![(0, 1.5), (49, 2.0)])
+        };
+        assert_eq!(
+            line(&in_body),
+            "{ \"method\":\"GET\", \"af\": 4, \"read-truncated\": true, \
+             \"dst_addr\":\"193.0.6.139\", \"src_addr\":\"192.0.2.10\", \"rt\":4.500000, \
+             \"res\":200, \"ver\":\"1.1\", \"hsize\":120, \"bsize\":2048 }"
+        );
+
+        let cut = |err: &str, header: Option<Vec<String>>| raw::RawHttpOutcome {
+            err: Some(err.into()),
+            header,
+            done: false,
+            read_truncated: true,
+            ..fetched(raw::Method::Get, vec![(0, 1.5)])
+        };
+        assert_eq!(
+            line(&cut(
+                "bad header line: read truncated",
+                Some(vec!["X-Client-IP: 192.0.2.10".into()])
+            )),
+            "{ \"header\": [ \"X-Client-IP: 192.0.2.10\" ], \
+             \"err\":\"bad header line: read truncated\", \"method\":\"GET\", \"af\": 4, \
+             \"read-truncated\": true, \"dst_addr\":\"193.0.6.139\", \"src_addr\":\"192.0.2.10\" }"
+        );
+        assert_eq!(
+            line(&cut("bad status line: read truncated", None)),
+            "{ \"err\":\"bad status line: read truncated\", \"method\":\"GET\", \"af\": 4, \
+             \"read-truncated\": true, \"dst_addr\":\"193.0.6.139\", \"src_addr\":\"192.0.2.10\" }"
+        );
+        // without the limit reached, nothing is said
+        assert!(
+            !result_body(1001, 1, &fetched(raw::Method::Get, vec![])).contains("read-truncated")
+        );
     }
 
     /// `--all`: a line for each address with its "subid" and "submax";

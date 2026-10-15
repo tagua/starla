@@ -329,6 +329,18 @@ pub struct HttpSpec {
     /// `-b`: the bundle, reported as `"bundle"`
     #[serde(default)]
     pub bundle: Option<u64>,
+    /// `--user-agent`: the User-Agent sent, httpget's own when None
+    /// (httpget.c:462, 565-566)
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    /// `--host`: the Host header's, in place of the URL's host and port
+    /// (httpget.c:730-735)
+    #[serde(default)]
+    pub host: Option<String>,
+    /// `--read-limit`: stop reading the response after this many bytes, 0
+    /// for no limit (httpget.c:698-708)
+    #[serde(default)]
+    pub read_limit: usize,
     pub spread: Option<u32>,
     pub schedule: ScheduleSpec,
 }
@@ -2077,13 +2089,15 @@ fn parse_evtdig(args: &[String], interval: u64, end_time: i64, spread: u32) -> T
 ///
 /// Usage: evhttpget [-4|-6] [-0|-1] [-a] [-c] [-b bundle] [-A msm_id]
 /// [-O output] [--get|--head|--post] [--etim] [--eetim]
-/// [--store-headers size] [--sni name] [--timeout ms] url
+/// [--store-headers size] [--read-limit size] [--user-agent string]
+/// [--host host] [--sni name] [--timeout ms] url
 ///
 /// httpget_init refuses a line whose `-b` is not digits
-/// (validate_atlas_id) or whose --post-header, --post-file or
+/// (validate_atlas_id), whose --read-limit or --timeout is not a number
+/// (httpget.c:698-720), or whose --post-header, --post-file or
 /// --post-footer is not under data/out (rebased_validated_filename;
-/// httpget.c:631-668). Their contents are not read: Starla keeps no
-/// data/out files, and httpget posts nothing for a file it cannot open.
+/// :631-668). Their contents are not read: Starla keeps no data/out
+/// files, and httpget posts nothing for a file it cannot open.
 fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -> TelnetCommand {
     let mut af: u8 = 4;
     let mut msm_id: u64 = 0;
@@ -2097,6 +2111,9 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
     let (mut all, mut combine) = (false, false);
     let (mut etim, mut eetim) = (false, false);
     let mut bundle: Option<u64> = None;
+    let mut user_agent: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut read_limit: usize = 0;
 
     let mut i = 0;
     while i < args.len() {
@@ -2179,9 +2196,33 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
                     i += 1;
                 }
             }
+            "--user-agent" => {
+                if i + 1 < args.len() {
+                    user_agent = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--host" => {
+                if i + 1 < args.len() {
+                    host = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--read-limit" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse() {
+                        Ok(n) => read_limit = n,
+                        Err(_) => {
+                            warn!("evhttpget: bad --read-limit {:?}", args[i + 1]);
+                            return TelnetCommand::Unknown(format!("evhttpget {:?}", args));
+                        }
+                    }
+                    i += 1;
+                }
+            }
             // httpget options with a value Starla does not use: their value
             // must not be taken for the URL.
-            "-I" | "-R" | "-W" | "--host" | "--read-limit" | "--store-body" | "--user-agent" => {
+            "-I" | "-R" | "-W" | "--store-body" => {
                 if i + 1 < args.len() {
                     i += 1;
                 }
@@ -2225,6 +2266,9 @@ fn parse_evhttpget(args: &[String], interval: u64, end_time: i64, spread: u32) -
         combine,
         etim: if eetim { 2 } else { u8::from(etim) },
         bundle,
+        user_agent,
+        host,
+        read_limit,
         spread: Some(spread),
         schedule: ScheduleSpec {
             interval,
@@ -2605,6 +2649,9 @@ fn parse_json_command(spec: &serde_json::Value) -> TelnetCommand {
             combine: false,
             etim: 0,
             bundle: None,
+            user_agent: None,
+            host: None,
+            read_limit: 0,
             spread,
             schedule,
         }),
@@ -3780,6 +3827,7 @@ mod tests {
         );
         assert_eq!(spec.sni, None);
         assert_eq!(spec.timeout_ms, Some(5000));
+        assert_eq!(spec.user_agent.as_deref(), Some("x"));
 
         // --sni names the server an https fetch asks for (httpget.c:560)
         let spec = match parse_command(
@@ -3801,10 +3849,11 @@ mod tests {
         ));
     }
 
-    /// --get/--head/--post, --etim/--eetim, -a/--all, -c/--combine and -b
-    /// reach the spec. A -b that is not digits, or a post file not under
-    /// data/out, makes httpget_init refuse the line (httpget.c:631-668).
-    /// Starla ignored them all, and fetched with GET.
+    /// --get/--head/--post, --etim/--eetim, -a/--all, -c/--combine, -b,
+    /// --user-agent, --host and --read-limit reach the spec. A -b that is
+    /// not digits, a --read-limit that is not a number, or a post file not
+    /// under data/out, makes httpget_init refuse the line (httpget.c:631-668,
+    /// 698-708). Starla ignored them all, and fetched with GET.
     #[test]
     fn evhttpget_keeps_method_timing_all_and_bundle() {
         let http = |opts: &str| {
@@ -3853,8 +3902,35 @@ mod tests {
             ("POST", "http://193.0.6.139/")
         );
 
+        // --user-agent, --host and --read-limit reach the spec (Starla
+        // took their values and dropped them)
+        assert_eq!(
+            (
+                plain.user_agent.as_deref(),
+                plain.host.as_deref(),
+                plain.read_limit
+            ),
+            (None, None, 0)
+        );
+        let s = spec(r#"--read-limit 4096 --user-agent "Atlas test" --host anchor.example:8080"#);
+        assert_eq!(
+            (
+                s.user_agent.as_deref(),
+                s.host.as_deref(),
+                s.read_limit,
+                s.url.as_str()
+            ),
+            (
+                Some("Atlas test"),
+                Some("anchor.example:8080"),
+                4096,
+                "http://193.0.6.139/"
+            )
+        );
+
         for bad in [
             "-b 1x",
+            "--read-limit 4k",
             "--post --post-file /etc/passwd",
             "--post --post-header /home/atlas/data/new/7",
             "--post --post-footer /home/atlas/data/out/../../../etc/passwd",

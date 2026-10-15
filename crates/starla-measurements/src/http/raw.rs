@@ -133,21 +133,25 @@ impl Method {
     }
 }
 
-/// The request httpget writes (writecb, httpget.c:1826-1866). A POST says
-/// its body's type and length; its body is the --post-header,
-/// --post-file and --post-footer files, which must be under data/out.
-/// Starla keeps no files there, and httpget posts nothing for a file it
-/// cannot stat or open (:1849-1863, 1767-1772), so the length is 0.
-pub fn request(url: &HttpUrl, method: Method, http10: bool) -> String {
+/// The request httpget writes (writecb, httpget.c:1826-1866). The Host
+/// header is `--host`'s, which takes the URL's host and port's place there
+/// and nowhere else: the name looked up and the server name sent are still
+/// the URL's (httpget.c:730-735, 773). The User-Agent is `--user-agent`'s
+/// (:565-566, 1838-1839). A POST says its body's type and length; its body
+/// is the --post-header, --post-file and --post-footer files, which must
+/// be under data/out. Starla keeps no files there, and httpget posts
+/// nothing for a file it cannot stat or open (:1849-1863, 1767-1772), so
+/// the length is 0.
+pub fn request(url: &HttpUrl, opts: &FetchOptions) -> String {
     let mut request = format!(
         "{} {} HTTP/1.{}\r\nHost: {}\r\nConnection: close\r\nUser-Agent: {}\r\n",
-        method.as_str(),
+        opts.method.as_str(),
         url.path,
-        if http10 { '0' } else { '1' },
-        url.hostport,
-        USER_AGENT
+        if opts.http10 { '0' } else { '1' },
+        opts.host.as_deref().unwrap_or(&url.hostport),
+        opts.user_agent.as_deref().unwrap_or(USER_AGENT)
     );
-    if method == Method::Post {
+    if opts.method == Method::Post {
         request
             .push_str("Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n");
     }
@@ -173,6 +177,13 @@ pub struct FetchOptions {
     /// `--all`: fetch from every address the lookup gave, each fetch
     /// reported
     pub all: bool,
+    /// `--user-agent`: the User-Agent sent, [`USER_AGENT`] when None
+    pub user_agent: Option<String>,
+    /// `--host`: the Host header's, the URL's host and port when None
+    pub host: Option<String>,
+    /// `--read-limit`: the bytes read after which the response is not read
+    /// further, 0 for no limit (see [`Reader`])
+    pub read_limit: usize,
 }
 
 impl Default for FetchOptions {
@@ -185,6 +196,9 @@ impl Default for FetchOptions {
             sni: None,
             method: Method::Get,
             all: false,
+            user_agent: None,
+            host: None,
+            read_limit: 0,
         }
     }
 }
@@ -221,6 +235,10 @@ pub struct RawHttpOutcome {
     pub refused: bool,
     /// The response was read to the end (httpget's READ_DONE)
     pub done: bool,
+    /// `--read-limit` stopped the reading: `"read-truncated": true` after
+    /// "af" (httpget.c:909-910), the response done or `err` saying where
+    /// it was cut
+    pub read_truncated: bool,
     /// The method sent
     pub method: Method,
     /// The fetch's address among the lookup's, from 1, and their count:
@@ -409,19 +427,24 @@ async fn attempt(
     };
 
     let head = opts.method == Method::Head;
-    let request = request(url, opts.method, opts.http10);
+    let request = request(url, opts);
     let mut raw = Vec::with_capacity(4096);
     let reads = &mut out.reads;
+    let mut reader = (opts.read_limit > 0).then(|| Reader::new(opts.read_limit, head));
     let read = async {
+        let reader = reader.as_mut();
         match &mut stream {
-            Conn::Plain(s) => exchange(s, request.as_bytes(), head, start, &mut raw, reads).await,
+            Conn::Plain(s) => {
+                exchange(s, request.as_bytes(), head, reader, start, &mut raw, reads).await
+            }
             Conn::Tls(s) => {
-                exchange(s.as_mut(), request.as_bytes(), head, start, &mut raw, reads).await
+                let s = s.as_mut();
+                exchange(s, request.as_bytes(), head, reader, start, &mut raw, reads).await
             }
         }
     };
-    match tokio::time::timeout_at(deadline, read).await {
-        Ok(Ok(())) => {}
+    let stop = match tokio::time::timeout_at(deadline, read).await {
+        Ok(Ok(stop)) => stop,
         Ok(Err(e)) => {
             out.err = Some(format!("error reading response: {e}"));
             return true;
@@ -430,10 +453,31 @@ async fn attempt(
             out.err = Some("timeout reading status".into());
             return true;
         }
-    }
+    };
     out.rt = start.elapsed().as_secs_f64() * 1000.0;
 
-    match parse_response(&raw, opts.store_headers) {
+    let parsed = match stop {
+        None => parse_response(&raw, opts.store_headers),
+        Some(Stop::End(n)) => parse_response(&raw[..n], opts.store_headers),
+        Some(Stop::Cut(cut)) => {
+            out.read_truncated = true;
+            match cut {
+                // err_status and err_header (httpget.c:1168-1188,
+                // 1219-1225): the header lines so far, no closing ""
+                Cut::Status => Err("bad status line: read truncated".to_string()),
+                Cut::Header { parsed } => {
+                    out.header = header_so_far(&raw[..parsed], opts.store_headers);
+                    Err("bad header line: read truncated".to_string())
+                }
+                // READ_DONE with the body read so far (:1226-1228)
+                Cut::Body { header_end, body } => {
+                    parse_response(&raw[..header_end], opts.store_headers)
+                        .map(|p| ParsedResponse { bsize: body, ..p })
+                }
+            }
+        }
+    };
+    match parsed {
         Ok(p) => {
             out.res = p.res;
             out.ver = p.ver;
@@ -475,18 +519,29 @@ enum Conn {
 /// httpget reads no body for one (httpget.c:1505-1514). Each read that
 /// brings data is logged in `reads`: the bytes read before it, and ms from
 /// `start`.
+///
+/// With `--read-limit`, `reader` is shown each read as httpget's readcb
+/// would be, and the reading stops where it stops: the limit reached, the
+/// response ended, or found malformed. A read it did not get to take from
+/// is not logged, as get_input logs none (httpget.c:1063-1075).
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &[u8],
     head: bool,
+    mut reader: Option<&mut Reader>,
     start: Instant,
     buf: &mut Vec<u8>,
     reads: &mut Vec<(usize, f64)>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<Stop>> {
     stream.write_all(request).await?;
     let mut chunk = [0u8; 8192];
+    let size = if reader.is_some() {
+        SOCKET_READ
+    } else {
+        chunk.len()
+    };
     loop {
-        let n = match stream.read(&mut chunk).await {
+        let n = match stream.read(&mut chunk[..size]).await {
             Ok(n) => n,
             // A TLS server that closes the connection with no close_notify,
             // as many do after `Connection: close`: the end of the response,
@@ -499,6 +554,15 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         }
         reads.push((buf.len(), start.elapsed().as_secs_f64() * 1000.0));
         buf.extend_from_slice(&chunk[..n]);
+        if let Some(reader) = reader.as_deref_mut() {
+            let taken = reader.taken;
+            if let Some(stop) = reader.readcb(buf) {
+                if reader.taken == taken {
+                    reads.pop();
+                }
+                return Ok(Some(stop));
+            }
+        }
         // Stop once the body is complete by Content-Length or a chunked
         // terminator, so a server that ignores `Connection: close` does
         // not make the whole-read timeout discard a complete response; a
@@ -512,7 +576,260 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             break;
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// What get_input takes at most: the room in httpget's line buffer,
+/// MAX_LINE_LEN less what it holds unparsed (httpget.c:30, 1034-1061).
+const LINE_MAX: usize = 2048;
+
+/// What libevent reads from a socket before it runs httpget's readcb, at
+/// most (EVBUFFER_MAX_READ): Starla's reads under `--read-limit`.
+const SOCKET_READ: usize = 4096;
+
+/// Why [`exchange`] stopped reading before the response's end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stop {
+    /// `--read-limit` reached
+    Cut(Cut),
+    /// The response's first `n` bytes are all of it, or all httpget would
+    /// read of a response it finds malformed
+    End(usize),
+}
+
+/// Where `--read-limit` cut the response: in the status line, in the
+/// header after `parsed` bytes, or in the body (from where it was in
+/// readcb, httpget.c:1212-1229).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cut {
+    Status,
+    Header {
+        parsed: usize,
+    },
+    /// The header ends at `header_end`; `body` bytes of the body were read
+    Body {
+        header_end: usize,
+        body: usize,
+    },
+}
+
+/// httpget's readcb (httpget.c:1200-1760) as far as `--read-limit` needs
+/// it: what it takes from the connection, when, and where the limit stops
+/// it.
+///
+/// The limit is checked against the bytes taken (roffset) before each step
+/// of the parse — a line of the status, header or chunk framing, the start
+/// of the body, a piece of the body — and not as they are read
+/// (:1212-1229). A step takes input (get_input) only when what it has is
+/// not enough: as much as has come, at most the room in the 2048-byte line
+/// buffer. So a read that crosses the limit is parsed one step further: a
+/// limit of 2048 or less that the first read reaches stops the response
+/// after its status line, however much of the header came. A read that
+/// leaves a line unfinished is found over the limit only when the next
+/// read comes.
+///
+/// Starla's reads stand for libevent's socket reads, one readcb each, at
+/// most [`SOCKET_READ`] bytes. Where data comes faster or slower than
+/// libevent would have read it, the pieces get_input takes, and so the
+/// bytes read when the limit is found, can differ by up to a read; so can
+/// they over TLS, where the openssl bufferevent reads whole records, up to
+/// 16 KB, before readcb runs.
+///
+/// The body read when the limit is found right after the header is
+/// content_offset before anything set it for this response: 0, where the
+/// reference's `--all` reports the previous address's.
+#[derive(Debug)]
+struct Reader {
+    limit: usize,
+    head: bool,
+    state: ReadState,
+    /// roffset: bytes taken from what came
+    taken: usize,
+    /// lineoffset from the response's start: bytes parsed
+    parsed: usize,
+    status: u16,
+    content_length: Option<usize>,
+    chunked: bool,
+    header_end: usize,
+    /// content_offset: body bytes read
+    body: usize,
+    /// tot_chunked: the body bytes at the end of the chunk being read
+    chunk_end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReadState {
+    Status,
+    Header,
+    Body,
+    Simple,
+    Chunked,
+    ChunkBody,
+    ChunkEnd,
+    Trailer,
+    /// READ_DONE, which the limit check still sees: a response whose last
+    /// line came in the read that crossed the limit is done and truncated
+    Done,
+}
+
+impl Reader {
+    fn new(limit: usize, head: bool) -> Self {
+        Self {
+            limit,
+            head,
+            state: ReadState::Status,
+            taken: 0,
+            parsed: 0,
+            status: 0,
+            content_length: None,
+            chunked: false,
+            header_end: 0,
+            body: 0,
+            chunk_end: 0,
+        }
+    }
+
+    /// get_input: take what has come, as much as the line buffer has room
+    /// for.
+    fn get_input(&mut self, buf: &[u8]) {
+        let room = LINE_MAX - (self.taken - self.parsed);
+        self.taken += room.min(buf.len() - self.taken);
+    }
+
+    /// The next line taken, from where the parse is, without its line end:
+    /// None when it has not all come (and the parse waits for more).
+    fn line<'a>(&mut self, buf: &'a [u8]) -> Option<&'a [u8]> {
+        let nl = |r: &Self| buf[r.parsed..r.taken].iter().position(|&b| b == b'\n');
+        let nl = match nl(self) {
+            Some(nl) => nl,
+            None => {
+                self.get_input(buf);
+                nl(self)?
+            }
+        };
+        let line = &buf[self.parsed..self.parsed + nl];
+        self.parsed += nl + 1;
+        Some(line.strip_suffix(b"\r").unwrap_or(line))
+    }
+
+    /// readcb, `buf` all that came so far: None when it waits for more,
+    /// else where the reading stops.
+    fn readcb(&mut self, buf: &[u8]) -> Option<Stop> {
+        use ReadState::*;
+        let malformed = Some(Stop::End(buf.len()));
+        loop {
+            if self.taken >= self.limit {
+                return Some(Stop::Cut(match self.state {
+                    Status => Cut::Status,
+                    Header => Cut::Header {
+                        parsed: self.parsed,
+                    },
+                    _ => Cut::Body {
+                        header_end: self.header_end,
+                        body: self.body,
+                    },
+                }));
+            }
+            let line = match self.state {
+                Status | Header | Chunked | ChunkEnd | Trailer => match self.line(buf) {
+                    Some(line) => Some(String::from_utf8_lossy(line).into_owned()),
+                    // "line too long" (:1290-1298)
+                    None if self.taken - self.parsed >= LINE_MAX => return malformed,
+                    None => return None,
+                },
+                Body | Simple | ChunkBody | Done => None,
+            };
+            let line = line.as_deref().unwrap_or("");
+            match self.state {
+                Status => match status_line(line) {
+                    Ok((status, _)) => {
+                        self.status = status;
+                        self.state = Header;
+                    }
+                    Err(_) => return malformed,
+                },
+                Header if line.is_empty() => {
+                    self.header_end = self.parsed;
+                    self.state = Body;
+                }
+                Header => framing(line, &mut self.content_length, &mut self.chunked),
+                Body => {
+                    // no body whatever the header says (:1505-1514)
+                    self.state = if self.head
+                        || matches!(self.status, 204 | 304)
+                        || self.status / 100 == 1
+                    {
+                        Done
+                    } else {
+                        self.body = 0;
+                        if self.chunked {
+                            Chunked
+                        } else {
+                            Simple
+                        }
+                    };
+                }
+                Simple | ChunkBody => {
+                    let end = match self.state {
+                        Simple => self.content_length,
+                        _ => Some(self.chunk_end),
+                    };
+                    if end.is_some_and(|end| self.body >= end) {
+                        self.state = if self.state == Simple { Done } else { ChunkEnd };
+                        continue;
+                    }
+                    if self.parsed >= self.taken {
+                        self.get_input(buf);
+                        if self.parsed >= self.taken {
+                            return None;
+                        }
+                    }
+                    let mut len = self.taken - self.parsed;
+                    if self.state == ChunkBody {
+                        len = len.min(self.chunk_end - self.body);
+                    }
+                    self.body += len;
+                    self.parsed += len;
+                }
+                Chunked => {
+                    let size = line.split(|c: char| c.is_ascii_whitespace()).next();
+                    match size.and_then(|s| usize::from_str_radix(s, 16).ok()) {
+                        Some(0) => self.state = Trailer,
+                        Some(size) => {
+                            self.chunk_end += size;
+                            self.state = ChunkBody;
+                        }
+                        None => return malformed,
+                    }
+                }
+                ChunkEnd if line.is_empty() => self.state = Chunked,
+                ChunkEnd => return malformed,
+                Trailer if line.is_empty() => self.state = Done,
+                Trailer => {}
+                Done => return Some(Stop::End(self.parsed)),
+            }
+        }
+    }
+}
+
+/// The header lines in `raw` after its status line, stored as
+/// `--store-headers` stores them, with no closing "": the header was cut
+/// before its end (err_header, httpget.c:1180-1184).
+fn header_so_far(raw: &[u8], max: usize) -> Option<Vec<String>> {
+    let lines: Vec<String> = raw
+        .split_inclusive(|&b| b == b'\n')
+        .skip(1)
+        .map(|line| {
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            String::from_utf8_lossy(line).into_owned()
+        })
+        .collect();
+    let mut stored = stored_headers(&lines, max)?;
+    if stored.last().is_some_and(String::is_empty) {
+        stored.pop();
+    }
+    Some(stored)
 }
 
 /// Whether `buf` holds a whole header: the status line and header lines,
@@ -673,23 +990,7 @@ pub fn parse_response(raw: &[u8], store_headers: usize) -> Result<ParsedResponse
     };
 
     let (status, _) = next_line(&mut pos).ok_or("bad status line: no line")?;
-    let rest = status
-        .get(..5)
-        .filter(|p| p.eq_ignore_ascii_case("HTTP/"))
-        .map(|_| &status[5..])
-        .ok_or_else(|| format!("bad status line: {status}"))?;
-    let (ver, code) = rest
-        .split_once(' ')
-        .ok_or_else(|| format!("bad status line: {status}"))?;
-    let (major, minor) = ver
-        .split_once('.')
-        .and_then(|(a, b)| Some((a.parse::<u8>().ok()?, b.parse::<u8>().ok()?)))
-        .ok_or_else(|| format!("bad status line: {status}"))?;
-    let res: u16 = code
-        .trim_start()
-        .get(..3)
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| format!("bad status line: {status}"))?;
+    let (res, ver) = status_line(&status)?;
 
     let mut lines = Vec::new();
     let mut hsize = 0;
@@ -701,16 +1002,7 @@ pub fn parse_response(raw: &[u8], store_headers: usize) -> Result<ParsedResponse
             break;
         }
         hsize += len;
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim();
-            if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = value.trim().parse().ok();
-            } else if name.eq_ignore_ascii_case("Transfer-Encoding")
-                && value.trim().to_ascii_lowercase().starts_with("chunked")
-            {
-                chunked = true;
-            }
-        }
+        framing(&line, &mut content_length, &mut chunked);
         lines.push(line);
     }
 
@@ -723,11 +1015,47 @@ pub fn parse_response(raw: &[u8], store_headers: usize) -> Result<ParsedResponse
 
     Ok(ParsedResponse {
         res,
-        ver: format!("{major}.{minor}"),
+        ver,
         hsize,
         bsize,
         header: stored_headers(&lines, store_headers),
     })
+}
+
+/// A status line's code and version ("1.1").
+fn status_line(status: &str) -> Result<(u16, String), String> {
+    let bad = || format!("bad status line: {status}");
+    let rest = status
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("HTTP/"))
+        .map(|_| &status[5..])
+        .ok_or_else(bad)?;
+    let (ver, code) = rest.split_once(' ').ok_or_else(bad)?;
+    let (major, minor) = ver
+        .split_once('.')
+        .and_then(|(a, b)| Some((a.parse::<u8>().ok()?, b.parse::<u8>().ok()?)))
+        .ok_or_else(bad)?;
+    let res: u16 = code
+        .trim_start()
+        .get(..3)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(bad)?;
+    Ok((res, format!("{major}.{minor}")))
+}
+
+/// What a header line says of how the body is framed: its length, or
+/// chunked.
+fn framing(line: &str, content_length: &mut Option<usize>, chunked: &mut bool) {
+    if let Some((name, value)) = line.split_once(':') {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("Content-Length") {
+            *content_length = value.trim().parse().ok();
+        } else if name.eq_ignore_ascii_case("Transfer-Encoding")
+            && value.trim().to_ascii_lowercase().starts_with("chunked")
+        {
+            *chunked = true;
+        }
+    }
 }
 
 fn dechunked_len(mut body: &[u8]) -> usize {
@@ -914,22 +1242,47 @@ mod tests {
     #[test]
     fn the_request_is_httpgets() {
         let u = parse_http_url("http://[2001:67c:2e8:16::c100:68d]").unwrap();
+        let with = |method, http10| FetchOptions {
+            method,
+            http10,
+            ..Default::default()
+        };
         assert_eq!(
-            request(&u, Method::Get, false),
-            "GET / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: \
-             close\r\nUser-Agent: httpget for atlas.ripe.net\r\n\r\n"
+            request(&u, &with(Method::Get, false)),
+            "GET / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: close\r\nUser-Agent: httpget for atlas.ripe.net\r\n\r\n"
         );
-        assert!(request(&u, Method::Get, true).starts_with("GET / HTTP/1.0\r\n"));
+        assert!(request(&u, &with(Method::Get, true)).starts_with("GET / HTTP/1.0\r\n"));
         // --head and --post send theirs; a POST says its body's type and
         // length (writecb, httpget.c:1826-1866)
         assert_eq!(
-            request(&u, Method::Head, false),
+            request(&u, &with(Method::Head, false)),
             "HEAD / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: close\r\nUser-Agent: httpget for atlas.ripe.net\r\n\r\n"
         );
         assert_eq!(
-            request(&u, Method::Post, false),
+            request(&u, &with(Method::Post, false)),
             "POST / HTTP/1.1\r\nHost: [2001:67c:2e8:16::c100:68d]\r\nConnection: close\r\nUser-Agent: httpget for atlas.ripe.net\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n"
         );
+        // --user-agent is sent as given; --host is the Host header's, port
+        // and all, in place of the URL's (httpget.c:730-735, 1834-1839).
+        // Starla sent its own User-Agent and the URL's host whatever the
+        // line said.
+        let u = parse_http_url("http://193.0.6.139:8080/4096?x=1").unwrap();
+        let opts = FetchOptions {
+            user_agent: Some("RIPE Atlas test agent/1.0".into()),
+            host: Some("anchor.example".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            request(&u, &opts),
+            "GET /4096?x=1 HTTP/1.1\r\nHost: anchor.example\r\nConnection: close\r\nUser-Agent: RIPE Atlas test agent/1.0\r\n\r\n"
+        );
+        // an empty --user-agent is still the header's value
+        let opts = FetchOptions {
+            user_agent: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(request(&u, &opts).contains("\r\nHost: 193.0.6.139:8080\r\n"));
+        assert!(request(&u, &opts).contains("\r\nUser-Agent: \r\n"));
         assert_eq!(Method::from_name("head"), Method::Head);
         assert_eq!(Method::from_name("POST"), Method::Post);
         assert_eq!(Method::from_name("GET"), Method::Get);
@@ -972,6 +1325,201 @@ mod tests {
             0.0 < out.ttc && out.ttc <= out.ttfb() && out.ttfb() <= out.rt,
             "{out:?}"
         );
+    }
+
+    /// What a [`Reader`] limited to `limit` makes of a response that comes
+    /// in `reads`: where it stops, if it does, and how many of the reads it
+    /// took from.
+    fn limited(limit: usize, head: bool, reads: &[&[u8]]) -> (Option<Stop>, usize) {
+        let mut reader = Reader::new(limit, head);
+        let mut buf = Vec::new();
+        for (i, read) in reads.iter().enumerate() {
+            buf.extend_from_slice(read);
+            let taken = reader.taken;
+            if let Some(stop) = reader.readcb(&buf) {
+                return (Some(stop), i + usize::from(reader.taken > taken));
+            }
+        }
+        (None, reads.len())
+    }
+
+    /// 49 bytes of header announcing 6000 of body.
+    const HEADER: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 6000\r\nX-A: 1\r\n\r\n";
+
+    /// readcb checks the bytes it has taken against --read-limit before
+    /// each step of the parse, taking at most 2048 at a time
+    /// (httpget.c:1034-1101, 1212-1229). In the body the response is done
+    /// with what was read; a read that brings more than the limit before
+    /// the header is parsed stops it in the header, its status line
+    /// parsed.
+    #[test]
+    fn the_read_limit_stops_where_readcb_finds_it() {
+        let body = [b'x'; 3000];
+        // The header alone, then 3000 bytes: 2048 of them taken, and the
+        // limit found in the body
+        assert_eq!(
+            limited(2000, false, &[HEADER, &body, &body]),
+            (
+                Some(Stop::Cut(Cut::Body {
+                    header_end: 49,
+                    body: 2048
+                })),
+                2
+            )
+        );
+        // All at once: the first 2048 bytes parsed to the end (1999 of the
+        // body), the next 2048 taken, and the limit found
+        let all: Vec<u8> = [HEADER, &body, &body].concat();
+        assert_eq!(
+            limited(2049, false, &[&all]),
+            (
+                Some(Stop::Cut(Cut::Body {
+                    header_end: 49,
+                    body: 4047
+                })),
+                1
+            )
+        );
+        // ... and with a limit under the first 2048, it is found after the
+        // status line, the whole header read or not
+        for limit in [10, 100, 2048] {
+            assert_eq!(
+                limited(limit, false, &[&all]),
+                (Some(Stop::Cut(Cut::Header { parsed: 17 })), 1),
+                "{limit}"
+            );
+        }
+        // A read that leaves a line unfinished: the limit is found when the
+        // next read comes, before readcb takes from it
+        assert_eq!(
+            limited(10, false, &[b"HTTP/1.1 2", b"00 OK\r\n\r\n"]),
+            (Some(Stop::Cut(Cut::Status)), 1)
+        );
+        assert_eq!(
+            limited(
+                30,
+                false,
+                &[b"HTTP/1.1 200 OK\r\nContent-Le", b"ngth: 0\r\n\r\n"]
+            ),
+            (Some(Stop::Cut(Cut::Header { parsed: 36 })), 2)
+        );
+        // Within the limit the response ends as it says: at its length, at
+        // a HEAD's header, at the chunked body's trailer
+        assert_eq!(
+            limited(
+                4096,
+                false,
+                &[b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello"]
+            ),
+            (Some(Stop::End(43)), 1)
+        );
+        assert_eq!(limited(4096, true, &[HEADER]), (Some(Stop::End(49)), 1));
+        let chunked: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n";
+        assert_eq!(limited(4096, false, &[chunked]), (Some(Stop::End(69)), 1));
+        // ... and one whose last line came with the read that crossed the
+        // limit is done and truncated, as readcb checks READ_DONE too
+        assert_eq!(
+            limited(68, false, &[&chunked[..67], &chunked[67..]]),
+            (
+                Some(Stop::Cut(Cut::Body {
+                    header_end: 47,
+                    body: 7
+                })),
+                2
+            )
+        );
+        // A malformed response is read no further, and is not truncated
+        assert_eq!(
+            limited(4096, false, &[b"garbage\r\n"]),
+            (Some(Stop::End(9)), 1)
+        );
+        // Not there yet: more is read
+        assert_eq!(limited(8000, false, &[HEADER, &body]), (None, 2));
+    }
+
+    /// A server on 127.0.0.1 for one connection that checks the request
+    /// with `check`, then writes each of `writes` 100 ms apart and holds
+    /// the connection.
+    async fn paced_server(check: fn(&str), writes: Vec<Vec<u8>>) -> u16 {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = server.accept().await.unwrap();
+            let mut req = vec![0u8; 512];
+            let n = s.read(&mut req).await.unwrap();
+            check(&String::from_utf8_lossy(&req[..n]));
+            for write in writes {
+                s.write_all(&write).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        port
+    }
+
+    /// --user-agent and --host go out in the request; --read-limit stops
+    /// the reading in the body, the response done and "read-truncated"
+    /// (httpget.c:909-910, 1212-1229), without waiting for the rest or the
+    /// timeout. Starla sent its own User-Agent and the URL's host, and read
+    /// to the end.
+    #[tokio::test]
+    async fn a_read_limit_ends_the_fetch_in_the_body() {
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n".to_vec();
+        let header_len = header.len();
+        let port = paced_server(
+            |req| {
+                assert!(req.starts_with("GET /10000 HTTP/1.1\r\nHost: anchor.example\r\nConnection: close\r\nUser-Agent: test agent\r\n\r\n"), "{req}");
+            },
+            vec![header, vec![b'x'; 3000], vec![b'x'; 3000], vec![b'x'; 4000]],
+        )
+        .await;
+        let url = parse_http_url(&format!("http://127.0.0.1:{port}/10000")).unwrap();
+        let limited = FetchOptions {
+            user_agent: Some("test agent".into()),
+            host: Some("anchor.example".into()),
+            read_limit: 2000,
+            ..opts(4, 0, Duration::from_secs(5), None)
+        };
+        let started = Instant::now();
+        let out = one(fetch_via(None, anywhere, &url, &limited).await.unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            out.done && out.read_truncated && out.err.is_none(),
+            "{out:?}"
+        );
+        assert_eq!((out.res, out.hsize), (200, 23));
+        // 2048 of the 3000 when they come in one read
+        assert!(
+            2000 - header_len <= out.bsize && out.bsize <= 3000,
+            "{out:?}"
+        );
+        let body = crate::http::result_body(1001, 1, &out);
+        assert!(
+            body.contains("{ \"method\":\"GET\", \"af\": 4, \"read-truncated\": true, \"dst_addr\":\"127.0.0.1\""),
+            "{body}"
+        );
+    }
+
+    /// A status line the limit cuts short: "bad status line: read
+    /// truncated", found when the next read comes, which is not logged as
+    /// one readcb took from (httpget.c:1063-1075, 1218-1222).
+    #[tokio::test]
+    async fn a_read_limit_in_the_status_line_is_an_error() {
+        let port = paced_server(
+            |_| {},
+            vec![b"HTTP/1.1 2".to_vec(), b"00 OK\r\n\r\n".to_vec()],
+        )
+        .await;
+        let url = parse_http_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let limited = FetchOptions {
+            read_limit: 10,
+            ..opts(4, 1024, Duration::from_secs(5), None)
+        };
+        let out = one(fetch_via(None, anywhere, &url, &limited).await.unwrap());
+        assert!(!out.done && out.read_truncated, "{out:?}");
+        assert_eq!(out.err.as_deref(), Some("bad status line: read truncated"));
+        assert_eq!(out.header, None, "no header list before the status line");
+        assert_eq!(out.reads.len(), 1, "{:?}", out.reads);
     }
 
     /// The lookup's addresses are tried in turn: a refused connect goes on
