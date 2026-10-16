@@ -9,7 +9,7 @@ or (at your option) any later version; see LICENSE. These modifications
 are distributed under the same license.
 
   Modified by:  Andrii Tereshchenko
-  Dates:        2026-10-10 to 2026-10-14
+  Dates:        2026-10-10 to 2026-10-16
   Based on:     upstream Starla v0.8.0, commit a374686
   Changes:      the commits on this branch after a374686
                 (git log a374686..enodia-0028)
@@ -79,6 +79,14 @@ the difference and cites the reference source it follows.
         waittime; SCHED_IDLE for background threads as an option,
         off by default (an earlier build of 0028, 56cd774, ran
         14:52-14:56 UTC on 2026-10-14 and was rolled back)
+  next  ntp: honour NTP servers' kiss-o'-death codes (RFC 5905 7.4),
+        which the reference does not, as an option ([measurements]
+        honor_ntp_kod), off by default: a RATE holds the runs to that
+        server for a minute, doubling with each RATE in a row up to an
+        hour, a DENY or RSTR for a day; a held run sends nothing and
+        reports "not sent: KoD <code>". Only a KoD that answers one of
+        the probe's own requests counts. Not deployed yet; it takes the
+        next enodia number when it is
 
 Upstream
 --------

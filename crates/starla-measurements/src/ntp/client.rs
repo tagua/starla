@@ -156,6 +156,28 @@ pub struct NtpResult {
     /// create_socket's failure, `socket failed: …` or `connect failed: …`
     /// (ntp.c:1225-1238, 1255-1274), which ends the run before any request
     pub error: Option<String>,
+    /// What the server's replies to the run's own requests said, for the
+    /// `honor_ntp_kod` hold ([`super::kod`]); not reported
+    #[serde(skip)]
+    pub said: super::kod::Said,
+}
+
+/// What `reply` says to the requests sent at `sent`: nothing unless its
+/// origin timestamp is one of their T1s; a kiss code to act on if it is a
+/// KoD (stratum 0) carrying one; else an answer.
+fn said(reply: &[u8], header: &NtpHeader, sent: &[u64]) -> super::kod::Said {
+    use super::kod::{Kiss, Said};
+    let origin = reply
+        .get(24..32)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_be_bytes);
+    if !origin.is_some_and(|origin| sent.contains(&origin)) {
+        return Said::Nothing;
+    }
+    match header.stratum {
+        0 => Kiss::from_ref_id(header.ref_id).map_or(Said::Answered, Said::Kissed),
+        _ => Said::Answered,
+    }
 }
 
 /// The sample a server's reply makes, received at `t4`: T1 is the reply's
@@ -223,6 +245,7 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
         samples: Vec::new(),
         src_addr: None,
         error: None,
+        said: Default::default(),
     };
     let bind_addr: SocketAddr = if config.target.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
@@ -250,6 +273,9 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
     let timeout = Duration::from_millis(config.timeout_ms);
     let gap = Duration::from_millis(config.gap_ms);
     let mut sent = 0;
+    // The T1s of the requests that went: a reply that carries one as its
+    // origin answers this run
+    let mut t1s = Vec::new();
     // A reply came to the latest request (gotresp)
     let mut answered = false;
     // The pending timers: the latest request's timeout, and the gap
@@ -272,14 +298,17 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
             // (ntp.c:544-564): the first request's socket is new to the
             // reactor, and T1 taken before `send().await` counted a reactor
             // turn into the request's delay.
-            let (_t1, sending) = starla_network::send_stamped(&socket, || {
+            let (t1, sending) = starla_network::send_stamped(&socket, || {
                 let t1 = now_ntp();
                 (t1, request(t1))
             })
             .await;
-            if let Err(e) = sending {
+            match sending {
+                Ok(_) => t1s.push(t1),
                 // Its timeout reports it as unanswered.
-                tracing::debug!("NTP request {} to {} not sent: {}", sent + 1, dest, e);
+                Err(e) => {
+                    tracing::debug!("NTP request {} to {} not sent: {}", sent + 1, dest, e)
+                }
             }
             sent += 1;
             let now = tokio::time::Instant::now();
@@ -319,6 +348,7 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
                 // the kernel's, when it stamped the reply
                 let t4 = stamp.map(ntp_ts).unwrap_or(t4);
                 if let Some(sample) = sample(&buf[..len], t4) {
+                    result.said = result.said.and(said(&buf[..len], &sample.header, &t1s));
                     result.samples.push(Some(sample));
                     answered = true;
                     timeout_at = None;
@@ -751,6 +781,99 @@ mod tests {
             assert_eq!((h.leap(), h.version(), h.mode()), (0, 4, 4));
             assert_eq!(h.ref_id.to_be_bytes(), *b"GPS\0");
         }
+    }
+
+    /// A KoD, as ntpd's fast_xmit sends one: stratum 0, the code as the
+    /// reference id, the request's transmit timestamp as its origin.
+    fn kod(request: &[u8; 48], code: &[u8; 4]) -> [u8; 48] {
+        let mut answer = reply(request, 0, 0);
+        answer[0] = 0xe4; // LI 3 (unsynchronised), VN 4, mode 4
+        answer[1] = 0; // stratum 0
+        answer[12..16].copy_from_slice(code);
+        answer
+    }
+
+    /// A server that answers the first request and sends RATE to the
+    /// second: both are reported, and the run's word is the KoD.
+    #[tokio::test]
+    async fn a_kod_to_a_request_of_the_run_is_its_word() {
+        use super::super::kod::{Kiss, Said};
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            for n in 0..2 {
+                let (_, from) = server.recv_from(&mut buf).await.unwrap();
+                let answer = match n {
+                    0 => reply(&buf, now_ntp(), now_ntp()),
+                    _ => kod(&buf, b"RATE"),
+                };
+                server.send_to(&answer, from).await.unwrap();
+            }
+        });
+
+        let res = execute_ntp_query(&config(port, 2, 500, 50)).await.unwrap();
+        let strata: Vec<u8> = res
+            .samples
+            .iter()
+            .flatten()
+            .map(|s| s.header.stratum)
+            .collect();
+        assert_eq!(strata, [1, 0], "{:?}", res.samples);
+        assert_eq!(res.said, Said::Kissed(Kiss::Rate));
+    }
+
+    /// A KoD whose origin is no request's T1 — forged, or a reply to some
+    /// other client — is reported as evntp reports it, and says nothing to
+    /// the hold; neither does a run that heard nothing.
+    #[tokio::test]
+    async fn a_kod_to_no_request_of_the_run_says_nothing() {
+        use super::super::kod::Said;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let mut forged = kod(&buf, b"DENY");
+            forged[24..32].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_be_bytes());
+            server.send_to(&forged, from).await.unwrap();
+        });
+
+        let res = execute_ntp_query(&config(port, 1, 500, 50)).await.unwrap();
+        let sample = res.samples[0].as_ref().expect("reported");
+        assert_eq!(sample.header.stratum, 0);
+        assert_eq!(sample.header.ref_id.to_be_bytes(), *b"DENY");
+        assert_eq!(res.said, Said::Nothing);
+
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let res = execute_ntp_query(&config(port, 1, 100, 50)).await.unwrap();
+        assert!(res.samples[0].is_none());
+        assert_eq!(res.said, Said::Nothing);
+    }
+
+    /// Answers alone, and another kiss code (INIT: the server is not yet
+    /// synchronised), are answers: they lift a RATE hold.
+    #[tokio::test]
+    async fn answers_and_other_kiss_codes_are_answers() {
+        use super::super::kod::Said;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            for n in 0..2 {
+                let (_, from) = server.recv_from(&mut buf).await.unwrap();
+                let answer = match n {
+                    0 => reply(&buf, now_ntp(), now_ntp()),
+                    _ => kod(&buf, b"INIT"),
+                };
+                server.send_to(&answer, from).await.unwrap();
+            }
+        });
+
+        let res = execute_ntp_query(&config(port, 2, 500, 50)).await.unwrap();
+        assert_eq!(res.samples.iter().flatten().count(), 2);
+        assert_eq!(res.said, Said::Answered);
     }
 
     /// The poll exponent is a signed byte (int8_t ntp_poll, ntp.c:134),

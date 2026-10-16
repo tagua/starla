@@ -108,6 +108,13 @@ pub struct MeasurementSettings {
     /// starla_common::priority::BACKGROUND_NICE_INCREMENT.
     #[serde(default)]
     pub background_sched_idle: bool,
+    /// Hold the NTP runs to a server after its kiss-o'-death: a RATE for a
+    /// minute and up, doubling, a DENY or RSTR for a day, as RFC 5905 §7.4
+    /// asks; a held run sends nothing and reports `not sent: KoD …`. Off by
+    /// default: the reference probe runs every line on its slot whatever
+    /// the server said. See starla_measurements::ntp::kod.
+    #[serde(default)]
+    pub honor_ntp_kod: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +256,18 @@ mod tests {
         assert!(parsed.measurements.background_sched_idle);
     }
 
+    /// Off unless asked for: by default, and in a config without the
+    /// section or the key.
+    #[test]
+    fn honor_ntp_kod_is_off_by_default() {
+        assert!(!ProbeConfig::default().measurements.honor_ntp_kod);
+        let parsed: ProbeConfig = toml::from_str("[measurements]\n").unwrap();
+        assert!(!parsed.measurements.honor_ntp_kod);
+        let on = "[measurements]\nhonor_ntp_kod = true\n";
+        let parsed: ProbeConfig = toml::from_str(on).unwrap();
+        assert!(parsed.measurements.honor_ntp_kod);
+    }
+
     #[test]
     fn kernel_rx_timestamps_are_off_by_default() {
         assert!(!ProbeConfig::default().measurements.kernel_rx_timestamps);
@@ -270,6 +289,8 @@ mod tests {
         assert!(example.contains("\nkernel_rx_timestamps = false\n"));
         assert!(!parsed.measurements.background_sched_idle);
         assert!(example.contains("\nbackground_sched_idle = false\n"));
+        assert!(!parsed.measurements.honor_ntp_kod);
+        assert!(example.contains("\nhonor_ntp_kod = false\n"));
     }
 
     #[test]
