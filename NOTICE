@@ -12,7 +12,7 @@ are distributed under the same license.
   Dates:        2026-10-10 to 2026-10-16
   Based on:     upstream Starla v0.8.0, commit a374686
   Changes:      the commits on this branch after a374686
-                (git log a374686..enodia-0028)
+                (git log a374686..enodia-0029)
 
 Where this code runs
 --------------------
@@ -21,7 +21,7 @@ It runs RIPE Atlas probe 1018212:
   https://atlas.ripe.net/probes/1018212/
 
 Each version deployed to that probe is tagged here (enodia-<NNNN>). The
-current one is enodia-0028 (c8fbb6a), running since 2026-10-14 16:21 UTC.
+current one is enodia-0029 (445d77b), running since 2026-10-16 09:48 UTC.
 This branch and its tags are the Corresponding Source for anyone who
 interacts with the probe over the network (AGPL-3.0, section 13).
 
@@ -30,7 +30,8 @@ What changed
 0001-0005 make the probe fit to run as a system service. 0006-0028 bring
 its behaviour on the wire in line with RIPE NCC's reference software probe
 (ripe-atlas-software-probe, firmware 5130). Each commit message explains
-the difference and cites the reference source it follows.
+the difference and cites the reference source it follows. 0029 adds an
+option the reference does not have.
 
   0001  deps: refresh Cargo.lock and drop the unused hickory-client
   0002  controller: use russh's default key exchange (no group1-sha1)
@@ -79,14 +80,16 @@ the difference and cites the reference source it follows.
         waittime; SCHED_IDLE for background threads as an option,
         off by default (an earlier build of 0028, 56cd774, ran
         14:52-14:56 UTC on 2026-10-14 and was rolled back)
-  next  ntp: honour NTP servers' kiss-o'-death codes (RFC 5905 7.4),
+  0029  ntp: honour NTP servers' kiss-o'-death codes (RFC 5905 7.4),
         which the reference does not, as an option ([measurements]
-        honor_ntp_kod), off by default: a RATE holds the runs to that
-        server for a minute, doubling with each RATE in a row up to an
-        hour, a DENY or RSTR for a day; a held run sends nothing and
-        reports "not sent: KoD <code>". Only a KoD that answers one of
-        the probe's own requests counts. Not deployed yet; it takes the
-        next enodia number when it is
+        honor_ntp_kod), off by default and on for this probe: a RATE
+        holds the runs to that server for a minute, doubling with each
+        RATE in a row up to an hour, a DENY or RSTR for a day; a held
+        run sends nothing and reports "not sent: KoD <code>". Only a KoD
+        that answers one of the probe's own requests counts.
+        enodia-0029 is enodia-0028 and this one commit (445d77b, as
+        2aa5504 here); the other commits since enodia-0028 are not
+        deployed yet
 
 Upstream
 --------
