@@ -307,6 +307,7 @@ fn main() -> Result<()> {
     );
     // Before any measurement runs; off unless the config asks.
     starla_network::rxstamp::set_enabled(config.measurements.kernel_rx_timestamps);
+    starla_measurements::ntp::kod::set_enabled(config.measurements.honor_ntp_kod);
     // resolv.conf and the hosts file, for the measurements' lookups, before
     // any measurement runs; then every minute from the background runtime
     let _ = starla_measurements::target::Resolver::read_system();

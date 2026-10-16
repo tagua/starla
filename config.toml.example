@@ -62,6 +62,23 @@ kernel_rx_timestamps = false
 # CPUs get busy; on an idle one the measurement thread finds a free CPU.
 background_sched_idle = false
 
+# Honour NTP servers' kiss-o'-death codes, as RFC 5905 7.4 asks of a
+# client. Off by default: the reference probe reports a KoD as any reply
+# (stratum 0, the code as its "ref-id") and runs the measurement again on
+# its next slot, and turning this on departs from it deliberately.
+#
+# On, a KoD that answers one of the probe's own requests (its origin
+# timestamp one of theirs; a forged one is ignored) holds every NTP run to
+# that server -- its address and port, whichever measurement or name led
+# there:
+#   RATE         a minute, doubling with each RATE in a row, up to an hour
+#   DENY, RSTR   a day, then one run to ask again
+# An answer from the server lifts a RATE hold. A run that comes during a
+# hold sends nothing and reports {"error":"not sent: KoD RATE"} (or DENY,
+# RSTR) instead of its entries. Holds are kept in memory; a restart
+# forgets them.
+honor_ntp_kod = false
+
 [storage]
 # Maximum number of results to hold in the upload queue
 max_queue_size = 10000

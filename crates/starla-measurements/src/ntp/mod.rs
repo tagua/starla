@@ -1,6 +1,7 @@
 //! NTP measurement implementation
 
 pub mod client;
+pub mod kod;
 
 use crate::target::{DstName, LookupError};
 use crate::traits::Measurement;
@@ -10,7 +11,7 @@ use starla_common::{
     MeasurementData, MeasurementId, MeasurementResult, MeasurementType, ProbeId, Timestamp,
 };
 use std::fmt::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpConfig {
@@ -401,9 +402,27 @@ impl Measurement for Ntp {
     /// (ntp.c:1195; report() prints it, 386-395). Starla took it once the
     /// run was over, -c requests -g apart later (8 s and more with evntp's
     /// defaults).
+    ///
+    /// With `honor_ntp_kod`, a run to a server whose KoD holds it sends
+    /// nothing, and reports why in the place create_socket's errors take
+    /// ([`kod`]).
     async fn execute(&self) -> anyhow::Result<MeasurementResult> {
         let timestamp = Timestamp::now().0;
-        let results = client::execute_ntp_query(&self.config).await?;
+        let server = SocketAddr::new(self.config.target, self.config.port);
+        let results = match kod::held(server) {
+            Some(kiss) => client::NtpResult {
+                samples: Vec::new(),
+                ttr: 0.0,
+                src_addr: None,
+                error: Some(format!("not sent: KoD {}", kiss.code())),
+                said: kod::Said::Nothing,
+            },
+            None => {
+                let results = client::execute_ntp_query(&self.config).await?;
+                kod::heard(server, results.said);
+                results
+            }
+        };
 
         let body = result_body(
             self.msm_id.0,
@@ -488,6 +507,7 @@ mod tests {
             ttr: 3.0,
             src_addr: Some("199.184.91.28".parse().unwrap()),
             error: None,
+            said: Default::default(),
         };
         let body = result_body(13023, &config(), &literal("193.0.0.229"), 4, 1, &results);
         assert!(
@@ -536,6 +556,7 @@ mod tests {
             ttr: 8.0,
             src_addr: Some("199.184.91.28".parse().unwrap()),
             error: None,
+            said: Default::default(),
         };
         let body = result_body(13023, &config(), &literal("193.0.0.229"), 4, 1, &results);
         assert!(
@@ -563,6 +584,7 @@ mod tests {
             ttr: 1.0,
             src_addr: Some("2001:871:23d:897e:2a0:98ff:fe35:eb0d".parse().unwrap()),
             error: None,
+            said: Default::default(),
         };
         let dst_name = DstName {
             name: "2.europe.pool.ntp.org".into(),
@@ -683,6 +705,7 @@ mod tests {
             ttr: 8.0,
             src_addr: Some("2001:871:23d:897e:2a0:98ff:fe35:eb0d".parse().unwrap()),
             error: None,
+            said: Default::default(),
         };
         let config = NtpConfig {
             target: "2001:ac8:30:68:0:1:0:2".parse().unwrap(),
@@ -909,6 +932,7 @@ mod tests {
             ttr: 16.0,
             src_addr: Some("199.184.91.28".parse().unwrap()),
             error: None,
+            said: Default::default(),
         };
         let body = result_body(13023, &config(), &literal("193.0.0.229"), 4, 1, &results);
         let (header, result) = body.split_once(", \"result\": ").unwrap();
@@ -1006,6 +1030,7 @@ mod tests {
             ttr: 8.0,
             src_addr: Some("2a02:5cc0::1:181".parse().unwrap()),
             error: None,
+            said: Default::default(),
         };
         let config = NtpConfig {
             target: "2a02:1748:0:1500:3::2005".parse().unwrap(),
@@ -1176,6 +1201,7 @@ mod tests {
             ttr: 0.0,
             src_addr: None,
             error: Some("connect failed: Network is unreachable".into()),
+            said: Default::default(),
         };
         let config = NtpConfig {
             target: "2001:ac8:30:68:0:1:0:2".parse().unwrap(),
@@ -1242,5 +1268,78 @@ mod tests {
             "{line}"
         );
         assert_eq!(line.matches("\"origin-ts\"").count(), 2, "{line}");
+    }
+
+    /// With `honor_ntp_kod`, a run that a server answers with RATE reports
+    /// the KoD as evntp does (stratum 0 is format_stratum's "invalid",
+    /// ntp.c:270-295); the next run to that server, in its hold,
+    /// sends nothing and reports why, with dst_addr and no src_addr, as
+    /// create_socket's errors are reported. A run to another server goes.
+    ///
+    /// The option is the process's: other tests that run meanwhile see it
+    /// on, and as no other server of theirs sends a KoD, nothing of theirs
+    /// is held.
+    #[tokio::test]
+    async fn a_server_that_says_rate_is_not_asked_again_in_its_hold() {
+        kod::set_enabled(true);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            while let Ok((_, from)) = server.recv_from(&mut buf).await {
+                tx.send(()).unwrap();
+                let mut reply = buf;
+                reply[0] = 0xe4; // LI 3, VN 4, mode 4 (server)
+                reply[1] = 0; // stratum 0: a KoD
+                reply[12..16].copy_from_slice(b"RATE");
+                reply[24..32].copy_from_slice(&buf[40..48]); // origin = T1
+                let _ = server.send_to(&reply, from).await;
+            }
+        });
+        let ntp = Ntp {
+            config: NtpConfig {
+                target: "127.0.0.1".parse().unwrap(),
+                timeout_ms: 300,
+                port,
+                count: 1,
+                gap_ms: 50,
+            },
+            probe_id: ProbeId(1018212),
+            msm_id: MeasurementId(1),
+            dst_name: literal("127.0.0.1"),
+        };
+
+        let line = body(ntp.execute().await.unwrap());
+        assert!(
+            line.contains("\"stratum\": \"invalid\", ") && line.contains("\"ref-id\": \"RATE\""),
+            "{line}"
+        );
+        assert_eq!(line.matches("\"origin-ts\"").count(), 1, "{line}");
+        assert_eq!(rx.recv().await, Some(()));
+
+        let held = ntp.execute().await.unwrap();
+        assert_eq!(held.src_addr, None);
+        let line = body(held);
+        assert!(
+            line.ends_with(
+                "\"dst_name\":\"127.0.0.1\", \"dst_addr\":\"127.0.0.1\", \"proto\":\"UDP\", \
+                 \"af\": 4, \"result\": [ { \"error\":\"not sent: KoD RATE\" } ]"
+            ),
+            "{line}"
+        );
+        assert!(rx.try_recv().is_err(), "the held run sent a request");
+
+        let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = Ntp {
+            config: NtpConfig {
+                port: other.local_addr().unwrap().port(),
+                timeout_ms: 50,
+                ..ntp.config.clone()
+            },
+            ..ntp
+        };
+        let line = body(other.execute().await.unwrap());
+        assert!(line.ends_with("\"result\": [ { \"x\":\"*\" } ]"), "{line}");
     }
 }
